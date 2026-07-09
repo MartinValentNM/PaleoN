@@ -1,0 +1,3 @@
+pytesseract>=0.3.10
+easyocr>=1.7
+fpdf2>=2.7

@@ -1,0 +1,19 @@
+cff-version: 1.2.0
+message: "If you use PaleoN, please cite it using the metadata below."
+title: "PaleoN: local multilingual extraction and review of palaeontological taxonomic records"
+authors:
+  - family-names: "Valent"
+    given-names: "Martin"
+    affiliation: "Národní Muzeum — Oddělení Paleontologie"
+license: "MIT"
+version: "1.0"
+date-released: "2026-07-08"
+abstract: "Local Streamlit application for conservative multilingual extraction, review, editing, and export of palaeontological taxonomic records."
+keywords:
+  - palaeontology
+  - taxonomy
+  - Streamlit
+  - OCR
+  - SQLite
+  - taxonomic extraction
+repository-code: "https://github.com/REPLACE_WITH_OWNER/REPLACE_WITH_REPOSITORY"
