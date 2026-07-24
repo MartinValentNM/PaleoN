@@ -5,11 +5,15 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import io, json, logging, os, pathlib, re, sqlite3, threading, zipfile
-import difflib, shutil, unicodedata
+import html
+import io, json, logging, os, pathlib, re, sqlite3, threading, time, zipfile
+import difflib, fnmatch, shutil, unicodedata
 import urllib.request, urllib.error
+import urllib.parse, http.client
+import socket
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
+from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -53,13 +57,13 @@ except ImportError:
     HAS_EASYOCR = False
 
 try:
-    from PIL import Image as _PILImage   # muže být dostupné i bez pytesseract
+    from PIL import Image as _PILImage   # muthat byt dostupne i without pytesseract
 except ImportError:
     pass
 
-# Souhrnný flag: máme alespoň jeden OCR engine?
-# fitz_ocr funguje bez pytesseract binárky jen v PyMuPDF >= 1.19 se systémovým tesseractem,
-# ale easyocr funguje čistě pythonovsky (pip install easyocr).
+# Summary flag: we have at least one OCR engine?
+# fitz_ocr works without pytesseract binarky only in PyMuPDF >= 1.19 with system tesseractem,
+# but EasyOCR works entirely in Python (pip install easyocr).
 def _HAS_ANY_OCR() -> bool:
     """Returns True if at least one OCR engine is available."""
     return HAS_EASYOCR or HAS_TESSERACT or HAS_FITZ
@@ -82,15 +86,16 @@ except ImportError:
 # KONSTANTY
 # ══════════════════════════════════════════════════════════════════════════════
 APP_NAME    = "PaleoN - Taxon Extraktor"
-APP_VERSION = "1.0"
+APP_VERSION = "2.0"
+DB_SCHEMA_VERSION = 4
 NOT_PROVIDED = "Not provided"
 ILLEGIBLE    = "[illegible]"
 MORPHO_STRAT_MATCHER_VERSION = "legacy_regex_from_claude-morfph"
 
-# Kanonický seznam klíčových slov pro typové exempláře (holotyp/paratyp/…)
-# ve allch podporovaných jazycích. Používá se pro detekci, zda text obsahuje
-# zmínku o typovém materiálu (TYPE SPECIMENS ≡ druh/poddruh). Centralizováno,
-# aby se stejný seznam neduplikoval na 5 místech s rizikem nekonzistence.
+# Canonical keyword list for type specimens (holotyp/paratyp/…)
+# in allch podporovanych jazycich. Used to detect, whether the text contains
+# and mention of type material (TYPE SPECIMENS ≡ druh/poddruh). Centralizovano,
+# so the same list is not duplicated on 5 mistech with and risk of inconsistency.
 TYPE_SPECIMEN_KEYWORDS: Tuple[str, ...] = (
     # EN
     "holotype", "paratype", "lectotype", "paralectotype", "neotype",
@@ -116,7 +121,9 @@ TRANSLATIONS: Dict[str, str] = {'tab_library': '📚 Library',
  'tab_review': '🔍 Review',
  'tab_editor': '✏️ Editor',
  'tab_dossier': '🧬 Taxon Dossier',
- 'tab_morpho': '⏳🔬 Morpho/Strat.',
+ 'tab_morphology': '🐚 Morphology Dossier',
+ 'tab_stratigraphy': '⏳ Stratigraphy Dossier',
+ 'tab_morpho': '🐚 Morphology Dossier',
  'tab_export': '📤 Export',
  'tab_settings': '⚙️ Settings',
  'dark_mode': '🌙 Dark mode',
@@ -156,7 +163,7 @@ TRANSLATIONS: Dict[str, str] = {'tab_library': '📚 Library',
  'reject': '❌ Reject (R)',
  'needs_review': '🔍 Needs review',
  'prev': '⬅️ Prev.',
- 'next': 'Noxt ➡️',
+ 'next': 'Next ➡️',
  'batch_approve': '✅ Approve',
  'batch_reject': '❌ Reject',
  'batch_automap': '🔄 Auto-map',
@@ -325,7 +332,7 @@ TRANSLATIONS: Dict[str, str] = {'tab_library': '📚 Library',
  'first_para_removed': 'First paragraph removed.',
  'only_one_para': 'Block has only one paragraph.',
  'last_para_removed': 'Last paragraph removed.',
- 'next_unit_added': 'Noxt unit added.',
+ 'next_unit_added': 'Next unit added.',
  'no_next_unit': 'No next unit.',
  'block_saved_ok2': 'Block saved.',
  'no_labels_found2': 'No labels found.',
@@ -423,7 +430,7 @@ TRANSLATIONS: Dict[str, str] = {'tab_library': '📚 Library',
  'similar_taxa_sub': '🔀 Similar taxa across documents',
  'comparing_taxa': 'Comparing taxa…',
  'select_user_md': '### Select user',
- 'new_user_expander': '➕ Now user',
+ 'new_user_expander': '➕ New user',
  'unique_username': 'Choose a unique username.',
  'create_account_btn': '✅ Create account',
  'wrong_password_simple': 'Wrong password.',
@@ -497,7 +504,8 @@ def _install_streamlit_i18n_patch() -> None:
     """No-op in the English-only build."""
     return None
 
-BASE_DIR    = pathlib.Path("paleon_data")
+SCRIPT_DIR  = pathlib.Path(__file__).resolve().parent
+BASE_DIR    = SCRIPT_DIR / "paleon_data"
 SCHEMA_FILE = BASE_DIR / "section_schema.tsv"
 DB_FILE     = BASE_DIR / "paleon.db"
 EXPORTS_DIR = BASE_DIR / "exports"
@@ -511,8 +519,8 @@ SYSTEMATIC_SECTIONS_FILE = BASE_DIR / "systematic_sections.tsv"
 
 # ── Multi-user paths ──────────────────────────────────────────────────────
 USERS_DIR      = BASE_DIR / "users"          # paleon_data/users/<username>/
-SYSTEM_DIR     = BASE_DIR / "system"         # systémové slovníky (šablona)
-USERS_REGISTRY = BASE_DIR / "paleon_users.db"  # registr uživatelu
+SYSTEM_DIR     = BASE_DIR / "system"         # system dictionaries (template)
+USERS_REGISTRY = BASE_DIR / "paleon_users.db"  # registr uzivatelu
 ADMIN_PASS_HASH = hashlib.sha256("PaleoN".encode()).hexdigest()
 
 
@@ -534,13 +542,95 @@ def _upath(filename: str, username: str = None) -> pathlib.Path:
     return _user_dir(username) / filename
 
 
+@dataclass(frozen=True)
+class UserPaths:
+    """All writable paths belonging to one user profile."""
+    root: pathlib.Path
+    db: pathlib.Path
+    uploads: pathlib.Path
+    exports: pathlib.Path
+    settings: pathlib.Path
+    prompts: pathlib.Path
+    schema: pathlib.Path
+    gazetteer: pathlib.Path
+    morphology: pathlib.Path
+    stratigraphy: pathlib.Path
+    systematic_sections: pathlib.Path
+
+    def ensure(self) -> "UserPaths":
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.uploads.mkdir(parents=True, exist_ok=True)
+        self.exports.mkdir(parents=True, exist_ok=True)
+        return self
+
+
+def _current_username() -> str:
+    """Stable cache/path identity for the active Streamlit session."""
+    if st is not None:
+        try:
+            value = st.session_state.get("pn_user")
+            if value:
+                return _sanitize_username(str(value))
+        except Exception:
+            pass
+    return "__legacy__"
+
+
+def current_user_paths(username: str = None, ensure: bool = True) -> UserPaths:
+    """Returns the authoritative set of paths for the active/specified user."""
+    root = _user_dir(username)
+    paths = UserPaths(
+        root=root,
+        db=root / "paleon.db",
+        uploads=root / "uploads",
+        exports=root / "exports",
+        settings=root / "settings.json",
+        prompts=root / "prompts.json",
+        schema=root / "section_schema.tsv",
+        gazetteer=root / "taxons.txt",
+        morphology=root / "paleon_morphology_terms.tsv",
+        stratigraphy=root / "stratigraphy_terms.tsv",
+        systematic_sections=root / "systematic_sections.tsv",
+    )
+    return paths.ensure() if ensure else paths
+
+
+def _safe_upload_name(name: str, allowed_extensions: Tuple[str, ...] = (".pdf", ".docx", ".txt")) -> str:
+    """Returns a basename safe for local storage and validates its extension."""
+    clean = pathlib.Path(str(name or "")).name.strip().replace("\x00", "")
+    clean = re.sub(r"[^A-Za-z0-9._() \-]+", "_", clean)[:180].strip(" .")
+    if not clean:
+        raise ValueError("Uploaded file has no valid filename.")
+    ext = pathlib.Path(clean).suffix.lower()
+    if ext not in allowed_extensions:
+        raise ValueError(f"Unsupported file extension: {ext or '(none)'}")
+    return clean
+
+
+def _unique_upload_path(original_name: str, username: str = None) -> pathlib.Path:
+    """Creates a collision-resistant per-user destination without writing it."""
+    safe = _safe_upload_name(original_name)
+    path = current_user_paths(username).uploads / safe
+    if not path.exists():
+        return path
+    stem, suffix = pathlib.Path(safe).stem, pathlib.Path(safe).suffix
+    counter = 2
+    while True:
+        candidate = path.with_name(f"{stem}_{counter}{suffix}")
+        if not candidate.exists():
+            return candidate
+        counter += 1
+
+
 # ── User registry DB ──────────────────────────────────────────────────────
 
 def _users_db() -> sqlite3.Connection:
     """Connection to the user registry (global, not per-user)."""
     BASE_DIR.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(str(USERS_REGISTRY), check_same_thread=False)
+    con = sqlite3.connect(str(USERS_REGISTRY), check_same_thread=False, timeout=30.0)
     con.row_factory = sqlite3.Row
+    con.execute("PRAGMA foreign_keys=ON")
+    con.execute("PRAGMA busy_timeout=30000")
     return con
 
 
@@ -558,7 +648,7 @@ def _init_user_registry() -> None:
             last_seen TEXT
         )
     """)
-    # Pokud neexists žádný uživatel, vytvoř trial (z legacy dat)
+    # If neexists zadny user, create the trial account (from legacy dat)
     n = con.execute("SELECT COUNT(*) FROM users").fetchone()[0]
     if n == 0:
         con.execute(
@@ -567,14 +657,14 @@ def _init_user_registry() -> None:
             ("trial", "Trial", 0, datetime.now().isoformat()))
     con.commit()
     con.close()
-    # Zajistit adresáře
+    # Ensure directories exist
     USERS_DIR.mkdir(parents=True, exist_ok=True)
     SYSTEM_DIR.mkdir(parents=True, exist_ok=True)
-    # Inicializovat trial uživatele z legacy dat
+    # Initialize trial user from legacy data
     trial_dir = USERS_DIR / "trial"
     trial_dir.mkdir(exist_ok=True)
     _migrate_legacy_to_trial(trial_dir)
-    # Zkopírovat systémové slovníky do system/
+    # Copy system dictionaries to system/
     _init_system_dicts()
 
 
@@ -632,10 +722,12 @@ def _create_user(username: str, display_name: str = "",
         con.commit()
         con.close()
     except Exception:
-        return False  # UNIQUE constraint → uživatel exists
-    # Vytvořit adresář a zkopírovat systémové slovníky
+        return False  # UNIQUE constraint → user exists
+    # Create the directory and copy system dictionaries
     user_dir = USERS_DIR / _sanitize_username(username)
     user_dir.mkdir(parents=True, exist_ok=True)
+    (user_dir / "uploads").mkdir(exist_ok=True)
+    (user_dir / "exports").mkdir(exist_ok=True)
     for fname in ["section_schema.tsv","paleon_morphology_terms.tsv",
                   "stratigraphy_terms.tsv","systematic_sections.tsv","taxons.txt"]:
         src = SYSTEM_DIR / fname
@@ -667,27 +759,19 @@ def _get_all_users() -> List[sqlite3.Row]:
 
 
 def _switch_user(username: str) -> None:
-    """Switches the active user and invalidates all caches."""
-    global _SCHEMA_DF, _MORPH_DF, _STRAT_DF
+    """Switches only this Streamlit session to another isolated user profile."""
     st.session_state["pn_user"] = username
-    # Aktualizovat last_seen
+    current_user_paths(username).ensure()
     try:
         con = _users_db()
         con.execute("UPDATE users SET last_seen=? WHERE username=? COLLATE NOCASE",
                     (datetime.now().isoformat(), username))
-        con.commit(); con.close()
+        con.commit()
+        con.close()
     except Exception:
-        pass
-    # Invalidovat allchny per-session cache
-    with _SCHEMA_LOCK:
-        _SCHEMA_DF = None
-    with _TERM_LOCK:
-        _MORPH_DF = None
-        _STRAT_DF = None
-    _invalidate_schema_derived_regex_cache()
+        logging.exception("Could not update last_seen for %r", username)
     st.session_state.pop("paleon_settings", None)
     st.session_state.pop("__gaz_cache", None)
-
 
 def _check_admin_password(entered: str) -> bool:
     return hmac.compare_digest(
@@ -736,9 +820,9 @@ OUTPUT_FIELDS = [
     "SOURCE PAGES", "FIELD_LANGUAGE_STATUS",
     "OCR_QUALITY_NOTE", "AMBIGUITY_FLAG",
     "EXTRACTION_CONFIDENCE", "EXTRACTION_NOTES",
-    # Feature 1: TYPE SPECIMENS strukturované
+    # Feature 1: TYPE SPECIMENS structured
     "TYPE_SPECIMEN_KIND", "INSTITUTION_CODE", "CATALOG_NUMBER",
-    # Feature 2: SIZE strukturované
+    # Feature 2: SIZE structured
     "SIZE_PARSED",
     # Feature 3: parent-child hierarchie
     "PARENT_TAXON_NAME", "PARENT_RANK",
@@ -776,7 +860,7 @@ You are the PaleoN field-assignment assistant. You will receive a verbatim taxon
 Assign text to canonical fields. Return ONLY valid JSON:
 {"fields":{"FIELD":"verbatim text..."},"reasons":{"FIELD":"why"},"confidence":"High|Medium|Low"}
 Use ONLY text from the input. Omit missing fields (do not write "Not provided").
-Nover summarise or modify the text."""
+Never summarise or modify the text."""
 
 LLM_TRANSLATION_PROMPT = """\
 You are a scientific translation assistant for palaeontological taxonomy.
@@ -790,8 +874,10 @@ Rules:
 - Stratigraphic unit names (Formation, Member, Stage, Biozone) keep their original proper name but translate the generic part (e.g. "Buchavské souvrství" → "Buchava Formation").
 - Geographic place names: keep the original local name but add English equivalent if widely known.
 - If a field value is already in English or is a proper name only, return it unchanged.
-- Nover summarise, shorten, or infer content that is not in the original text.
-- Omit fields you cannot translate (do not include them in the output JSON at all)."""
+- Never summarise, shorten, or infer content that is not in the original text.
+- Omit fields you cannot translate (do not include them in the output JSON at all).
+- Output MUST be a single valid JSON object. Inside string values, replace every line break with a single space and do not use unescaped control characters.
+- Do not output any reasoning, thoughts, markdown, or text outside the JSON object."""
 
 LLM_CJK_RU_EXTRACTION_PROMPT = """\
 You are a palaeontological taxonomy extraction assistant for ClaudePaleoN.
@@ -802,29 +888,47 @@ Your task: extract field values and return ONLY valid JSON in this exact format:
 {"fields": {"FIELD_NAME": "value in English"}, "confidence": "High|Medium|Low"}
 
 FIELD NAMES to extract (use only these canonical names):
-  DIAGNOSIS        — morphological characteristics / 特征 / 鉴别特征 / Диагноз
+  DIAGNOSIS        — morphological characteristics / 特征 / 鉴别特征 / 分类特征 / Диагноз
   DESCRIPTION      — detailed description / 描述 / Описание
-  REMARKS          — discussion, comparison / 讨论 / 比较 / 讨论与比较 / Замечания / Сравнение
-  OCCURRENCE       — age and distribution / 时代和分布 / 分布与时代 / Геологическое распространение
-  STRATIGRAPHY     — stratigraphic unit / 地层 / Стратиграфия
+  REMARKS          — discussion, comparison / 讨论 / 比较 / 讨论与比较 / 比较与讨论 / Замечания / Сравнение
+  OCCURRENCE       — age and distribution / 时代和分布 / 分布与时代 / 时代与分布 / Геологическое распространение
+  STRATIGRAPHY     — stratigraphic unit / horizon / 地层 / 层位 / 地层与时代 / Стратиграфия
   LOCALITY         — geographic locality / 产地 / Местонахождение
   TYPE TAXON       — type species or type genus / 模式种 / 模式属 / Типовой вид
-  TYPE SPECIMENS   — holotype, paratype etc. / 正模 / 副模 / Голотип
-  SYNONYMY         — synonymy list / 同物异名 / Синонимика
-  ETYMOLOGY        — name derivation / 种名来源 / 属名来源 / Этимология
-  SIZE             — measurements / 壳体度量 / Размеры
+  TYPE SPECIMENS   — holotype, paratype etc. / 正模 / 副模 / 模式标本 / 模式材料 / Голотип
+  SYNONYMY         — synonymy list / 同物异名 / 异名 / Синонимика
+  ETYMOLOGY        — name derivation / 种名来源 / 属名来源 / 词源 / Этимология
+  SIZE             — measurements / 壳体度量 / 度量 / Размеры
   INCLUDED TAXONS  — list of included species or genera / Состав / 包含种
+
+COMBINED LABELS (split into TWO fields):
+  产地与层位 / 产地与地层 ("locality and horizon") → put the GEOGRAPHIC place into LOCALITY
+    and the STRATIGRAPHIC unit (system/series/stage/formation) into STRATIGRAPHY.
+    Example: "湖北宜昌石牌虎井滩；下寒武统黄善洞组" →
+      LOCALITY: "Hujingtan, Shipai, Yichang, Hubei"
+      STRATIGRAPHY: "Lower Cambrian, Huangshandong Formation"
+  分布与时代 / 时代和分布 ("distribution and age") → OCCURRENCE (keep age + region together).
+
+HEADING STRUCTURE (for context — do NOT extract the heading itself as a field):
+  Chinese treatments are headed by a Chinese vernacular name followed by the Latin
+  name, e.g. "圆管螺属 Circotheca Sysoiev, 1958" (genus) or
+  "习水小阿纳巴管螺（新种） Anabaritellus xishuiensis sp. nov." (new species).
+  The Latin name, author and year in the heading belong to the taxon, not to a field.
 
 STRICT RULES:
 - Latin taxon names (e.g. Circotheca Sysoiev, 1958), author names, and years MUST be kept
-  verbatim — never translate or alter them.
+  verbatim — never translate or alter them. This includes names inside REMARKS/SYNONYMY.
 - Translate ALL other content into English (from Chinese or Russian).
-- Stratigraphic terms: translate generic part, keep formation name (e.g. 寒武纪 → Cambrian).
+- Stratigraphic terms: translate the generic part, keep the proper formation/stage name
+  (e.g. 下寒武统 → Lower Cambrian; 黄善洞组 → Huangshandong Formation; 梅树村阶 → Meishucun Stage).
+- Chinese place names: transliterate in pinyin, largest unit last
+  (e.g. 湖北宜昌 → Yichang, Hubei; 陕西宁强 → Ningqiang, Shaanxi).
 - Do NOT invent or infer data not present in the text.
 - Do NOT include fields that are absent from the block (omit them from JSON).
 - Do NOT include the raw Chinese/Russian text in values — provide English translation only.
 - If a section label appears but the content is empty or illegible, omit that field.
-- Return ONLY the JSON object — no markdown, no preamble, no explanation.\
+- Inside JSON string values, replace every line break with a single space; never emit unescaped control characters.
+- Return ONLY the JSON object — no markdown, no preamble, no reasoning, no explanation.\
 """
 
 DEFAULT_SETTINGS: Dict[str, Any] = {
@@ -833,11 +937,14 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "lmstudio_model": "",
     "llm_temperature": 0.0,
     "llm_timeout": 180,
+    "llm_max_tokens": 4096,          # response limit — prevents JSON truncation for long translations
+    "llm_json_mode": True,           # response_format={"type":"json_object"} for JSON tasks
+    "llm_disable_thinking": True,    # /no_think — disables Qwen3 reasoning, which breaks JSON
     "llm_validation_prompt": LLM_VALIDATION_PROMPT,
     "llm_boundary_prompt": LLM_BOUNDARY_PROMPT,
     "llm_field_prompt": LLM_FIELD_PROMPT,
     "llm_translation_prompt": LLM_TRANSLATION_PROMPT,
-    "llm_auto_translate": False,   # automatický překlad při indexaci (ne-EN Documenty)
+    "llm_auto_translate": False,   # automatic translation during indexing (ne-EN Documenty)
     "ocr_enabled": True,
     "ocr_languages": "eng+ces+rus+deu+fra+chi_sim",
     "pdf_min_chars": 80,
@@ -849,16 +956,28 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "show_rejected": False,
     "theme": "dark",
     "lang": "en",
+    "ui_mode": "Basic",          # Basic / Curator / Expert
+    "onboarding_completed": False,
+    "llm_verify_language_support": True,
+    "fast_approval": True,
+    "llm_fast_translation": True,
+    "llm_workflow_mode": "Conservative translation",
+    "llm_translation_batch_chars": 9000,
+    "llm_persistent_http": True,
+    "llm_strict_json_schema": True,
+    "llm_cjk_batch_records": 6,
+    "llm_cjk_batch_chars": 12000,
+    "llm_glossary_relevant_only": True,
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
-# NAČTENÍ SCHÉMATU  (TSV → engine)
+# SCHEMA LOADING (TSV → engine)
 # ══════════════════════════════════════════════════════════════════════════════
 
-_SCHEMA_DF: Optional[pd.DataFrame] = None
+_SCHEMA_CACHE: Dict[Tuple[str, int, int], pd.DataFrame] = {}
 _SCHEMA_LOCK = threading.Lock()
 
-# Minimální fallback schema (zahrnuto inline – app funguje i bez TSV fileu)
+# Minimal fallback schema (included inline – app funguje i without TSV fileu)
 _MINIMAL_SCHEMA_TSV = """\
 enabled\tlabel\tlabel_regex\tcanonical_label\ttarget_field\tis_strong\tcan_start_treatment\ttype_species_standalone\tpriority\tlanguage
 1\tDiagnosis\tDiagnosis\tDiagnosis\tDIAGNOSIS\t1\t0\t0\t100\ten/mixed
@@ -955,7 +1074,13 @@ enabled\tlabel\tlabel_regex\tcanonical_label\ttarget_field\tis_strong\tcan_start
 1\t种名来源\t种名来源\t种名来源\tETYMOLOGY\t1\t0\t0\t100\tzh
 1\t属名来源\t属名来源\t属名来源\tETYMOLOGY\t1\t0\t0\t100\tzh
 1\t壳体度量\t壳体度量\t壳体度量\tSIZE\t1\t0\t0\t100\tzh
+1\t壳体度盆\t壳体度盆\t壳体度盆\tSIZE\t1\t0\t0\t95\tzh
+1\t度量\t度量\t度量\tSIZE\t1\t0\t0\t85\tzh
 1\t保存壳长\t保存壳长\t保存壳长\tSIZE\t0\t0\t0\t80\tzh
+1\t层位\t层位\t层位\tSTRATIGRAPHY\t1\t0\t0\t90\tzh
+1\t分类特征\t分类特征\t分类特征\tDIAGNOSIS\t1\t0\t0\t95\tzh
+1\t异名\t异名\t异名\tSYNONYMY\t1\t0\t0\t90\tzh
+1\t词源\t词源\t词源\tETYMOLOGY\t1\t0\t0\t95\tzh
 1\t同物异名\t同物异名\t同物异名\tSYNONYMY\t1\t0\t0\t100\tzh
 1\tДиагноз\tДиагноз\tДиагноз\tDIAGNOSIS\t1\t0\t0\t100\tru
 1\tОписание\tОписание\tОписание\tDESCRIPTION\t1\t1\t0\t100\tru
@@ -968,17 +1093,70 @@ enabled\tlabel\tlabel_regex\tcanonical_label\ttarget_field\tis_strong\tcan_start
 1\tМатериал и местонахождение\tМатериал и местонахождение\tМатериал и местонахождение\tMATERIAL EXAMINED\t1\t0\t0\t100\tru
 1\tТиповой вид\tТиповой вид\tТиповой вид\tTYPE TAXON\t1\t0\t1\t100\tru
 1\tТиповой род\tТиповой род\tТиповой род\tTYPE TAXON\t1\t0\t1\t100\tru
+1\tRapp. et différ.\tRapp. et différ.\tRapp. et différ.\tREMARKS\t1\t0\t0\t100\tfr
+1\tRapp. et differ.\tRapp. et differ.\tRapp. et différ.\tREMARKS\t0\t0\t0\t90\tfr
+1\tGisem. et local.\tGisem. et local.\tGisem. et local.\tOCCURRENCE\t1\t0\t0\t100\tfr
+1\tGisemt. et local.\tGisemt. et local.\tGisem. et local.\tOCCURRENCE\t1\t0\t0\t100\tfr
+1\tGisemi. et local.\tGisemi. et local.\tGisem. et local.\tOCCURRENCE\t0\t0\t0\t95\tfr
+1\tGisem!. et local.\tGisem!. et local.\tGisem. et local.\tOCCURRENCE\t0\t0\t0\t95\tfr
+1\tGisem'. et local.\tGisem'. et local.\tGisem. et local.\tOCCURRENCE\t0\t0\t0\t95\tfr
+1\tGisem'. el local.\tGisem'. el local.\tGisem. et local.\tOCCURRENCE\t0\t0\t0\t90\tfr
+1\tGisemÿ. et local.\tGisemÿ. et local.\tGisem. et local.\tOCCURRENCE\t0\t0\t0\t90\tfr
+1\tVorkommen\tVorkommen\tVorkommen\tOCCURRENCE\t1\t0\t0\t100\tde
+1\tRozměry\tRozměry\tRozměry\tSIZE\t1\t0\t0\t100\tcs
+1\tVztah k ostatním\tVztah k ostatním\tVztah k ostatním\tREMARKS\t1\t0\t0\t100\tcs
+1\tVztahy k ostatním\tVztahy k ostatním\tVztahy k ostatním\tREMARKS\t0\t0\t0\t95\tcs
+1\tRozšíření\tRozšíření\tRozšíření\tOCCURRENCE\t1\t0\t0\t100\tcs
+1\tMateriál\tMateriál\tMateriál\tMATERIAL EXAMINED\t1\t0\t0\t100\tcs
+1\tDoplňek k synonymice\tDoplňek k synonymice\tDoplňek k synonymice\tSYNONYMY\t1\t0\t0\t90\tcs
 """
 
 
 # Forced English section aliases requested for post-translation / English remapping.
 # NOTE: UI/export still uses canonical PaleoN field names; "Discussion" maps to REMARKS.
 _SCHEMA_FORCED_ALIAS_ROWS = [
+    # ── EN: general aliases critical for correct mapping ─────────────────────
     {"enabled":"1", "label":"Characteristics", "label_regex":"Characteristics", "canonical_label":"Characteristics", "target_field":"DESCRIPTION", "is_strong":"1", "can_start_treatment":"1", "type_species_standalone":"0", "priority":"110", "language":"en/mixed"},
     {"enabled":"1", "label":"Discussion and Comparison", "label_regex":"Discussion and Comparison", "canonical_label":"Discussion and Comparison", "target_field":"REMARKS", "is_strong":"1", "can_start_treatment":"1", "type_species_standalone":"0", "priority":"110", "language":"en/mixed"},
     {"enabled":"1", "label":"Age and Distribution", "label_regex":"Age and Distribution", "canonical_label":"Age and Distribution", "target_field":"OCCURRENCE", "is_strong":"1", "can_start_treatment":"1", "type_species_standalone":"0", "priority":"110", "language":"en/mixed"},
     {"enabled":"1", "label":"Discussion", "label_regex":"Discussion", "canonical_label":"Discussion", "target_field":"REMARKS", "is_strong":"1", "can_start_treatment":"1", "type_species_standalone":"0", "priority":"105", "language":"en/mixed"},
     {"enabled":"1", "label":"Comparison", "label_regex":"Comparison", "canonical_label":"Comparison", "target_field":"REMARKS", "is_strong":"1", "can_start_treatment":"1", "type_species_standalone":"0", "priority":"105", "language":"en/mixed"},
+    # ── BOTANY: EN critical labels ───────────────────────────────────────────
+    {"enabled":"1", "label":"Basionym", "label_regex":"Basionym", "canonical_label":"Basionym", "target_field":"NOMENCLATURAL ACTS", "is_strong":"1", "can_start_treatment":"1", "type_species_standalone":"0", "priority":"100", "language":"en/mixed"},
+    {"enabled":"1", "label":"Holotypus", "label_regex":"Holotypus", "canonical_label":"Holotypus", "target_field":"TYPE SPECIMENS", "is_strong":"1", "can_start_treatment":"1", "type_species_standalone":"0", "priority":"100", "language":"la/abbr"},
+    {"enabled":"1", "label":"Isotypus", "label_regex":"Isotypus", "canonical_label":"Isotypus", "target_field":"TYPE SPECIMENS", "is_strong":"1", "can_start_treatment":"1", "type_species_standalone":"0", "priority":"100", "language":"la/abbr"},
+    {"enabled":"1", "label":"Lectotypus", "label_regex":"Lectotypus", "canonical_label":"Lectotypus", "target_field":"TYPE SPECIMENS", "is_strong":"1", "can_start_treatment":"1", "type_species_standalone":"0", "priority":"100", "language":"la/abbr"},
+    {"enabled":"1", "label":"Descriptio", "label_regex":"Descriptio", "canonical_label":"Descriptio", "target_field":"DESCRIPTION", "is_strong":"1", "can_start_treatment":"1", "type_species_standalone":"0", "priority":"100", "language":"la/abbr"},
+    {"enabled":"1", "label":"Locus classicus", "label_regex":"Locus classicus", "canonical_label":"Locus classicus", "target_field":"LOCALITY", "is_strong":"1", "can_start_treatment":"1", "type_species_standalone":"0", "priority":"100", "language":"la/abbr"},
+    {"enabled":"1", "label":"Spore description", "label_regex":"Spore description", "canonical_label":"Spore description", "target_field":"DESCRIPTION", "is_strong":"1", "can_start_treatment":"1", "type_species_standalone":"0", "priority":"100", "language":"en/mixed"},
+    {"enabled":"1", "label":"Pollen morphology", "label_regex":"Pollen morphology", "canonical_label":"Pollen morphology", "target_field":"DESCRIPTION", "is_strong":"1", "can_start_treatment":"1", "type_species_standalone":"0", "priority":"100", "language":"en/mixed"},
+    {"enabled":"1", "label":"Cuticle description", "label_regex":"Cuticle description", "canonical_label":"Cuticle description", "target_field":"DESCRIPTION", "is_strong":"1", "can_start_treatment":"1", "type_species_standalone":"0", "priority":"100", "language":"en/mixed"},
+    {"enabled":"1", "label":"Wood anatomy", "label_regex":"Wood anatomy", "canonical_label":"Wood anatomy", "target_field":"DESCRIPTION", "is_strong":"1", "can_start_treatment":"1", "type_species_standalone":"0", "priority":"100", "language":"en/mixed"},
+    {"enabled":"1", "label":"Leaf architecture", "label_regex":"Leaf architecture", "canonical_label":"Leaf architecture", "target_field":"DESCRIPTION", "is_strong":"1", "can_start_treatment":"1", "type_species_standalone":"0", "priority":"100", "language":"en/mixed"},
+    {"enabled":"1", "label":"Exsiccata", "label_regex":"Exsiccata", "canonical_label":"Exsiccata", "target_field":"MATERIAL EXAMINED", "is_strong":"1", "can_start_treatment":"1", "type_species_standalone":"0", "priority":"95", "language":"en/mixed"},
+    # ── ICHNOLOGY: EN critical labels ────────────────────────────────────────
+    {"enabled":"1", "label":"Ethology", "label_regex":"Ethology", "canonical_label":"Ethology", "target_field":"DESCRIPTION", "is_strong":"1", "can_start_treatment":"1", "type_species_standalone":"0", "priority":"100", "language":"en/mixed"},
+    {"enabled":"1", "label":"Behavioral category", "label_regex":"Behavioral category", "canonical_label":"Behavioral category", "target_field":"DESCRIPTION", "is_strong":"1", "can_start_treatment":"1", "type_species_standalone":"0", "priority":"100", "language":"en/mixed"},
+    {"enabled":"1", "label":"Behavioural category", "label_regex":"Behavioural category", "canonical_label":"Behavioural category", "target_field":"DESCRIPTION", "is_strong":"1", "can_start_treatment":"1", "type_species_standalone":"0", "priority":"100", "language":"en/mixed"},
+    {"enabled":"1", "label":"Tracemaker", "label_regex":"Tracemaker", "canonical_label":"Tracemaker", "target_field":"REMARKS", "is_strong":"1", "can_start_treatment":"1", "type_species_standalone":"0", "priority":"100", "language":"en/mixed"},
+    {"enabled":"1", "label":"Preservational mode", "label_regex":"Preservational mode", "canonical_label":"Preservational mode", "target_field":"DESCRIPTION", "is_strong":"1", "can_start_treatment":"1", "type_species_standalone":"0", "priority":"100", "language":"en/mixed"},
+    {"enabled":"1", "label":"Mode of preservation", "label_regex":"Mode of preservation", "canonical_label":"Mode of preservation", "target_field":"DESCRIPTION", "is_strong":"1", "can_start_treatment":"1", "type_species_standalone":"0", "priority":"100", "language":"en/mixed"},
+    {"enabled":"1", "label":"Ichnofacies", "label_regex":"Ichnofacies", "canonical_label":"Ichnofacies", "target_field":"OCCURRENCE", "is_strong":"1", "can_start_treatment":"1", "type_species_standalone":"0", "priority":"100", "language":"en/mixed"},
+    {"enabled":"1", "label":"Substrate", "label_regex":"Substrate", "canonical_label":"Substrate", "target_field":"OCCURRENCE", "is_strong":"1", "can_start_treatment":"1", "type_species_standalone":"0", "priority":"95", "language":"en/mixed"},
+    {"enabled":"1", "label":"Tier", "label_regex":"Tier", "canonical_label":"Tier", "target_field":"DESCRIPTION", "is_strong":"1", "can_start_treatment":"0", "type_species_standalone":"0", "priority":"90", "language":"en/mixed"},
+    {"enabled":"1", "label":"Depositional environment", "label_regex":"Depositional environment", "canonical_label":"Depositional environment", "target_field":"OCCURRENCE", "is_strong":"1", "can_start_treatment":"1", "type_species_standalone":"0", "priority":"100", "language":"en/mixed"},
+    {"enabled":"1", "label":"Palaeoenvironment", "label_regex":"Palaeoenvironment", "canonical_label":"Palaeoenvironment", "target_field":"OCCURRENCE", "is_strong":"1", "can_start_treatment":"1", "type_species_standalone":"0", "priority":"100", "language":"en/mixed"},
+    {"enabled":"1", "label":"Burrow dimensions", "label_regex":"Burrow dimensions", "canonical_label":"Burrow dimensions", "target_field":"SIZE", "is_strong":"1", "can_start_treatment":"1", "type_species_standalone":"0", "priority":"100", "language":"en/mixed"},
+    # ── SWEDISH (sv): critical labels for Holm 1893 ──────────────────────────
+    {"enabled":"1", "label":"Diagnos", "label_regex":"Diagnos", "canonical_label":"Diagnos", "target_field":"DIAGNOSIS", "is_strong":"1", "can_start_treatment":"1", "type_species_standalone":"0", "priority":"100", "language":"sv"},
+    {"enabled":"1", "label":"Beskrivning", "label_regex":"Beskrivning", "canonical_label":"Beskrivning", "target_field":"DESCRIPTION", "is_strong":"1", "can_start_treatment":"1", "type_species_standalone":"0", "priority":"100", "language":"sv"},
+    {"enabled":"1", "label":"Anmärkning", "label_regex":"Anmärkning", "canonical_label":"Anmärkning", "target_field":"REMARKS", "is_strong":"1", "can_start_treatment":"1", "type_species_standalone":"0", "priority":"100", "language":"sv"},
+    {"enabled":"1", "label":"Förekomst", "label_regex":"Förekomst", "canonical_label":"Förekomst", "target_field":"OCCURRENCE", "is_strong":"1", "can_start_treatment":"1", "type_species_standalone":"0", "priority":"100", "language":"sv"},
+    {"enabled":"1", "label":"Fyndort", "label_regex":"Fyndort", "canonical_label":"Fyndort", "target_field":"LOCALITY", "is_strong":"1", "can_start_treatment":"1", "type_species_standalone":"0", "priority":"100", "language":"sv"},
+    {"enabled":"1", "label":"Jämförelse", "label_regex":"Jämförelse", "canonical_label":"Jämförelse", "target_field":"REMARKS", "is_strong":"1", "can_start_treatment":"1", "type_species_standalone":"0", "priority":"100", "language":"sv"},
+    {"enabled":"1", "label":"Synonymi", "label_regex":"Synonymi", "canonical_label":"Synonymi", "target_field":"SYNONYMY", "is_strong":"1", "can_start_treatment":"1", "type_species_standalone":"0", "priority":"100", "language":"sv"},
+    {"enabled":"1", "label":"Storlek", "label_regex":"Storlek", "canonical_label":"Storlek", "target_field":"SIZE", "is_strong":"1", "can_start_treatment":"1", "type_species_standalone":"0", "priority":"100", "language":"sv"},
+    {"enabled":"1", "label":"Mått", "label_regex":"Mått", "canonical_label":"Mått", "target_field":"SIZE", "is_strong":"1", "can_start_treatment":"1", "type_species_standalone":"0", "priority":"100", "language":"sv"},
 ]
 
 
@@ -997,88 +1175,89 @@ def _apply_forced_schema_aliases(df: pd.DataFrame) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
-def load_schema(path: pathlib.Path = None) -> pd.DataFrame:
-    """
-    Loads the active user's TSV schema. Falls back if the file does not exist.
-    Returns a DataFrame with indexed rows.
-    """
-    global _SCHEMA_DF
-    if path is None:
-        path = _upath("section_schema.tsv")
-        if not path.exists():
-            path = SCHEMA_FILE  # legacy fallback
-    with _SCHEMA_LOCK:
-        if _SCHEMA_DF is not None:
-            return _SCHEMA_DF
-        if path.exists():
-            try:
-                df = pd.read_csv(path, sep="\t", encoding="utf-8", dtype=str).fillna("")
-                df["enabled"] = df["enabled"].astype(str).str.strip()
-                df = df[df["enabled"] == "1"].reset_index(drop=True)
-                _SCHEMA_DF = _apply_forced_schema_aliases(df)
-                return _SCHEMA_DF
-            except Exception as exc:
-                logging.warning(f"Schema load failed ({exc}); using fallback.")
-        df = pd.read_csv(io.StringIO(_MINIMAL_SCHEMA_TSV), sep="\t", dtype=str).fillna("")
-        df = df[df["enabled"] == "1"].reset_index(drop=True)
-        _SCHEMA_DF = _apply_forced_schema_aliases(df)
-        return _SCHEMA_DF
+def _file_cache_key(path: pathlib.Path) -> Tuple[str, int, int]:
+    """Path + mtime + size; prevents cross-user and stale file caches."""
+    resolved = str(path.resolve())
+    try:
+        stt = path.stat()
+        return resolved, int(stt.st_mtime_ns), int(stt.st_size)
+    except OSError:
+        return resolved, 0, 0
 
+
+def load_schema(path: pathlib.Path = None) -> pd.DataFrame:
+    """Loads and caches a schema by its concrete file identity."""
+    if path is None:
+        path = current_user_paths().schema
+        if not path.exists():
+            path = SCHEMA_FILE
+    key = _file_cache_key(path)
+    with _SCHEMA_LOCK:
+        cached = _SCHEMA_CACHE.get(key)
+    if cached is not None:
+        return cached
+    if path.exists():
+        try:
+            df = pd.read_csv(path, sep="\t", encoding="utf-8", dtype=str).fillna("")
+            df["enabled"] = df["enabled"].astype(str).str.strip()
+            df = df[df["enabled"] == "1"].reset_index(drop=True)
+        except Exception as exc:
+            logging.warning("Schema load failed (%s); using fallback.", exc)
+            df = pd.read_csv(io.StringIO(_MINIMAL_SCHEMA_TSV), sep="\t", dtype=str).fillna("")
+    else:
+        df = pd.read_csv(io.StringIO(_MINIMAL_SCHEMA_TSV), sep="\t", dtype=str).fillna("")
+    df = df[df["enabled"] == "1"].reset_index(drop=True)
+    result = _apply_forced_schema_aliases(df)
+    with _SCHEMA_LOCK:
+        _SCHEMA_CACHE[key] = result
+    return result
 
 def reload_schema():
-    """Forces schema reload (after uploading a new TSV)."""
-    global _SCHEMA_DF
+    """Invalidates schema-derived caches without affecting user isolation."""
     with _SCHEMA_LOCK:
-        _SCHEMA_DF = None
+        _SCHEMA_CACHE.clear()
     _invalidate_schema_derived_regex_cache()
 
-
-# ── Gazetteer (seznam známých taxa) ───────────────────────────────────────
-# Volitelný měkký bonus do scoring — NE tvrdý filtr. Pokud kandidát
-# odpovídá jménu (or rodu) ze seznamu, dostane bonus k duvěře. Nopřítomnost
-# v seznamu NIC nepenalizuje — v textech se mohou objevit i jiné, neznámé
-# taxony (nově popisované druhy z aktuálního článku tam logicky missing).
-_GAZETTEER_GENERA: Optional[set] = None
-_GAZETTEER_BINOMIALS: Optional[set] = None
+# ── Gazetteer (list znamych taxa) ───────────────────────────────────────
+# Optional soft bonus to scoring — NOT and hard filter. If the candidate
+# matches and name (or genusu) from the list, dostane bonus k duvere. Nopritomnost
+# absence from the list is NOT penalized — texts may contain i jine, nezname
+# taxony (newly described species from aktualniho clanku tam logicky missing).
+_GAZETTEER_CACHE: Dict[Tuple[str, int, int], Tuple[set, set]] = {}
 _GAZETTEER_LOCK = threading.Lock()
 
 
 def load_gazetteer(path: pathlib.Path = None) -> Tuple[set, set]:
+    """Loads known taxa; cache is keyed by the exact user file."""
     if path is None:
-        path = _upath("taxons.txt")
-        if not path.exists(): path = GAZETTEER_FILE
-    """Loads the list of known taxa. Returns (set of genus names, set of binomials)."""
-    global _GAZETTEER_GENERA, _GAZETTEER_BINOMIALS
+        path = current_user_paths().gazetteer
+        if not path.exists():
+            path = GAZETTEER_FILE
+    key = _file_cache_key(path)
     with _GAZETTEER_LOCK:
-        if _GAZETTEER_GENERA is not None:
-            return _GAZETTEER_GENERA, _GAZETTEER_BINOMIALS
-        genera: set = set()
-        binomials: set = set()
-        if path.exists():
-            try:
-                for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-                    name = line.strip()
-                    if not name:
-                        continue
-                    parts = name.split()
-                    if len(parts) >= 1:
-                        genera.add(parts[0].lower())
-                    if len(parts) >= 2:
-                        binomials.add(f"{parts[0]} {parts[1]}".lower())
-            except Exception:
-                pass
-        _GAZETTEER_GENERA = genera
-        _GAZETTEER_BINOMIALS = binomials
-        return genera, binomials
-
+        cached = _GAZETTEER_CACHE.get(key)
+    if cached is not None:
+        return cached
+    genera, binomials = set(), set()
+    if path.exists():
+        try:
+            for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                parts = line.strip().split()
+                if parts:
+                    genera.add(parts[0].lower())
+                if len(parts) >= 2:
+                    binomials.add(f"{parts[0]} {parts[1]}".lower())
+        except OSError as exc:
+            logging.warning("Gazetteer load failed (%s): %s", path, exc)
+    result = (genera, binomials)
+    with _GAZETTEER_LOCK:
+        _GAZETTEER_CACHE[key] = result
+    return result
 
 def reload_gazetteer():
-    """Forces gazetteer reload (after uploading a new taxons.txt)."""
-    global _GAZETTEER_GENERA, _GAZETTEER_BINOMIALS
+    """Invalidates gazetteer caches; next access reloads the active file."""
     with _GAZETTEER_LOCK:
-        _GAZETTEER_GENERA = None
-        _GAZETTEER_BINOMIALS = None
-
+        _GAZETTEER_CACHE.clear()
 
 def rebuild_taxon_hierarchy() -> Dict[str, int]:
     """
@@ -1103,15 +1282,19 @@ def rebuild_taxon_hierarchy() -> Dict[str, int]:
     ]
 
     con = db()
-    # Načíst allchny kandidáty jedním SQL dotazem (sorted = pořadí v lit.)
+    # Load allchny kandidaty with one SQL query (sorted = poradi in lit.)
+    # Secondary sorting podle unit_index: cinske monografie maji vice treatmentu
+    # on one page (stejny page_start) — without unit_index the order in ramci
+    # strany would be nondeterministic and parent-child the hierarchy would break.
     rows = con.execute(
         "SELECT id, taxon_name, rank_guess, page_start, document_id, "
         "parent_taxon_name, parent_rank FROM taxon_candidates "
         "WHERE status IN ('approved','pending','needs_review','low_confidence') "
-        "ORDER BY document_id, page_start"
+        "ORDER BY document_id, page_start, "
+        "CASE WHEN unit_index IS NULL THEN 999999 ELSE unit_index END, id"
     ).fetchall()
 
-    # Načíst INCLUDED TAXONS pole pro párovací krok (genus → family)
+    # Load INCLUDED TAXONS field for parovaci kyear (genus → family)
     included_map: Dict[int, str] = {}
     for r in con.execute(
         "SELECT candidate_id, field_value FROM occurrence_fields "
@@ -1119,7 +1302,7 @@ def rebuild_taxon_hierarchy() -> Dict[str, int]:
     ).fetchall():
         included_map[r["candidate_id"]] = r["field_value"]
 
-    # Sestavit index: name_lower → (id, rank) pro rychlé hledání
+    # Build an index: name_lower → (id, rank) for fast lookup
     name_index: Dict[str, List[Tuple[int, str]]] = {}
     for r in rows:
         key = (r["taxon_name"] or "").strip().lower()
@@ -1139,12 +1322,12 @@ def rebuild_taxon_hierarchy() -> Dict[str, int]:
             stats["skipped"] += 1
             continue
 
-        # Reset stack při přechodu na nový Document
+        # Reset the stack when switching on new Document
         if r["document_id"] != _cur_doc:
             _stack = {}
             _cur_doc = r["document_id"]
 
-        # Najdi nejbližšího rodiče
+        # Find the nearest parent
         my_pos = _RANK_ORDER.index(rank_raw)
         parent_name = ""
         parent_rank = ""
@@ -1156,13 +1339,13 @@ def rebuild_taxon_hierarchy() -> Dict[str, int]:
         # Aktualizuj stack pro tento rank
         _stack[rank_raw] = (r["taxon_name"] or "").strip(), rank_raw
 
-        # Vymaž nižší ranky (jsou teď mimo Context)
+        # Remove lower ranks (are ted mimo Context)
         for pr in _RANK_ORDER[my_pos + 1:]:
             _stack.pop(pr, None)
 
-        # Pokud stále nemáme rodiče, zkus INCLUDED TAXONS z vyšší jednotky
+        # If there is still no parent, try INCLUDED TAXONS from vyssi jednotky
         if not parent_name and rank_raw == "species":
-            # Pro druh: hledej rod podle prvního slova jména
+            # For and species: search for the genus using the first word of the name
             genus_prefix = (r["taxon_name"] or "").split()[0].lower()
             if genus_prefix in name_index:
                 for pid, prank in name_index[genus_prefix]:
@@ -1171,7 +1354,7 @@ def rebuild_taxon_hierarchy() -> Dict[str, int]:
                         parent_rank = "genus"
                         break
 
-        # Porovnej s existujícím - aktualizuj jen pokud se změnilo
+        # Compare with the existing value - update only if it changed
         old_pn = (r["parent_taxon_name"] or "").strip()
         old_pr = (r["parent_rank"] or "").strip()
         if old_pn == parent_name and old_pr == parent_rank:
@@ -1180,7 +1363,7 @@ def rebuild_taxon_hierarchy() -> Dict[str, int]:
             updates.append((parent_name, parent_rank, r["id"]))
             stats["updated"] += 1
 
-    # Dávková aktualizace v jedné transakci
+    # Batch update in and single transaction
     if updates:
         con.executemany(
             "UPDATE taxon_candidates SET parent_taxon_name=?, parent_rank=? WHERE id=?",
@@ -1191,23 +1374,23 @@ def rebuild_taxon_hierarchy() -> Dict[str, int]:
 
 
 
-# Stejný princip jako u taxonomického gazetteeru: TSV file s termíny,
-# kategoriemi a jazyky, předpočítané shody se ukládají do tabulky
-# term_matches při schválení kandidáta (viz compute_and_save_term_matches_*).
+# The same principle as u taxonomickeho gazetteeru: TSV file s terms,
+# categories and languages, precomputed matches are stored in the table
+# term_matches when and candidate is approved (viz compute_and_save_term_matches_*).
 
-_MORPH_DF: Optional[pd.DataFrame] = None
-_STRAT_DF: Optional[pd.DataFrame] = None
+_MORPH_CACHE: Dict[Tuple[str, int, int], pd.DataFrame] = {}
+_STRAT_CACHE: Dict[Tuple[str, int, int], pd.DataFrame] = {}
 _TERM_LOCK = threading.Lock()
 
 # ── Cached compiled regexes ─────────────────────────────────────────────────
-# Regex se buildí jednou při prvním použití a cachuje se v paměti.
-# Při reloadu TSV je cache invalidována přes reload_morphology/stratigraphy_terms().
+# Regex buildi jednou on first use and and cached in memory.
+# When the TSV is reloaded is the cache is invalidated pres reload_morphology/stratigraphy_terms().
 # (dict[term_lower→(canonical,category)], max_ngrams)
 _MORPH_REGEX_CACHE: Optional[Tuple[Dict[str, Tuple[str, str]], int]] = None
 _STRAT_REGEX_CACHE: Optional[Tuple[Dict[str, Tuple[str, str]], int]] = None
 
-# ── Named-unit regex — kompilujeme JEDNOU na úrovni modulu ─────────────────
-# (dříve bylo uvnitř compute_term_matches → zbytečná re.compile() při každém volání)
+# ── Named-unit regex — compile ONCE at module level ─────────────────
+# (previously it was inside compute_term_matches → unnecessary re.compile() on every call)
 _NAMED_STRAT_UNIT_TYPES = (
     # EN
     "Formation|Member|Stage|Zone|Biozone|Group|Suite|Series|System|"
@@ -1233,66 +1416,66 @@ _NAMED_STRAT_UNIT_RE = re.compile(
     r"[\s\-]+(" + _NAMED_STRAT_UNIT_TYPES + r")",
     re.UNICODE | re.IGNORECASE)
 
-# Tokenizer pro compute_term_matches — modul-level konstanta (ne uvnitř funkce)
+# Tokenizer for compute_term_matches — modul-level konstanta (not inside the function)
 _TERM_WORD_RE = re.compile(
     r"[\w\u00c0-\u024f\u0400-\u04ff\u4e00-\u9fff]{2,}", re.UNICODE)
 
 
 def load_morphology_terms(path: pathlib.Path = None) -> pd.DataFrame:
     if path is None:
-        path = _upath("paleon_morphology_terms.tsv")
-        if not path.exists(): path = MORPHOLOGY_FILE
-    """Loads the list of morphological terms (term, canonical, category, language, enabled)."""
-    global _MORPH_DF
+        paths = current_user_paths()
+        path = paths.morphology
+        if not path.exists():
+            alt = paths.root / "morphology_terms.tsv"
+            path = alt if alt.exists() else MORPHOLOGY_FILE
+    key = _file_cache_key(path)
     with _TERM_LOCK:
-        if _MORPH_DF is not None:
-            return _MORPH_DF
-        if path.exists():
-            try:
-                df = pd.read_csv(path, sep="\t", dtype=str, encoding="utf-8").fillna("")
-                if "enabled" in df.columns:
-                    df = df[df["enabled"].astype(str).str.strip() == "1"]
-                _MORPH_DF = df.reset_index(drop=True)
-                return _MORPH_DF
-            except Exception as exc:
-                logging.warning(f"Morphology terms load failed ({exc}); using empty set.")
-        _MORPH_DF = pd.DataFrame(columns=["term","canonical","category","language","enabled"])
-        return _MORPH_DF
-
+        cached = _MORPH_CACHE.get(key)
+    if cached is not None:
+        return cached
+    result = pd.DataFrame(columns=["term","canonical","category","language","enabled"])
+    if path.exists():
+        try:
+            result = pd.read_csv(path, sep="\t", dtype=str, encoding="utf-8").fillna("")
+            if "enabled" in result.columns:
+                result = result[result["enabled"].astype(str).str.strip() == "1"]
+            result = result.reset_index(drop=True)
+        except Exception as exc:
+            logging.warning("Morphology terms load failed (%s); using empty set.", exc)
+    with _TERM_LOCK:
+        _MORPH_CACHE[key] = result
+    return result
 
 def load_stratigraphy_terms(path: pathlib.Path = None) -> pd.DataFrame:
     if path is None:
-        path = _upath("stratigraphy_terms.tsv")
-        if not path.exists(): path = STRATIGRAPHY_FILE
-    """Loads the list of stratigraphic terms (enabled, term, canonical, category, language, match_mode, source_term_en)."""
-    global _STRAT_DF
+        path = current_user_paths().stratigraphy
+        if not path.exists():
+            path = STRATIGRAPHY_FILE
+    key = _file_cache_key(path)
     with _TERM_LOCK:
-        if _STRAT_DF is not None:
-            return _STRAT_DF
-        if path.exists():
-            try:
-                df = pd.read_csv(path, sep="\t", dtype=str, encoding="utf-8").fillna("")
-                if "enabled" in df.columns:
-                    df = df[df["enabled"].astype(str).str.strip() == "1"]
-                _STRAT_DF = df.reset_index(drop=True)
-                return _STRAT_DF
-            except Exception as exc:
-                logging.warning(f"Stratigraphy terms load failed ({exc}); using empty set.")
-        _STRAT_DF = pd.DataFrame(columns=["enabled","term","canonical","category","language","match_mode"])
-        return _STRAT_DF
-
+        cached = _STRAT_CACHE.get(key)
+    if cached is not None:
+        return cached
+    result = pd.DataFrame(columns=["enabled","term","canonical","category","language","match_mode"])
+    if path.exists():
+        try:
+            result = pd.read_csv(path, sep="\t", dtype=str, encoding="utf-8").fillna("")
+            if "enabled" in result.columns:
+                result = result[result["enabled"].astype(str).str.strip() == "1"]
+            result = result.reset_index(drop=True)
+        except Exception as exc:
+            logging.warning("Stratigraphy terms load failed (%s); using empty set.", exc)
+    with _TERM_LOCK:
+        _STRAT_CACHE[key] = result
+    return result
 
 def reload_morphology_terms():
-    global _MORPH_DF
     with _TERM_LOCK:
-        _MORPH_DF = None
-
+        _MORPH_CACHE.clear()
 
 def reload_stratigraphy_terms():
-    global _STRAT_DF
     with _TERM_LOCK:
-        _STRAT_DF = None
-
+        _STRAT_CACHE.clear()
 
 def _load_raw_tsv(path: pathlib.Path, default_cols: list) -> pd.DataFrame:
     """Load a TSV file WITHOUT filtering enabled/disabled rows — for use in the term editors.
@@ -1318,44 +1501,37 @@ def get_term_regex(term_type: str) -> Tuple[re.Pattern, Dict[str, Tuple[str, str
 
 
 # ── Systematic sections ─────────────────────────────────────────────────────
-_SYST_DF:    Optional[pd.DataFrame] = None
-_SYST_RE_CACHE: Optional[re.Pattern]  = None
+_SYST_CACHE: Dict[Tuple[str, int, int], pd.DataFrame] = {}
+_SYST_RE_CACHE: Dict[str, re.Pattern] = {}
 
 
 def load_systematic_sections(path: pathlib.Path = None) -> pd.DataFrame:
-    """
-    Loads the systematic section headings table (systematic_sections.tsv).
-    Columns: enabled, language, heading, priority, weight, pattern, note
-    Returns only rows with enabled=1.
-    """
-
-    global _SYST_DF
     if path is None:
-        path = _upath("systematic_sections.tsv")
+        path = current_user_paths().systematic_sections
         if not path.exists():
             path = SYSTEMATIC_SECTIONS_FILE
+    key = _file_cache_key(path)
     with _TERM_LOCK:
-        if _SYST_DF is not None:
-            return _SYST_DF
-        if path.exists():
-            try:
-                df = pd.read_csv(path, sep="\t", dtype=str, encoding="utf-8").fillna("")
-                if "enabled" in df.columns:
-                    df = df[df["enabled"].astype(str).str.strip() == "1"]
-                _SYST_DF = df.reset_index(drop=True)
-                return _SYST_DF
-            except Exception as exc:
-                logging.warning(f"Systematic sections load failed ({exc}); using built-in.")
-        _SYST_DF = pd.DataFrame(columns=["enabled","language","heading","priority","weight","pattern","note"])
-        return _SYST_DF
-
+        cached = _SYST_CACHE.get(key)
+    if cached is not None:
+        return cached
+    result = pd.DataFrame(columns=["enabled","language","heading","priority","weight","pattern","note"])
+    if path.exists():
+        try:
+            result = pd.read_csv(path, sep="\t", dtype=str, encoding="utf-8").fillna("")
+            if "enabled" in result.columns:
+                result = result[result["enabled"].astype(str).str.strip() == "1"]
+            result = result.reset_index(drop=True)
+        except Exception as exc:
+            logging.warning("Systematic sections load failed (%s); using built-in.", exc)
+    with _TERM_LOCK:
+        _SYST_CACHE[key] = result
+    return result
 
 def reload_systematic_sections():
-    global _SYST_DF, _SYST_RE_CACHE
     with _TERM_LOCK:
-        _SYST_DF = None
-        _SYST_RE_CACHE = None
-
+        _SYST_CACHE.clear()
+        _SYST_RE_CACHE.clear()
 
 def build_systematic_re() -> re.Pattern:
     """
@@ -1365,26 +1541,27 @@ def build_systematic_re() -> re.Pattern:
       2. Original hard-coded patterns (fallback)
     Result is cached in _SYST_RE_CACHE.
     """
-    global _SYST_RE_CACHE
+    cache_key = _current_username()
     with _TERM_LOCK:
-        if _SYST_RE_CACHE is not None:
-            return _SYST_RE_CACHE
+        cached = _SYST_RE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
     df = load_systematic_sections()
     patterns: List[str] = []
     if not df.empty and "pattern" in df.columns:
-        # Použít jen core a support záznamy
+        # Use only core and support records
         active = df[df.get("priority", pd.Series(["core"]*len(df))).isin(["core","support"])]
         for pat in active["pattern"].dropna():
             pat = str(pat).strip()
             if pat:
-                # Extrahovat jádro vzoru (odpagesit (?i) a anchory pro použití v SYSTEMATIC_RE)
-                # Použijeme celý pattern jako alternativu
+                # Extract the pattern core (odpagesit (?i) and anchory for use in SYSTEMATIC_RE)
+                # Use the complete pattern as an alternative
                 try:
-                    re.compile(pat)   # ověřit validitu
+                    re.compile(pat)   # validate
                     patterns.append(pat)
                 except re.error:
                     pass
-    # Hard-coded fallback (puvodní SYSTEMATIC_RE alternativy)
+    # Hard-coded fallback (puvodni SYSTEMATIC_RE alternativy)
     _FALLBACK = (
         r"\bSystematic\s+pal(?:a?e)ontology\b|"
         r"\bSystematic\s+characteri[sz]ation\b|"
@@ -1392,7 +1569,10 @@ def build_systematic_re() -> re.Pattern:
         r"\bTaxonomy\b|"
         r"\bSystematic\s+descriptions?\b|"
         r"\bSystematische\s+Pal[aä]ontologie\b|"
+        r"\bBeschreibung\s+der\s+Arten\b|"
         r"\bSyst[eé]matique\b|"
+        r"\bPal[eé]ontologie\s+syst[eé]matique\b|"
+        r"\bDescription\s+des\s+esp[eè]ces\b|"
         r"\bSistematica\b|"
         r"\b\u0421\u0438\u0441\u0442\u0435\u043c\u0430\u0442\u0438\u0447\u0435\u0441\u043a\u0430\u044f\s+\u043f\u0430\u043b\u0435\u043e\u043d\u0442\u043e\u043b\u043e\u0433\u0438\u044f\b|"
         r"\b\u0421\u0438\u0441\u0442\u0435\u043c\u0430\u0442\u0438\u0447\u0435\u0441\u043a\u0430\u044f\s+\u0447\u0430\u0441\u0442\u044c\b|"
@@ -1401,25 +1581,25 @@ def build_systematic_re() -> re.Pattern:
     if not patterns:
         result = re.compile(_FALLBACK, re.IGNORECASE | re.UNICODE)
     else:
-        # Kombinujeme patterns z TSV jako alternativu celých řádku
-        # TSV patterns již mají (?i) na začátku každého — extrahujeme je do flagu
+        # Combine patterns from TSV as alternativu celych radku
+        # TSV patterns already contain (?i) at the start of each — move them to the flag
         clean_parts = []
         for p in patterns:
-            # Odstranit všechny inline globální flagy ze začátku patternu.
-            # TSV patterns mohou začínat (?i), (?u), (?iu), (?ui) apod. —
-            # kompilujeme s re.IGNORECASE | re.UNICODE, takže inline flagy musí
-            # být odstraněny (Python 3.11+ vyhodí "global flags not at start").
+            # Remove all inline global flags from the start of the pattern.
+            # TSV patterns may begin (?i), (?u), (?iu), (?ui) apod. —
+            # kompilujeme s re.IGNORECASE | re.UNICODE, takthat inline flagy must
+            # byt odstraneny (Python 3.11+ raises "global flags not at start").
             clean = re.sub(r"^\(\?[a-zA-Z]+\)", "", p.strip()).strip()
             try:
                 re.compile(clean, re.IGNORECASE)
                 clean_parts.append(f"(?:{clean})")
             except re.error:
-                # Pokud pattern nejde kompilovat, použij jen text nadpisu
+                # If the pattern cannot be compiled, use only the heading text
                 pass
         combined_tsv = "|".join(clean_parts) if clean_parts else _FALLBACK
         result = re.compile(combined_tsv, re.IGNORECASE | re.UNICODE)
     with _TERM_LOCK:
-        _SYST_RE_CACHE = result
+        _SYST_RE_CACHE[cache_key] = result
     return result
 
 
@@ -1451,8 +1631,8 @@ def build_term_regex(df: pd.DataFrame) -> Tuple[re.Pattern, Dict[str, Tuple[str,
     return pattern, term_map
 
 
-# Která OUTPUT_FIELDS pole se prohledávají primárně pro daný typ termínu.
-# ROLLBACK: starší Morpho/Strat regex matcher z claude-morfph.py
+# Which OUTPUT_FIELDS field are searched primarily for the given term type.
+# ROLLBACK: older Morpho/Strat regex matcher from claude-morfph.py
 TERM_PRIMARY_FIELDS: Dict[str, List[str]] = {
     "stratigraphy": ["STRATIGRAPHY"],
     "morphology":   ["DESCRIPTION", "DIAGNOSIS"],
@@ -1502,9 +1682,9 @@ def compute_term_matches(
                     "category": category, "source_field": "RAW_TAXONOMIC_BLOCK",
                 }
 
-    # ── Druhý pruchod: detekce pojmenovaných stratigraphic units ────────
-    # Zachytí vzory jako "Buchava Formation", "Klabava Member", "Stage 3"
-    # které nejsou ve slovníku jako vlastní termín, ale jsou duležitou informací.
+    # ── Druhy pruchod: detection pojmenovanych stratigraphic units ────────
+    # Captures patterns such as "Buchava Formation", "Klabava Member", "Stage 3"
+    # that are not in the dictionary as vlastni termin, but are dulezitou informaci.
     if term_type == "stratigraphy":
         _UNIT_TYPES = (
             # EN
@@ -1530,7 +1710,7 @@ def compute_term_matches(
             r"(?:[-\s]+[A-ZА-ЯЁ\u4e00-\u9fff][A-Za-zА-ЯЁа-яё\u4e00-\u9fff]+)*)"
             r"[\s\-]+(" + _UNIT_TYPES + r")",
             re.UNICODE | re.IGNORECASE)
-        # Hledat ve stratigrafickém textu or raw bloku
+        # Search in the stratigraphic text or raw bloku
         _strat_texts = []
         for fname in ["STRATIGRAPHY", "OCCURRENCE", "LOCALITY"]:
             v = field_text_map.get(fname, "")
@@ -1541,7 +1721,7 @@ def compute_term_matches(
         for _txt in _strat_texts:
             for _m in _NAMED_UNIT_RE.finditer(_txt):
                 _full_name = f"{_m.group(1)} {_m.group(2)}"
-                _canonical = _full_name  # celý name je kanonický
+                _canonical = _full_name  # cely name is kanonicky
                 if _canonical not in found and len(_m.group(1)) > 2:
                     found[_canonical] = {
                         "term": _full_name,
@@ -1597,29 +1777,29 @@ def recompute_all_term_matches(progress_cb=None, include_needs_review: bool = Tr
             progress_cb(i, total)
         compute_and_save_term_matches_for_candidate(cid)
     if progress_cb and total:
-        progress_cb(total, total)   # finální 100 %
+        progress_cb(total, total)   # final 100 %
     return total
 
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Deterministické řešení nejednoznačných labels (label → víc target_field)
+# Deterministic reseni nejednoznacnych labels (label → vic target_field)
 # ══════════════════════════════════════════════════════════════════════════════
-# Některé labely v section_schema.tsv mapují na >1 cílové pole se STEJNÝM
-# Score (priority + is_strong). Bez explicitního pravidla by výběr závisel
-# na pořadí řádku v TSV → nedeterministické mapování mezi buildy.
+# Some labels in section_schema.tsv map to >1 target field STEJNYM
+# Score (priority + is_strong). Without an explicit rule the choice would depend
+# on poradi radku in TSV → nondeterministic mapping between builds.
 #
-# Tento slovník řeší POUZE skutečné TIE (shodné Score). Pokud má některé
-# pole v TSV vyšší priority, respektujeme volbu autora schématu — sem patří
-# jen labely, kde jsou Score shodná a je třeba deterministicky rozhodnout.
+# This dictionary resi Only skutecne TIE (shodne Score). If ma nektere
+# field in TSV vyssi priority, respect the schema author’s choice — sem patri
+# only labely, kde are Score shodna and and deterministic decision is needed.
 #
-# Volba je založena na taxonomické konvenci:
-#   • "comparison/comparaison"  → REMARKS  (srovnávací poznámky, ne diagnóza)
-#   • "depth"                   → LOCALITY (hloubka nálezu = lokalita, ne size)
-#   • "series"                  → STRATIGRAPHY (geol. série; "type series" má
-#                                  vlastní specifičtější label → TYPE SPECIMENS)
-#   • "dépôt"                   → TYPE MATERIAL (fr. „saveení typu")
-#   • "geographic distribution" → OCCURRENCE (rozšíření, ne bodová lokalita)
+# The choice is based on taxonomic convention:
+#   • "comparison/comparaison" → REMARKS (comparative remarks, not diagnosis)
+#   • "depth" → LOCALITY (find depth = lokalita, ne size)
+#   • "series" → STRATIGRAPHY (geol. serie; "type series" ma
+#                                  its own more specific label → TYPE SPECIMENS)
+#   • "depot" → TYPE MATERIAL (fr. „saveeni typu")
+#   • "geographic distribution" → OCCURRENCE (distribution, not and point locality)
 #   • "emended diagnosis/description" → DIAGNOSIS/DESCRIPTION (ne NOM. ACTS)
 _AMBIGUOUS_LABEL_PREFERENCE: Dict[str, str] = {
     "comparison":              "REMARKS",
@@ -1634,8 +1814,8 @@ _AMBIGUOUS_LABEL_PREFERENCE: Dict[str, str] = {
     "emended description":     "DESCRIPTION",
     # Pozn.: labely jako "type designation" (→ TYPE TAXON, prio 100 vs
     # NOM.ACTS 95), "bibliographic citation" (→ AUTHOR prio 70 vs REFERENCE
-    # 50) a "replacement name" (→ SYNONYMY 100 vs NOM.ACTS 95) mají v TSV
-    # jednoznačně vyšší prioritu — jejich volbu autora schématu respektujeme.
+    # 50) and "replacement name" (→ SYNONYMY 100 vs NOM.ACTS 95) maji in TSV
+    # jednoznacne higher priority — we respect the schema author’s choice.
 }
 
 
@@ -1672,9 +1852,9 @@ def _build_section_regex_uncached(df: pd.DataFrame) -> Tuple[re.Pattern, Dict[st
         _min_len = 2 if _has_cjk else 3
         if len(label) < _min_len or not field:
             continue
-        # dwc/db exclusion — ale POUZE camelCase DB identifikátory
-        # (namePublishedInYear, decimalLongitude), NE prosté nadpisy
-        # jako DIAGNOSIS, OCCURRENCE, DESCRIPTION které jsou i běžné nadpisy.
+        # dwc/db exclusion — but Only camelCase DB identifikatory
+        # (namePublishedInYear, decimalLongitude), NE proste nadpisy
+        # as DIAGNOSIS, OCCURRENCE, DESCRIPTION which are i bezne nadpisy.
         _is_camel = bool(re.search(r"[a-z][A-Z]", label))       # camelCase
         _is_dwc = (lang in ("dwc/db", "dwc", "db")) and _is_camel
 
@@ -1696,23 +1876,23 @@ def _build_section_regex_uncached(df: pd.DataFrame) -> Tuple[re.Pattern, Dict[st
         elif score > _existing_score:
             _take = True
         elif score == _existing_score and lk in _AMBIGUOUS_LABEL_PREFERENCE:
-            # TIE + máme explicitní preferenci → vezmi preferované pole,
-            # jinak ponech dosavadní (deterministické, nezávislé na pořadí řádku).
+            # TIE + mame explicitni preferenci → vezmi preferovane field,
+            # jinak ponech dosavadni (deterministicke, nezavisle on poradi radku).
             _pref = _AMBIGUOUS_LABEL_PREFERENCE[lk]
             if field == _pref and label_to_field.get(lk) != _pref:
                 _take = True
         if _take:
             label_to_field[lk] = field
             label_priority[lk] = score
-        # entries (regex alternativy) přidáváme VŽDY když label není dwc/db —
-        # regex hledá výskyt labelu v textu, cílové pole se pak dohledá
-        # z label_to_field (což je už deterministické díky logice výše).
+        # entries (regex alternativy) pridavame VZDY when label neni dwc/db —
+        # regex hleda vyskyt labelu in textu, target field pak dohleda
+        # from label_to_field (coz is uz deterministicke diky logice vyse).
         if not _is_dwc:
             entries.append((score, len(label), alt, lk))
 
-    # Deduplikace regex alternativ podle label_key (ruzné řádky téhož labelu
-    # s odlišnými poli by jinak přidaly tutéž alternativu vícekrát → nafouklý
-    # a pomalejší regex). Zachováme nejvyšší Score pro řazení.
+    # Deduplikace regex alternativ podle label_key (ruzne lines tehoz labelu
+    # s odlisnymi poli by jinak pridaly tutez alternativu vicekrat → nafoukly
+    # and pomalejsi regex). Zachovame nejvyssi Score for razeni.
     _seen_alts: Dict[str, Tuple[int, int, str, str]] = {}
     for e in entries:
         _sc, _ln, _alt, _lk = e
@@ -1724,15 +1904,15 @@ def _build_section_regex_uncached(df: pd.DataFrame) -> Tuple[re.Pattern, Dict[st
     entries.sort(key=lambda x: (x[0], x[1]), reverse=True)
     alts = [x[2] for x in entries]
 
-    # ── Robustní separátor za labelem ────────────────────────────────────────
-    # Dvouúrovňový:
-    #  (a) BARE label + separátor [: . ) — –] / newline / 2+ mezer / tab
-    #      (tečka povolena pro nadpisy "Diagnosis." apod.)
-    #  (b) label + POKRAČOVACÍ slova (jen malá písmena/spojky) + JEN dvojtečka/
-    #      pomlčka/newline — zachytí složené nadpisy jako
+    # ── Robustni separator za labelem ────────────────────────────────────────
+    # Dvouurovnovy:
+    #  (and) BARE label + separator [: . ) — –] / newline / 2+ mezer / tab
+    #      (tecka povolena for nadpisy "Diagnosis." apod.)
+    #  (b) label + POKRACOVACI slova (only mala pismena/spojky) + Only dvojtecka/
+    #      pomlcka/newline — captures slothatne nadpisy as
     #      "Stratigraphic range and distribution:", "Type horizon and locality:".
-    #      Malá písmena zaručí, že "Diagnosis Malinky et al." NEmatchne (M velké).
-    # Volitelné koncové s/es → plurál (Paratype→Paratypes).
+    #      Mala pismena zaruci, that "Diagnosis Malinky et al." NEmatchne (M velke).
+    # Volitelne koncove s/es → plural (Paratype→Paratypes).
     # CJK fullwidth interpunkce: ：(FF1A) ，(FF0C) 、(3001) ；(FF1B) 。(3002) ）(FF09)
     _CJK_SEP = r"\uff1a\uff0c\u3001\uff1b\u3002\uff09"
     _SEP = (
@@ -1758,46 +1938,48 @@ def build_section_regex(df: pd.DataFrame) -> Tuple[re.Pattern, Dict[str, str]]:
     so it is safe to cache the result between calls. Without the cache, the massive
     regex (1300+ labels) was recompiled on every block mapping call.
     """
-    global _SECTION_REGEX_CACHE
+    cache_key = id(df)
     with _SCHEMA_DERIVED_RE_LOCK:
-        if _SECTION_REGEX_CACHE is not None:
-            return _SECTION_REGEX_CACHE
-    # Compilation outside the lock (may take time) — race is harmless (idempotent).
+        cached = _SECTION_REGEX_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
     result = _build_section_regex_uncached(df)
     with _SCHEMA_DERIVED_RE_LOCK:
-        _SECTION_REGEX_CACHE = result
+        _SECTION_REGEX_CACHE[cache_key] = result
     return result
 
 
 def get_strong_labels(df: pd.DataFrame) -> set:
     """Returns the set of labels with is_strong=1 (cached)."""
-    global _STRONG_LABELS_CACHE
+    cache_key = id(df)
     with _SCHEMA_DERIVED_RE_LOCK:
-        if _STRONG_LABELS_CACHE is not None:
-            return _STRONG_LABELS_CACHE
+        cached = _STRONG_LABELS_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
     result = set(
         str(getattr(row, "label", "")).lower()
         for row in df.itertuples(index=False)
         if str(getattr(row, "is_strong", "0")).strip() == "1"
     )
     with _SCHEMA_DERIVED_RE_LOCK:
-        _STRONG_LABELS_CACHE = result
+        _STRONG_LABELS_CACHE[cache_key] = result
     return result
 
 
 def get_strong_fields(df: pd.DataFrame) -> set:
     """Returns the set of target_field values where is_strong=1 (cached)."""
-    global _STRONG_FIELDS_CACHE
+    cache_key = id(df)
     with _SCHEMA_DERIVED_RE_LOCK:
-        if _STRONG_FIELDS_CACHE is not None:
-            return _STRONG_FIELDS_CACHE
+        cached = _STRONG_FIELDS_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
     result = set(
         str(getattr(row, "target_field", ""))
         for row in df.itertuples(index=False)
         if str(getattr(row, "is_strong", "0")).strip() == "1"
     )
     with _SCHEMA_DERIVED_RE_LOCK:
-        _STRONG_FIELDS_CACHE = result
+        _STRONG_FIELDS_CACHE[cache_key] = result
     return result
 
 
@@ -1805,20 +1987,20 @@ def get_strong_fields(df: pd.DataFrame) -> set:
 # REGEX VZORY PRO DETEKCI
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Rodové/druhové vzory
+# Genus/species patterns
 FAMILY_RE = re.compile(
     r"^(?P<name>\??[A-ZÁČĎÉĚÍŇÓŘŠŤÚŮÝŽÄÖÜÀÂÆÇÈÊËÎÏÔÙÛÜ][A-Za-záčďéěíňóřšťúuýžäöüàâæçèêëîïôùûü\-]*"
     r"(?:idae|inae|ini|oidea|acea|iformes))\b", re.UNICODE)
 
-# Řád: standardní zoologická/paleontologická koncovka -ecida, -ida (ne -idae!)
-# Příklady: Circothecida, Orthothecida, Exilithecida, Hyolithida
-# Pozn.: negativní lookbehind (?<![i]) zajistí, že -idae NENÍ zachyceno jako -ida + e
+# Order: standard zoological/palaeontological suffix -ecida, -ida (ne -idae!)
+# Examples: Circothecida, Orthothecida, Exilithecida, Hyolithida
+# Note:: negativni lookbehind (?<![i]) ensures, that -idae NENI zachyceno as -ida + e
 ORDER_RE = re.compile(
     r"^(?P<name>\??[A-ZÁČĎÉĚÍŇÓŘŠŤÚŮÝŽÄÖÜÀÂÆÇÈÊËÎÏÔÙÛÜ][A-Za-záčďéěíňóřšťúuýžäöüàâæçèêëîïôùûü\-]*"
     r"(?:ecida|arida|(?<!i)ida))\b",
     re.UNICODE)
 
-# Třída: -morpha (Orthothecimorpha, Hyolithinomorpha), -phyta, -opsida aj.
+# Class: -morpha (Orthothecimorpha, Hyolithinomorpha), -phyta, -opsida aj.
 CLASS_RE = re.compile(
     r"^(?P<name>\??[A-ZÁČĎÉĚÍŇÓŘŠŤÚŮÝŽÄÖÜÀÂÆÇÈÊËÎÏÔÙÛÜ][A-Za-záčďéěíňóřšťúuýžäöüàâæçèêëîïôùûü\-]*"
     r"(?:morpha|phyta|opsida|ophyceae|ozoa|mycetes))\b",
@@ -1833,16 +2015,16 @@ SPECIES_RE = re.compile(
     re.UNICODE)
 
 
-# Trinomiální a explicitní subspecifické nadpisy.
-# Konzervativní: chytá buď "Genus species subspecies", or "Genus species subsp./ssp. epithet".
-# Používá se PŘED SPECIES_RE, aby se poddruh nezkrátil na binomium.
+# Trinomialni and explicitni subspecificke nadpisy.
+# Conservative: matches either "Genus species subspecies", or "Genus species subsp./ssp. epithet".
+# Used BEFORE SPECIES_RE, so the subspecies is not shortened on binomium.
 SUBSPECIES_RE = re.compile(
-    r"^(?P<n>\??[A-ZÁČĎÉĚÍŇÓŘŠŤÚŮÝŽÄÖÜÀÂÆÇÈÊËÎÏÔÙÛÜ][A-Za-záčďéěíňóřšťúuýžäöüàâæçèêëîïôùûü\-]+"
-    r"\??\s+[a-záčďéěíňóřšťúuýžäöüàâæçèêëîïôùûü][a-záčďéěíňóřšťúuýžäöüàâæçèêëîïôùûü\-]+"
-    r"\s+(?:(?:subsp\.|ssp\.|var\.)\s+)?"
-    r"(?!n\.?$|sp\.?$|nov\.?$|indet\.?$)"
-    r"[a-záčďéěíňóřšťúuýžäöüàâæçèêëîïôùûü][a-záčďéěíňóřšťúuýžäöüàâæçèêëîïôùûü\-]{1,})"
-    r"(?:\s+[A-Z][A-Za-z\-]+,?\s*\d{4})?",
+    r"^(?P<n>\\??[A-ZÁČĎÉĚÍŇÓŘŠŤÚŮÝŽÄÖÜÀÂÆÇÈÊËÎÏÔÙÛÜ][A-Za-záčďéěíňóřšťúuýžäöüàâæçèêëîïôùûü\\-]+"
+    r"\\??\\s+[a-záčďéěíňóřšťúuýžäöüàâæçèêëîïôùûü][a-záčďéěíňóřšťúuýžäöüàâæçèêëîïôùûü\\-]+"
+    r"\\s+(?:(?:subsp\\.|ssp\\.|var\\.|f\\.|forma\\s+|subvar\\.|cv\\.)?)"
+    r"(?!n\\.?$|sp\\.?$|nov\\.?$|indet\\.?$)"
+    r"[a-záčďéěíňóřšťúuýžäöüàâæçèêëîïôùûü][a-záčďéěíňóřšťúuýžäöüàâæçèêëîïôùûü\\-]{1,})"
+    r"(?:\\s+[A-Z][A-Za-z\\-]+,?\\s*\\d{4})?",
     re.UNICODE)
 
 # Cyrillic binomial (Russian, Ukrainian, etc.)
@@ -1851,29 +2033,29 @@ CYRILLIC_SPECIES_RE = re.compile(
     r"(?:\s+[А-ЯЁ][А-ЯЁа-яёА-Я\-]+,?\s*\d{4})?",
     re.UNICODE)
 
-# Čínský nadpis taxonu: čínské jméno + latinský name + (autor, rok).
-# Vzory z reálných publikací (Qian 1977, 2000):
-#   "圆管螺属 Circotheca Sysoiev, 1958"   (rod: čín. jméno + rank znak 属)
-#   "圆管螺科 Circothecidae Missarzhevsky, 1969"  (čeleď: 科)
+# Chinese taxon heading: Chinese name + latinsky name + (author, year).
+# Patterns from real publications (Qian 1977, 2000):
+#   "圆管螺属 Circotheca Sysoiev, 1958" (genus: cin. name + rank znak 属)
+#   "圆管螺科 Circothecidae Missarzhevsky, 1969" (family: 科)
 #   "密脊脊管螺 Lophotheca multicostata Qian (MS)"  (druh: bez rank znaku)
-# Extrahujeme LATINSKÝ name (pro databázi), čínské jméno se zahodí.
-# Rank znak (属=genus, 科=family, 目=order, 纲=class) určuje rank.
+# Extract LATINSKY name (for the database), Chinese name is discarded.
+# Rank znak (属=genus, 科=family, 目=order, 纲=class) determines rank.
 _CHINESE_RANK_CHARS = {"属": "Genus", "超科": "Superfamily", "科": "Family", "亚科": "Subfamily", "族": "Tribe", "亚族": "Subtribe", "总目": "Superorder", "目": "Order", "亚目": "Suborder",
                        "纲": "Class", "门": "Phylum", "种": "Species"}
 CHINESE_TAXON_RE = re.compile(
-    r"^[\u4e00-\u9fff]+?"                      # čínské jméno (non-greedy)
-    r"(?P<rankchar>[属科目纲门种])?"             # volitelný rank znak
-    r"(?=\s)"                                    # musí následovat mezera
+    r"^[\u4e00-\u9fff]+?"                      # Chinese name (non-greedy)
+    r"(?P<rankchar>[属科目纲门种])?"             # optional rank znak
+    r"(?=\s)"                                    # must be followed by and space
     r"\s+"                                       # mezera
-    r"(?P<name>[A-Z][A-Za-z\-]+"               # latinský rod
-    r"(?:\s+[a-z][a-z\-]+)?)"                  # volitelný druhový epiteton
-    r"(?!\s*——)"                                # NEsmělo by následovat em-dash (etymologie "Eo——始")
-    r"(?:\s+[A-Z][A-Za-z\-]+\.?)?"             # volitelný autor
-    r"(?:\s*,?\s*\d{4})?"                      # volitelný rok
+    r"(?P<name>[A-Z][A-Za-z\-]+"               # latinsky genus
+    r"(?:\s+[a-z][a-z\-]+)?)"                  # optional species epithet
+    r"(?!\s*——)"                                # NEsmelo by nasledovat em-dash (etymologie "Eo——始")
+    r"(?:\s+[A-Z][A-Za-z\-]+\.?)?"             # optional author
+    r"(?:\s*,?\s*\d{4})?"                      # optional year
     r"(?:\s*\((?:MS|新种|新属|gen\.\s*et\s*sp\.\s*nov\.)\))?",  # nom. akt
     re.UNICODE)
 
-# Vzor pro detekci etymologických řádku — ty se NIKDY nepovažují za taxon
+# Pattern for detecting etymologickych radku — these are NEVER considered and taxon
 # nadpis (e.g. „属名来源　Eo——始、古之意" or „种名来源　qiongzhussi——")
 _CHINESE_ETYMOLOGY_RE = re.compile(r"[属种]名来源|名称来源|词源", re.UNICODE)
 
@@ -1881,16 +2063,63 @@ _CHINESE_ETYMOLOGY_RE = re.compile(r"[属种]名来源|名称来源|词源", re.
 # ── Chinese / multilingual high-rank treatment detector ─────────────────────
 # Used before the conservative generic parser for dense systematic PDFs.
 _ZH_TAXON_HEADING_RE = re.compile(
-    # \s* (místo \s+): čínský rank znak muže být bez mezery přímo před latinským jménem
-    # (e.g. "软舌螺动物门Hyolitha" — typický OCR artefakt skenovaných čínských monografií).
-    # Zároveň \s* zachytí i split-line případ "圆管螺属\nC ircotheca" protože \s zahrnuje \n.
+    # \s* (instead of \s+): cinsky rank znak muthat byt without mezery directly before the Latin name
+    # (e.g. "软舌螺动物门Hyolitha" — typical OCR artefact of scanned Chinese monographs).
+    # At the same time \s* captures i split-line case "圆管螺属\nC ircotheca" because \s includes \n.
     r"(?P<zh>[\u4e00-\u9fff]{1,30})(?P<rank_char>总目|亚目|超科|科|亚科|族|亚族|门|纲|目|属|种)\s*"
     r"(?P<latin>[A-Z](?:\s*[A-Za-z-]){3,}(?:\s+[a-z][a-z-]+)?)"
     r"(?:\s+(?P<author>[A-Z](?:\s*[A-Za-z.-]){1,30}|[A-ZА-ЯЁ][A-Za-zА-Яа-яЁё.-]{1,30}))?"
     r"(?:\s*,?\s*(?P<year>1[5-9]\d{2}|20[0-3]\d))?",
     re.UNICODE,
 )
-_ZH_FIELD_LABELS_FOR_SPLIT = ("模式种", "模式属", "模式标本", "模式材料", "特征", "分类特征", "描述", "讨论与比较", "讨论", "比较", "时代和分布", "分布与时代", "地层与时代", "插图", "图版")
+_ZH_FIELD_LABELS_FOR_SPLIT = (
+    "模式种", "模式属", "模式标本", "模式材料",
+    "特征", "分类特征", "鉴别特征", "描述",
+    "讨论与比较", "比较与讨论", "讨论", "比较",
+    "时代和分布", "分布与时代", "时代与分布", "地层与时代", "分布时代",
+    "产地与层位", "产地与地层", "分布与层位", "产地", "层位",
+    "壳体度量", "壳体度盆", "度量",   # 度盆 = common OCR artefact of the word 度量
+    "同物异名", "异名", "词源", "属名来源", "种名来源",
+    "插图", "图版",
+)
+
+# ── Genus / species heading detector (cinsky vernacular name + Latin name) ──
+# Key pattern cinske paleontologicke literatury: genera and species To NOT have an explicit
+# rank znak (属/种) in the heading. Instead they have cinsky vernacular name (koncici napr.
+# on 螺/虫/贝) followed directly by latinskym jmenem, authorem, yearem and prip. nom. aktem:
+#     脊管螺 Lophotheca Qian (MS)                    → Genus
+#     密脊脊管螺 Lophotheca multicostata Qian (MS)     → Species
+#     圆形阿纳巴管螺(新种) Anabarites rotundum sp. nov. → Species (new species)
+# Without this detector ONLY higher taxa are captured (門/纲/目/科), while
+# all genera and species (the core of the systematic section) are missing.
+_ZH_GENUS_SPECIES_HEADING_RE = re.compile(
+    r"(?P<zh>[\u4e00-\u9fff]{2,14})"                          # Chinese vernacular taxon name
+    r"(?:[（(]\s*新[\u4e00-\u9fff]{0,2}\s*[)）])?"             # optional „(新种)" / „(新属)" in name
+    r"\s+"
+    r"(?P<latin>[A-Z][a-zA-Züöäïéèêáà:-]{3,}"                # latinsky genus
+    r"(?:\s+[a-z][a-züöäïéèêáà-]{2,})?)"                     # optional species epithet
+    r"(?:\s+(?P<author>\(?[A-ZА-ЯЁ][A-Za-zА-Яа-яЁё.-]+\)?"  # author (possibly in parentheses: (He))
+    r"(?:\s+(?:et|and|&|und)\s+[A-Z][A-Za-z.-]+)?"
+    r"(?:\s+et\s+al\.)?))?"
+    r"(?:\s*,?\s*(?P<year>1[5-9]\d{2}|20[0-3]\d))?"
+    r"(?:\s*(?P<nomact>\(\s*MS\s*\)|（\s*MS\s*）|sp\.\s*nov\.|"
+    r"gen\.\s*(?:et\s*sp\.\s*)?nov\.|subsp\.\s*nov\.|新种|新属|新科))?",
+    re.UNICODE,
+)
+
+# Labels whose presence in „ocasu" za nadpisem confirms, that this is and real
+# taxonomicky treatment (and not and random fragment „中文 Latinword" in ordinary text).
+_ZH_TREATMENT_TAIL_LABELS = (
+    "特征", "鉴别特征", "分类特征", "描述", "讨论", "比较",
+    "模式种", "模式属", "模式标本", "模式材料",
+    "时代和分布", "分布与时代", "时代与分布", "地层与时代",
+    "产地与层位", "产地与地层", "产地", "分布", "层位",
+    "壳体度量", "壳体度盆", "度量", "词源", "同物异名",
+)
+
+# Cinske labely, which declare and type genus/species — nadpis, which jimi bezprostredne
+# PREDCHAZI, is and type declaration (not and new treatment) and must not become and candidate.
+_ZH_TYPE_DECL_PREFIXES = ("模式种", "模式属", "模式标本", "模式材料")
 
 
 def _clean_latin_taxon_ocr(name: str) -> str:
@@ -1959,7 +2188,7 @@ def _normalize_chinese_systematic_text(text: str) -> str:
         return text
     out = unicodedata.normalize("NFKC", text)
 
-    # 2. Slovníkové OCR opravy — specifické artefakty čínských skenéru (TH-OCR, podobné)
+    # 2. Slovnikove OCR opravy — specificke artefakty cinskych skeneru (TH-OCR, podobne)
     for bad, good in {
         # Hyolitha / class level
         "H yolitha": "Hyolitha", "H yolithozoes": "Hyolithozoes",
@@ -1976,6 +2205,25 @@ def _normalize_chinese_systematic_text(text: str) -> str:
         "C ircotheca": "Circotheca",
         "P aracircotheca": "Paracircotheca",
         "H yolithes": "Hyolithes",
+        # Genus level — doplneno for Qian 1977/1995/2000 (软舌螺 monografie)
+        "L ophotheca": "Lophotheca", "L op hotheca": "Lophotheca",
+        "A nabarites": "Anabarites", "A nab arites": "Anabarites",
+        "A nabaritellus": "Anabaritellus", "A nab aritellus": "Anabaritellus",
+        "C onotheca": "Conotheca", "C on otheca": "Conotheca",
+        "D almanitheca": "Dalmanitheca",
+        "A mbrolinevitus": "Ambrolinevitus", "A m brolinevitus": "Ambrolinevitus",
+        "E olinevitus": "Eolinevitus",
+        "D ianxitheca": "Dianxitheca",
+        "X ystritheca": "Xystritheca",
+        "P achytheca": "Pachytheca",
+        "N eogloborilus": "Neogloborilus", "N eog loborilus": "Neogloborilus",
+        "P aragloborilus": "Paragloborilus", "P arag loborilus": "Paragloborilus",
+        "M icrocornus": "Microcornus", "M icro cornus": "Microcornus",
+        "T urcuthecidae": "Turcuthecidae", "N ovitatidae": "Novitatidae",
+        "S ulcavitidae": "Sulcavitidae", "A llathecidae": "Allathecidae",
+        "P auxillitidae": "Pauxillitidae", "L inevitidae": "Linevitidae",
+        "S ulcavitida": "Sulcavitida", "S pinulithecidae": "Spinulithecidae",
+        "P aragloborilidae": "Paragloborilidae",
         # Authors
         "Q ian": "Qian", "M arek": "Marek", "M issarzhevsky": "Missarzhevsky",
         "H olm": "Holm", "S ysoiev": "Sysoiev", "L in n arso n": "Linnarson",
@@ -1986,25 +2234,30 @@ def _normalize_chinese_systematic_text(text: str) -> str:
     }.items():
         out = out.replace(bad, good)
 
-    # 3. Generická OCR oprava: velké písmeno + 1 mezera + 3+ malých písmen → slepení
+    # 3. Genericka OCR oprava: velke pismeno + 1 mezera + 3+ malych pismen → slepeni
     # Vzory: "C ircotheca" → "Circotheca", "O rthothecida" → "Orthothecida"
-    # Bezpečné v čínském Contextu kde "X word" kombinace jsou taxonomická jména.
+    # Bezpecne in cinskem Contextu kde "X word" kombinace are taxonomicka jmena.
     out = re.sub(r"\b([A-Z])\s+([a-z]{3,})\b", r"\1\2", out)
 
-    # 4. Vložení \n před nadpisy embeddované v running textu
-    # Dvojitý lookbehind:
-    #   (?<!\n)           – neopakovat \n pokud nadpis je již na vlastním řádku
-    #   (?<![\u4e00-\u9fff]) – nezačínat UVNITŘ čínského složeného slova
+    # 4. Vlothatni \n before nadpisy embeddovane in running textu
+    # Dvojity lookbehind:
+    #   (?<!\n) – neopakovat \n if nadpis is jiz on vlastnim radku
+    #   (?<![\u4e00-\u9fff]) – nezacinat UVNITR cinskeho slothatneho slova
     #     (e.g. v "口管螺科Circ..." regex by bez tohoto lookbehind nalezl "管螺科Circ"
-    #      a vložil \n před "管螺", přičemž "口" zustane osamoceně → false positive)
-    # \s* (místo \s+): rank-znak muže být bezprostředně (bez mezery) před latinským jménem
+    #      and vlozil \n before "管螺", pricemz "口" zustane osamocene → false positive)
+    # \s* (instead of \s+): rank-znak muthat byt bezprostredne (without mezery) before latinskym jmenem
     out = re.sub(
         r"(?<!\n)(?<![\u4e00-\u9fff])(?P<h>[\u4e00-\u9fff]{1,30}(?:总目|亚目|超科|亚科|亚族|门|纲|目|科|族|属|种)\s*[A-Z][A-Za-z\s-]{3,80}?\s*(?:1[5-9]\d{2}|20[0-3]\d)?)",
         r"\n\g<h>", out)
 
-    # 5. Field-labely na vlastní řádky
+    # 5. Field-labely on vlastni lines
+    # Lookbehind (?<![\u4e00-\u9fff]) zabranuje rozdeleni UVNITR delsiho labelu:
+    # without nej by „产地与层位" (zpracovano prvni, delka desc) after vlothatni \n bylo
+    # znovu rozdeleno kratsim labelem „层位" on „产地与\n层位" (层位 is podretezec).
+    # Sekcni labely in cinskych monografiich vzdy zacinaji after interpunkci / \n /
+    # mezere (nikdy uprostred cinskeho slova), takthat lookbehind is bezpecny.
     for lab in sorted(_ZH_FIELD_LABELS_FOR_SPLIT, key=len, reverse=True):
-        out = re.sub(rf"(?<!\n)\s*({re.escape(lab)})\s+", rf"\n\1 ", out)
+        out = re.sub(rf"(?<!\n)(?<![\u4e00-\u9fff])\s*({re.escape(lab)})\s+", rf"\n\1 ", out)
 
     return re.sub(r"\n{3,}", "\n\n", out).strip()
 
@@ -2037,26 +2290,110 @@ def _extract_goldset_style_chinese_treatments(document_id: int, pages: List[Page
     full = "".join(parts)
     if not re.search(r"[\u4e00-\u9fff]", full):
         return None
+
+    _VALID_RANKS = {"Phylum", "Class", "Superorder", "Order", "Suborder",
+                    "Superfamily", "Family", "Subfamily", "Tribe", "Subtribe",
+                    "Genus", "Subgenus", "Species", "Subspecies"}
+
+    def _tail_has_treatment_label(pos_end: int) -> bool:
+        tail = full[pos_end:pos_end + 300]
+        return any(lbl in tail for lbl in _ZH_TREATMENT_TAIL_LABELS)
+
+    def _preceded_by_type_decl(pos_start: int) -> bool:
+        """True pokud nadpis bezprostředně následuje za labelem 模式种/模式属
+        (je to deklarace typového rodu/druhu, ne nový treatment)."""
+        pre = full[max(0, pos_start - 12):pos_start]
+        return any(p in pre for p in _ZH_TYPE_DECL_PREFIXES)
+
+    def _at_line_start(pos_start: int) -> bool:
+        """True pokud pozice leží na začátku řádku (max 2 znaky odsazení).
+        Skutečné nadpisy rodu/druhu jsou v čínských monografiích vždy na
+        samostatném řádku; latinská jména zmíněná uprostřed sekcí 讨论/比较
+        (\"相似于 Circotheca Sysoiev, 1958\") tuto podmínku nesplní → filtrují se."""
+        ls = full.rfind("\n", 0, pos_start) + 1
+        return (pos_start - ls) <= 2
+
     matches = []
+
+    # ── PASS 1: Vyssi taxony s explicitnim rank znakem (門/纲/目/科/属/种) ──────
     for m in _ZH_TAXON_HEADING_RE.finditer(full):
         zh_text = m.group("zh") or ""
-        # ── Filtr false-pozitiv zpusobených \s* ──────────────────────────────
-        # "模式属 Circotheca" / "模式种 Hyolithes" = typový rod/druh, NENÍ nadpis.
-        # Testujeme přítomnost "模式" v čínské části (zh group).
+        # "模式属 Circotheca" / "模式种 Hyolithes" = typovy genus/druh, NENI nadpis.
         if "模式" in zh_text:
             continue
-        tail = full[m.end():m.end()+260]
-        if not any(lbl in tail for lbl in ("特征", "模式种", "模式属", "讨论", "比较", "时代和分布")):
+        if not _tail_has_treatment_label(m.end()):
             continue
         name = _clean_latin_taxon_ocr(m.group("latin"))
-        # Ochrana proti velmi krátkým jménum (OCR artefakty jako "引目Holm" → "Holm")
+        # Ochrana proti velmi kratkym jmenum (OCR artefakty as "引目Holm" → "Holm")
         if len(name.split()[0] if name else "") < 5:
             continue
+        if name.split()[0].lower() in TAXON_STOPWORDS:
+            continue
         rank = _infer_rank_from_suffix_and_context(name, m.group("rank_char") or "", m.group(0))
-        if name and rank in {"Phylum", "Class", "Superorder", "Order", "Suborder", "Superfamily", "Family", "Subfamily", "Tribe", "Subtribe", "Genus", "Species", "Subspecies"}:
-            mm = {"start": m.start(), "end": m.end(), "name": name, "rank": rank, "heading": m.group(0).strip()}
+        if name and rank in _VALID_RANKS:
+            mm = {"start": m.start(), "end": m.end(), "name": name, "rank": rank,
+                  "heading": m.group(0).strip(), "detector": "highrank"}
             if not matches or abs(mm["start"] - matches[-1]["start"]) > 10:
                 matches.append(mm)
+
+    # ── PASS 2: Rody and druhy (cinsky vernacular name + Latin name, without rank znaku) ──
+    # This pattern tvori the core of the systematic section — without nej ztrati all
+    # genera and species. False-pozitivy are odfiltrovany pres:
+    #   (and) povinny label in ocasu (特征/描述/产地/…),
+    #   (b) vylouceni deklaraci typoveho genusu/druhu (模式种/模式属 before nadpisem),
+    #   (c) stopwords and min. delku latinskeho jmena,
+    #   (d) vyzadovani silneho signalu: author Or year Or nom. akt.
+    _gs_pass2 = []
+    for m in _ZH_GENUS_SPECIES_HEADING_RE.finditer(full):
+        zh_text = m.group("zh") or ""
+        if "模式" in zh_text:
+            continue
+        if _preceded_by_type_decl(m.start()):
+            continue
+        # Nadpis genusu/druhu must byt on zacatku radku — vyradi latinska jmena
+        # zminena uprostred sekci 讨论/比较 (\"…相似于 Circotheca Sysoiev, 1958\").
+        if not _at_line_start(m.start()):
+            continue
+        latin_raw = m.group("latin") or ""
+        name = _clean_latin_taxon_ocr(latin_raw)
+        _first = name.split()[0] if name else ""
+        if len(_first) < 5 or _first.lower() in TAXON_STOPWORDS:
+            continue
+        # Silny signal, that jde o nadpis taxonu (ne fragment vety):
+        #   author / year / nom. akt must byt pritomen.
+        if not (m.group("author") or m.group("year") or m.group("nomact")):
+            continue
+        if not _tail_has_treatment_label(m.end()):
+            continue
+        rank = _rank_from_name_shape(name, "Genus")
+        # Nom. akt s „gen. et sp. nov." → Species; „gen. nov." → Genus
+        _nomact = (m.group("nomact") or "").lower()
+        if "gen." in _nomact and "sp." not in _nomact:
+            rank = "Genus"
+        elif "sp." in _nomact or "新种" in _nomact:
+            rank = "Species"
+        if rank in _VALID_RANKS:
+            _gs_pass2.append({
+                "start": m.start(), "end": m.end(), "name": name, "rank": rank,
+                "heading": m.group(0).strip(), "detector": "genus_species"})
+
+    # ── Slouceni obou passu ──────────────────────────────────────────────────
+    # Pass 1 (vyssi taxony) ma prednost; pass 2 adds only nadpisy, which
+    # nelezi in tesne blizkosti (±10 znaku) uz existujiciho nadpisu.
+    _hr_starts = [mm["start"] for mm in matches]
+    for gs in _gs_pass2:
+        if all(abs(gs["start"] - hs) > 10 for hs in _hr_starts):
+            matches.append(gs)
+
+    matches.sort(key=lambda mm: mm["start"])
+    # Dedup: if dva nadpisy lezi velmi blizko (±10 znaku), ponech prvni.
+    _dedup: List[Dict[str, Any]] = []
+    for mm in matches:
+        if _dedup and abs(mm["start"] - _dedup[-1]["start"]) <= 10:
+            continue
+        _dedup.append(mm)
+    matches = _dedup
+
     if len(matches) < 2:
         return None
     def page_for_offset(pos: int) -> int:
@@ -2069,7 +2406,7 @@ def _extract_goldset_style_chinese_treatments(document_id: int, pages: List[Page
     for i, mm in enumerate(matches):
         end = matches[i+1]["start"] if i+1 < len(matches) else len(full)
         block = re.sub(r"!\[\]\[[^\]]+\]", "", full[mm["start"]:end]).strip()
-        # Vyčisti zbývající OCR artefakty v bloku před mapováním fields
+        # Vycisti zbyvajici OCR artefakty in bloku before mapovanim fields
         block = re.sub(r"\b([A-Z])\s+([a-z]{3,})\b", r"\1\2", block)
         ps, pe = page_for_offset(mm["start"]), page_for_offset(max(mm["start"], end-1))
         cur = con.execute(
@@ -2081,7 +2418,9 @@ def _extract_goldset_style_chinese_treatments(document_id: int, pages: List[Page
             (document_id, mm["name"], mm["rank"], 0.96, "pending", mm["heading"],
              full[max(0, mm["start"]-300):mm["start"]], full[end:min(len(full), end+300)],
              ps, block, now, pe, i,
-             json.dumps({"detector": "chinese_goldset_style", "rank_basis": "chinese_marker_or_iczn_suffix"}, ensure_ascii=False),
+             json.dumps({"detector": "chinese_goldset_style",
+                         "sub_detector": mm.get("detector", "highrank"),
+                         "rank_basis": "chinese_marker_or_iczn_suffix"}, ensure_ascii=False),
              "chinese_goldset_style", "heading_to_next_heading", 0.96))
         cid = cur.lastrowid
         try:
@@ -2107,10 +2446,10 @@ GENUS_RE = re.compile(
     r"(?:\s+(?:gen\.\s*nov\.|n\.\s*gen\.)|\s+[A-Z][A-Za-z\-]+,?\s*\d{4}|,?\s*\d{4})?\s*$",
     re.UNICODE)
 
-# Samostatný nadpis "Rod Autor, Rok" BEZ druhového epitetu — typický pro
-# rodovou (genus-level) sekci systematického popisu, e.g. "Gracilitheca Sysoev, 1968".
-# Striktně ukotveno na celý text (^...$), aby nechytalo fragmenty běžných vět —
-# obyčejná věta po "Rok" nekončí, zatímco tento nadpis ano.
+# Standalone nadpis "Rod Autor, Rok" Without druhoveho epitetu — typicky for
+# genusovou (genus-level) sekci systematickeho popisu, e.g. "Gracilitheca Sysoev, 1968".
+# Striktne ukotveno on cely text (^...$), so that does not match fragmenty beznych vet —
+# obycejna veta after "Rok" nekonci, while this nadpis ano.
 GENUS_AUTHOR_RE = re.compile(
     r"""^(?P<name>
             [A-ZÁČĎÉĚÍŇÓŘŠŤÚŮÝŽÄÖÜÀÂÆÇÈÊËÎÏÔÙÛÜ]
@@ -2149,31 +2488,75 @@ RANK_LABEL_RE = re.compile(
     r"属|种|科|目|纲|门)[\s:\.]*(.*)$",
     re.IGNORECASE | re.UNICODE)
 
-# Kanonizace rank-labelu pro parser. Duležité hlavně proto, že .title()
-# u cizojazyčných labels ("Druh", "Вид", "种") nevyrábí hodnoty kompatibilní
-# s RANK_OPTIONS a následně se míchá Species/Subspecies/Higher taxon.
+# Kanonizace rank-labelu for parser. Dulezite hlavne proto, that .title()
+# u cizojazycnych labels ("Druh", "Вид", "种") nevyrabi values kompatibilni
+# s RANK_OPTIONS and nasledne micha Species/Subspecies/Higher taxon.
 _RANK_LABEL_TO_CANONICAL: Dict[str, str] = {
+    # ── Phylum / Division ─────────────────────────────────────────────────────
     "phylum": "Phylum", "subphylum": "Phylum", "kmen": "Phylum", "тип": "Phylum", "门": "Phylum",
+    "division": "Phylum", "divisio": "Phylum", "subdivisio": "Phylum",  # botanicky ekvivalent
+    "abteilung": "Phylum",  # DE
+    # ── Class ────────────────────────────────────────────────────────────────
     "class": "Class", "subclass": "Class", "třída": "Class", "класс": "Class", "подкласс": "Class",
     "klasse": "Class", "klass": "Class", "classis": "Class", "纲": "Class",
+    # ── Order ────────────────────────────────────────────────────────────────
     "superorder": "Superorder",
     "order": "Order", "suborder": "Suborder", "infraorder": "Infraorder",
     "řád": "Order", "отряд": "Order", "подотряд": "Order", "ordnung": "Order",
     "ordning": "Order", "ordo": "Order", "ordre": "Order",
     "总目": "Superorder", "目": "Order", "亚目": "Suborder",
+    # ── Family ───────────────────────────────────────────────────────────────
     "superfamily": "Superfamily", "family": "Family", "subfamily": "Subfamily",
     "tribe": "Tribe", "subtribe": "Subtribe",
     "čeleď": "Family", "семейство": "Family", "надсемейство": "Superfamily", "подсемейство": "Subfamily",
     "familia": "Family", "famille": "Family", "familj": "Family",
     "超科": "Superfamily", "科": "Family", "亚科": "Subfamily", "族": "Tribe", "亚族": "Subtribe",
+    # ── Genus ────────────────────────────────────────────────────────────────
     "genus": "Genus", "subgenus": "Subgenus", "rod": "Genus", "род": "Genus", "подрод": "Subgenus",
     "gattung": "Genus", "släkte": "Genus", "genre": "Genus", "属": "Genus",
-    "species": "Species", "druh": "Species", "вид": "Species", "art": "Species", "espèce": "Species", "种": "Species",
+    # ── Botanical rank: Section / Series ────────────────────────────────────
+    "section": "Section", "sectio": "Section", "subsection": "Subsection", "subsectio": "Subsection",
+    "series": "Series", "subseries": "Subseries",
+    "sekce": "Section",  # CS
+    "sektion": "Section",  # DE/SV
+    # ── Species ──────────────────────────────────────────────────────────────
+    "species": "Species", "druh": "Species", "вид": "Species", "art": "Species",
+    "espèce": "Species", "种": "Species", "sp": "Species",
+    # ── Infraspecific botanical ranks ────────────────────────────────────────
     "subspecies": "Subspecies", "poddruh": "Subspecies", "подвид": "Subspecies",
     "subsp": "Subspecies", "ssp": "Subspecies", "亚种": "Subspecies",
+    "variety": "Variety", "varietas": "Variety", "var": "Variety",
+    "odrůda": "Variety",  # CS
+    "varietät": "Variety",  # DE
+    "variété": "Variety",  # FR
+    "разновидность": "Variety",  # RU
+    "form": "Form", "forma": "Form", "f": "Form",
+    "subvariety": "Variety", "subvarietas": "Variety",
+    # ── Botanical: cultivar / nothotaxon ────────────────────────────────────
+    "cultivar": "Cultivar", "cv": "Cultivar",
+    "nothospecies": "Species", "nothosubspecies": "Subspecies",
+    "nothogenus": "Genus", "nothovariety": "Variety",
+    "hybrid": "Species",  # "×" handled in regex
+    # ── Ichnological ranks ───────────────────────────────────────────────────
+    "ichnospecies": "Species", "ichnosp": "Species", "isp": "Species",
+    "ichnogenus": "Genus", "ichnogen": "Genus", "igen": "Genus",
+    "ichnosubspecies": "Subspecies", "ichnosubsp": "Subspecies",
+    "ichnovariety": "Variety",
+    # ── Swedish (Holm 1893 et al.) ───────────────────────────────────────────
+    "art": "Species",     # SV: art = species (kolize s DE, but DE "art" = type, mene caste as rank)
+    "släkte": "Genus", "familj": "Family", "ordning": "Order", "klass": "Class",
+    "underart": "Subspecies", "varietet": "Variety",
 }
-_SPECIES_LEVEL_RANKS = {"species", "subspecies"}
-_HIGHER_TYPE_TAXON_RANKS = {"genus", "subgenus", "family", "order", "class", "phylum"}
+_SPECIES_LEVEL_RANKS = {"species", "subspecies", "variety", "form", "cultivar",
+                        "ichnospecies", "ichnosubspecies", "ichnovariety"}
+_HIGHER_TYPE_TAXON_RANKS = {"genus", "subgenus", "section", "series",
+                             "family", "subfamily", "superfamily", "tribe", "subtribe",
+                             "order", "suborder", "class", "phylum", "division",
+                             "ichnogenus"}
+# Ranky inferovane from morfologie jmena (for _rank_from_name_shape)
+_BOTANICAL_INFRASPECIFIC = {"var", "var.", "f.", "forma", "subvar.", "cv.", "cultivar"}
+_ICHNOLOGICAL_RANK_ABBR = {"isp.", "isp", "igen.", "igen", "ichnosp.", "ichnosp",
+                            "ichnogen.", "ichnogen"}
 
 
 def _canonical_rank_label(label: str) -> str:
@@ -2183,22 +2566,41 @@ def _canonical_rank_label(label: str) -> str:
 
 
 def _rank_from_name_shape(name: str, fallback: str = "") -> str:
-    """Estimates rank from name morphology (trinomial=Subspecies, binomial=Species…)."""
+    """Estimates rank from name morphology.
+    Handles: trinomial=Subspecies/Variety, binomial=Species, uninomial=Family/Genus.
+    Botanické infraspecifické ranky: 'Genus species var. epithet' → Variety.
+    Ichnologické: 'Ichnogen. ichnosp.' → detekuje prefix ichno-.
+    """
     raw = (name or "").replace("?", " ").strip()
-    _skip = {"cf", "cf.", "aff", "aff.", "subsp", "subsp.", "ssp", "ssp.", "var", "var.",
-             "n", "n.", "sp", "sp.", "spp", "spp.", "nov", "nov.", "indet", "indet."}
-    parts = []
+    # botanicke infraspecificke ranky — odstranime is from skip setu and pouzijeme as signal
+    _infraspec_markers = {"var", "var.", "f.", "forma", "subvar.", "cv.", "cultivar", "subvar"}
+    _skip = {"cf", "cf.", "aff", "aff.", "subsp", "subsp.", "ssp", "ssp.", "n", "n.",
+             "sp", "sp.", "spp", "spp.", "nov", "nov.", "indet", "indet."}
+    parts = []; saw_infraspec = False
     for p in re.split(r"\s+", raw):
         q = p.strip(",;:()[]")
-        if q and q.lower() not in _skip:
+        ql = q.lower()
+        if ql in _infraspec_markers:
+            saw_infraspec = True  # "var." / "f." / "cv." → is to infraspecificky taxon
+        elif q and ql not in _skip:
             parts.append(q)
     if not parts:
         return fallback or ""
+    # Botanicky trinomal s var./f.: Genus species var. epithet → Variety
+    if saw_infraspec:
+        return "Variety"
+    # Standardni trinomialni tvar (Subspecies)
     if len(parts) >= 3 and parts[0][:1].isupper() and parts[1][:1].islower() and parts[2][:1].islower():
         return "Subspecies"
+    # Binomialni tvar (Species)
     if len(parts) >= 2 and parts[0][:1].isupper() and parts[1][:1].islower():
         return "Species"
-    if re.search(r"(idae|inae|ini|oidea|acea|iformes)$", parts[0], re.I):
+    # Ichnologicky uninominal zacinajici Ichno-
+    p0 = parts[0]
+    if re.match(r"Ichno[A-Z]", p0):
+        return "Genus"  # ichnogenus
+    # Rodinne zakonceni (zoologicke i botanicke)
+    if re.search(r"(idae|inae|ini|oidea|acea|iformes|aceae|ales|ales|ophyta|opsida)$", p0, re.I):
         return "Family"
     return fallback or "Genus"
 
@@ -2212,33 +2614,48 @@ def _prefer_name_shape_rank(prev_rank: str, name: str, default: str) -> str:
 
 
 SYSTEMATIC_RE = re.compile(
-    # "pal(?:a?e)ontology" pokrývá BRITSKÝ pravopis "palaeontology" (pal+ae+ontology)
-    # I AMERICKÝ "paleontology" (pal+e+ontology) — puvodní "pale?ontology" chytal
-    # jen americký tvar a v britsky psaných časopisech (Alcheringa aj.) selhával.
+    # "pal(?:and?e)ontology" pokryva BRITSKY pravopis "palaeontology" (pal+ae+ontology)
+    # I AMERICKY "paleontology" (pal+e+ontology) — puvodni "pale?ontology" chytal
+    # only americky tvar and in britsky psanych casopisech (Alcheringa aj.) selhaval.
     r"\b(Systematic\s+pal(?:a?e)ontology|Systematics|Taxonomy|Systematic\s+descriptions?|"
     r"Systematic\s+characteri[sz]ation|Systematic\s+section|Now\s+taxa|"
     r"Palaeontological\s+systematics|Description\s+of\s+taxa|"
     r"Taxonomic\s+descriptions?|Formal\s+descriptions?|"
-    r"Systematische\s+Paläontologie|Systematik|"
-    r"Systématique|Paléontologie\s+systématique|"
+    r"Systematische\s+Pal[aä]ontologie|Systematik|Beschreibung\s+der\s+Arten|"
+    r"Systématique|Paléontologie\s+systématique|Description\s+des\s+esp[eè]ces|"
     r"Systematická\s+paleontologie|Systematika|"
     r"Систематическая\s+палеонтология|Систематика|"
+    # Botany / Palaeobotany
+    r"Systematic\s+[Bb]otany|Palae?obotany|Systematic\s+palae?obotany|"
+    r"Systematische\s+Botanik|Paläobotanik|"
+    r"Botanique\s+systématique|Paléobotanique|"
+    r"Систематическая\s+ботаника|"
+    r"Systematisk\s+botanik|"
+    r"Plant\s+descriptions?|Phytography|Systematic\s+palynology|"
+    # Ichnology
+    r"Systematic\s+[Ii]chnology|Ichnological\s+descriptions?|Ichnology|Ichnotaxonomy|"
+    r"Trace\s+fossil\s+descriptions?|Descriptions?\s+of\s+trace\s+fossils|"
+    r"Ichnologie|Paläoichnologie|Spurenfossil-?[Bb]eschreibungen|"
+    r"Ichnologie\s+systématique|"
+    r"Описание\s+ихнофоссилий|Систематика\s+ихнофоссилий|"
+    # Swedish (Holm 1893 et al.)
+    r"Systematisk\s+paleontologi|Systematisk\s+paläontologi|Artbeskrivningar|"
     r"系统古生物学|分类)\b",
     re.IGNORECASE | re.UNICODE)
 
-# POZN.: bez ukotvení na konci ($) — "References" často sdílí PyMuPDF blok
-# s první položkou bibliografie ("References\nBARRANDE, J., 1867…"), což po
-# sloučení řádku uvnitř odstavce (viz reading_order) vytvoří jedinou souvislou
-# větu. Stačí, že odstavec ZAČÍNÁ tímto slovem.
+# POZN.: without ukotveni on konci ($) — "References" casto sdili PyMuPDF blok
+# s prvni polozkou bibliografie ("References\nBARRANDE, J., 1867…"), coz after
+# slouceni radku uvnitr odstavce (viz reading_order) vytvori jedinou souvislou
+# vetu. Staci, that odstavec ZACINA timto slovem.
 END_REGION_RE = re.compile(
     r"^\s*(References|Acknowledgements?|Bibliography|Literature\s+cited)\b",
     re.IGNORECASE | re.MULTILINE)
 
-# Detekce stránek abecedního INDEXU (rejstřík na konci monografie).
-# Takové stránky typically obsahují řádky ve formátu "Taxon .... 25" or
-# "Taxon, 25, 47" — tedy jméno + tečky/čárky + čísla pages. Pokud 70%+ řádku
-# na stránce odpovídá tomuto vzoru, stránka je označena jako "index" a
-# kandidáti z ní nejsou extrahováni (vyhne se duplicitám bez fields).
+# Detection stranek abecedniho INDEXU (rejstrik on konci monografie).
+# Takove pages typically obsahuji lines in formatu "Taxon .... 25" or
+# "Taxon, 25, 47" — tedy name + tecky/carky + cisla pages. If 70%+ radku
+# on page odpovida tomuto patternu, stranka is oznacena as "index" and
+# kandidati from ni nejsou extrahovani (vyhne duplicitam without fields).
 _BOOK_INDEX_LINE_RE = re.compile(
     r"^[A-ZА-ЯЁ一-鿿\[\(]"      # begins with capital / CJK
     r"[A-Za-zА-Яа-яёÄÖÜäöüčšžřéíúuý\-\s\.]+?"  # name (with possible spaces/dashes)
@@ -2248,8 +2665,8 @@ _BOOK_INDEX_LINE_RE = re.compile(
 
 
 # Detekce front-matter obsahu / "indexu Documentu" (Table of Contents).
-# Řádky typu "Genus RHIPIDOMELLA ... 10" v obsahu NESMÍ spustit systematickou
-# sekci ani vytvořit taxonomické bloky. Bloky se tvoří až od reálné textové části.
+# Orderky typu "Genus RHIPIDOMELLA ... 10" in obsahu NESMI spustit systematickou
+# sekci ani vytvorit taxonomicke bloky. Bloky tvori az od realne textove casti.
 _TOC_HEADING_RE = re.compile(
     r"^\s*(_+\s*)?(contents|table\s+of\s+contents|index\s+of\s+contents|"
     r"inhalt|inhaltsverzeichnis|sommaire|table\s+des\s+mati[eè]res|"
@@ -2283,23 +2700,23 @@ def _looks_like_document_index_page(lines: List[str]) -> bool:
     return False
 
 CAPTION_RE   = re.compile(r"^(Fig\.?|Figure|Plate|Pl\.?|Table|Tab\.?)\s*\d+", re.I)
-# POZOR: musí vyžadovat skutečnou strukturu synonymního záznamu — binomium
-# následované "Autor, Rok:" a teprve PAK stránkovým/obrázkovým odkazem.
-# Bez vyžadování dvojtečky po roce by tento vzor omylem chytal i genuinní
-# nadpisy nových druhu typu "Gracilitheca astronauta n. sp. (Figs. 3A–I, 4B)
-# Holotype: …", protože ty také obsahují "Fig." někde za sebou.
+# POZOR: must vyzadovat skutecnou strukturu synonymniho zaznamu — binomium
+# nasledovane "Autor, Rok:" and teprve PAK strankovym/obrazkovym odkazem.
+# Without vyzadovani dvojtecky after roce by this pattern omylem chytal i genuinni
+# nadpisy novych druhu typu "Gracilitheca astronauta n. sp. (Figs. 3And–I, 4B)
+# Holotype: …", because ty take obsahuji "Fig." nekde za sebou.
 SYNONYMY_LINE_RE = re.compile(
     r"^(?:\d{4}\s+)?[A-Z][a-zA-Z\-]+\s+[a-z][a-zA-Z\-]+.*?,\s*\d{4}\s*:\s*"
     r".*\b(pl\.|fig\.|p\.|pp\.|стр\.|рис\.)",
     re.I | re.UNICODE)
-# Ruský styl synonymiky: "Circotheca billingsi: Мешкова, 1969б, с. 176, табл. LVII, фиг. 1, 2."
-# Linka začíná taxonem (Velké+malé) or rodovým jménem, pak ":", autor, rok, citace.
+# Rusky styl synonymiky: "Circotheca billingsi: Мешкова, 1969б, с. 176, табл. LVII, фиг. 1, 2."
+# Linka zacina taxonem (Velke+male) or genusovym jmenem, pak ":", author, year, citace.
 SYNONYMY_LINE_RE_RU = re.compile(
-    r"^[A-ZА-ЯЁ][a-zA-Zа-яё\\-]+(?:\\s+[a-zA-Zа-яё\\-]+)?"
-    r"\\s*:\\s*"
-    r"[A-ZА-ЯЁ][a-zA-Zа-яёäöü\\-]+.*?"
-    r",\\s*\\d{4}[a-zа-я]?[\\s;,]+"
-    r".*?\\b(с\\\.|стр\\\.|фиг\\\.|табл\\\.|рис\\\.|p\\\.|pl\\\.|figs?\\\.|fig\\\.)",
+    r"^[A-ZА-ЯЁ][a-zA-Zа-яё\-]+(?:\s+[a-zA-Zа-яё\-]+)?"
+    r"\s*:\s*"
+    r"[A-ZА-ЯЁ][a-zA-Zа-яёäöü\-]+.*?"
+    r",\s*\d{4}[a-zа-я]?[\s;,]+"
+    r".*?\b(с\.|стр\.|фиг\.|табл\.|рис\.|p\.|pl\.|figs?\.|fig\.)",
     re.I | re.UNICODE | re.MULTILINE)
 REF_LIKE_RE  = re.compile(r"^[A-Z][A-Za-z\-]+,\s*[A-Z].*\d{4}", re.UNICODE)
 AUTHOR_YEAR_RE = re.compile(
@@ -2317,7 +2734,7 @@ TAXON_STOPWORDS = {
     "locality", "stratigraphy", "figure", "table", "small", "large", "shell",
     "conch", "known", "references", "acknowledgements", "type", "species",
     "systematika", "taxonomie",
-    # Běžná anglická slova na začátku vět/odstavcu — časté falešné pozitivy
+    # Bezna anglicka slova on zacatku vet/odstavcu — caste falesne pozitivy
     "this", "the", "a", "an", "to", "in", "on", "for", "with", "we", "it",
     "key", "five", "four", "three", "two", "one", "almost", "subsequently",
     "however", "recently", "published", "downloaded", "please", "taylor",
@@ -2326,24 +2743,24 @@ TAXON_STOPWORDS = {
     "including", "according", "based", "following", "here", "thus", "since",
     "because", "although", "additional", "further", "other", "another",
     "specimens", "specimen", "holotype", "paratype", "paratypes",
-    # Slovně zapsaná čísla
+    # Slovne zapsana cisla
     "six", "seven", "eight", "nine", "ten", "eleven", "twelve", "thirteen",
     "fourteen", "fifteen", "sixteen", "seventeen", "eighteen", "nineteen",
     "twenty", "thirty", "forty", "fifty", "hundred", "several", "many",
     "few", "some", "most",
-    # Nadpisy úvodních sections
+    # Nadpisy uvodnich sections
     "mots", "keywords", "abstract", "résumé", "resume", "summary",
     "zusammenfassung", "schlüsselwörter", "ключевые",
     "introduction", "disclosure", "interest", "acknowledgements",
-    # Fráze před schema-labely
+    # Fraze before schema-labely
     "original", "emended", "revised", "general", "differential",
-    # ── Doplněno po analýze reálných exportu (2026-07) ─────────────────────
-    # Sekční nadpisy chybně detekované jako binomium Genus species:
+    # ── Doplneno after analyze realnych exportu (2026-07) ─────────────────────
+    # Sekcni nadpisy chybne detekovane as binomium Genus species:
     "terminology", "faunal", "unfigured", "until", "except", "although",
     "comparison", "introduction", "methods", "method", "results", "conclusions",
     "conclusion", "discussion", "review", "notes", "note", "overview",
     "history", "preservation", "preparation", "collection",
-    # Morfologické adjektivy a termíny na začátku diagnóz/popisu
+    # Morfologicke adjektivy and terms on zacatku diagnoz/popisu
     # ("Monoclaviculate operculum", "Hyolithids characterized" atd.)
     "monoclaviculate", "biclaviculate", "hyolithid", "hyolithids", "orthothecid",
     "orthothecids", "hyolith", "hyoliths",
@@ -2358,79 +2775,79 @@ TAXON_STOPWORDS = {
     "observed", "figured", "described", "assigned", "attributed",
     "reported", "referred", "considered", "mentioned", "noted",
     "represented", "consisting", "bearing",
-    # Noxt sekce a pojmy z recenzních článku
+    # Noxt sekce and pojmy from recenznich clanku
     "repository", "repositories", "collected", "locality", "localities",
     "institutional", "abbreviations", "acknowledgments",
-    # Spojky a příslovce v angličtině/němčině/francouzštině
+    # Spojky and prislovce in anglictine/nemcine/francouzstine
     "whereas", "whilst", "therefore", "nevertheless", "furthermore",
     "moreover", "however", "indeed", "apparently", "presumably",
     "possibly", "probably", "certainly", "apparently",
-    # ── OCR-split sekční nadpisy: "Diag nosis" → "Diag" zustane jako FP ──────
-    # Přidáme krátké OCR fragmenty sections jako stopwords
+    # ── OCR-split sekcni nadpisy: "Diag nosis" → "Diag" zustane as FP ──────
+    # Pridame kratke OCR fragmenty sections as stopwords
     "diag", "diagn", "descr", "morphol", "stratigr", "occurr",
     "emend", "emended", "sensu", "fide", "vide", "cfr", "incl",
     "excl", "stat", "comb", "nov", "nob",
-    # ── Měrné a popisné výrazy chybně detekované jako binomia ──────────────
+    # ── Merne and popisne vyrazy chybne detekovane as binomia ──────────────
     # "Estimated length", "Maximum width", "Total height" atd.
     "estimated", "estimate", "maximum", "minimum", "average", "approximate",
     "approximately", "total", "overall", "measured", "measurement",
     "length", "width", "height", "thickness", "depth", "diameter",
     "breadth", "ratio", "angle", "curvature", "size",
-    # Geometrické a anatomické termíny stojící na začátku věty
+    # Geometricke and anatomicke terms stojici on zacatku vety
     "cross", "section", "outline", "profile", "shape", "form", "type",
     "dorsoventral", "anteroposterior", "transverse", "longitudinal",
     "adapical", "adoral",
-    # Geol. časová označení stojící samostatně na začátku nadpisu
+    # Geol. casova oznaceni stojici samostatne on zacatku nadpisu
     "lower", "upper", "middle", "early", "late", "mid",
     "cambrian", "ordovician", "silurian", "devonian", "carboniferous",
     "permian", "triassic", "jurassic", "cretaceous", "paleocene",
     "eocene", "oligocene", "miocene", "pliocene", "pleistocene",
-    # ── P 1.5: Ruské nadpisové stopwords ──────────────────────────────────────
+    # ── P 1.5: Ruske nadpisove stopwords ──────────────────────────────────────
     "аннотация", "введение", "методика", "заключение", "благодарности",
     "результаты", "обсуждение", "выводы", "литература", "резюме",
     "список", "приложение", "дополнение", "таблица", "рисунок", "пластина",
-    # ── P 1.5: Čínské stopwords ───────────────────────────────────────────────
+    # ── P 1.5: Cinske stopwords ───────────────────────────────────────────────
     "摘要", "关键词", "引言", "方法", "结论", "致谢", "结果",
     "讨论", "参考文献", "附录", "图版", "表格",
-    # ── P 1.5: Latinské nadpisy sections ────────────────────────────────────────
+    # ── P 1.5: Latinske nadpisy sections ────────────────────────────────────────
     "conspectus", "enumeratio", "catalogus", "addenda", "corrigenda",
-    # ── Časté FP z anglicky psaných paleontologických článku ─────────────────
-    # Logistical / metodické nadpisy (Malinky 2002: "Logistical difficulties")
+    # ── Caste FP from anglicky psanych paleontologickych clanku ─────────────────
+    # Logistical / metodicke nadpisy (Malinky 2002: "Logistical difficulties")
     "logistical", "logistics", "collecting", "preservation", "collection",
     "registration", "accessibility", "difficulties",
-    # Morfologické adj/noun páry falešně detekované jako binomia ("outermost layer")
+    # Morfologicke adj/noun pary falesne detekovane as binomia ("outermost layer")
     "outermost", "innermost", "lowermost", "uppermost", "foremost",
     "layer", "layers", "surface", "surfaces", "portion", "portions",
     "region", "regions", "margin", "margins", "edge", "edges",
     "section", "sections", "shell", "specimen", "specimens",
     "feature", "features", "character", "characters", "element",
     "component", "components", "part", "parts", "area", "areas",
-    # Posuzovací výrazy
+    # Posuzovaci vyrazy
     "general", "typical", "common", "unusual", "unique", "similar",
     "different", "larger", "smaller", "shorter", "longer", "wider",
-    # ── Časté FP z geologicko-palaeontologických článku (cave bear paper, 2026-07) ─
-    # Záhlaví stránek a institucí
+    # ── Caste FP from geologicko-palaeontologickych clanku (cave bear paper, 2026-07) ─
+    # Zahlavi stranek and instituci
     "département", "departement", "centre", "cahiers", "fichier",
     "citer", "actes", "symposium", "musée", "muséum", "musee", "museum",
-    # Statistické a datové termíny
+    # Statisticke and datove terms
     "statistic", "statistics", "statistical", "measurements", "measurement",
     "radiometric", "comparisons", "comparison", "comparaison",
     "indices", "index", "parameters", "data", "mean", "deviation",
-    # Anatomické termíny stojící samostatně (záhlaví tabulek)
+    # Anatomicke terms stojici samostatne (zahlavi tabulek)
     "ramesch", "gamssulzen", "conturines", "zoolithenhohle",
-    # Obecné biologicko-geologické termíny detekované jako binomia
+    # Obecne biologicko-geologicke terms detekovane as binomia
     "only", "elements", "cave", "bears", "phylogenetic", "conclusions",
     "phylogenetic", "systematic", "characterisation", "characterization",
-    # Francouzské termíny na začátku textu
+    # Francouzske terms on zacatku textu
     "les", "du", "de", "des", "et", "en", "un", "une", "dans", "le", "la",
     "pour", "avec", "que", "qui", "mais", "sur", "par", "au", "aux",
-    # Německé termíny
+    # Nemecke terms
     "die", "der", "den", "das", "des", "ein", "eine", "und", "oder",
     "mit", "von", "aus", "bei", "zur", "zum", "über",
 }
 
-# Boilerplate / running-header-footer junk typické pro akademické PDF.
-# Tyto řádky NIKDY nesmí být detekovány jako kandidát nadpisu taxonu.
+# Boilerplate / running-header-footer junk typicke for akademicke PDF.
+# These lines NIKDY nesmi byt detekovany as candidate nadpisu taxonu.
 BOILERPLATE_RE = re.compile(
     r"^(?:"
     r"Downloaded by|This article may be used|Published online|"
@@ -2440,21 +2857,21 @@ BOILERPLATE_RE = re.compile(
     r"Registered in England|Registered office|Registered Number|"
     r"Author's personal copy|Author personal copy|"
     r"Disclosure of interest|Conflicts? of interest|"
-    r"https?://doi\.org/|https?://www\.|http://dx\.doi|"   # DOI/URL řádky z PDF
+    r"https?://doi\.org/|https?://www\.|http://dx\.doi|"   # DOI/URL lines from PDF
     r"Cambridge Core|cambridge\.org|IP address:\s*\d|"      # Cambridge Core download banners
     r"Citer ce document|Cite this document|"                # Cover-page citation blocks
     r"Fichier pdf g[eé]n[eé]r[eé]|"                       # Persee.fr cover page
     r"Département du Rh[oô]ne|Centre de Conservation|"     # French journal running headers
     r"Cahiers scientifiques.*H[oô]rs.s[eé]rie|"           # Journal title in header
-    r"D[eé]partement du Rh[oô]ne\s*[-–]\s*Mus[eé]um|"    # Département header variant
+    r"D[eé]partement du Rh[oô]ne\s*[-–]\s*Mus[eé]um|"    # Departement header variant
     r"Actes du \d+e? [Ss]ymposium"                         # Conference proceedings header
     r")|"
-    # Generický vzor běžícího záhlaví: cokoliv krátkého / Časopis (Rok) pagesy
+    # Genericky pattern beziciho zahlavi: cokoliv kratkeho / Casopis (Rok) pagesy
     r"^.{2,45}/\s*.{3,60}\(\d{4}\)\s*\d",
     re.IGNORECASE)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DATOVÉ TŘÍDY
+# DATOVE TRIDY
 # ══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
@@ -2474,15 +2891,291 @@ class TextUnit:
     zone_flags: str = ""   # "systematic", "references", "synonymy", "caption", …
     bbox: Optional[Tuple[float,float,float,float]] = None
 
+
+@dataclass
+class OperationResult:
+    """Testable service-layer result independent of Streamlit widgets."""
+    ok: bool
+    message: str = ""
+    error_code: str = ""
+    details: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class DocumentIndexResult(OperationResult):
+    document_id: Optional[int] = None
+    stored_path: Optional[pathlib.Path] = None
+    pages: List[PageText] = field(default_factory=list)
+    diagnostics: Dict[str, Any] = field(default_factory=dict)
+    char_count: int = 0
+
+
 # ══════════════════════════════════════════════════════════════════════════════
-# DATABÁZE
+# DATABAZE
 # ══════════════════════════════════════════════════════════════════════════════
+
+def _table_columns(con: sqlite3.Connection, table: str) -> set:
+    """Returns column names for a SQLite table."""
+    return {str(row[1]) for row in con.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _add_column_if_missing(con: sqlite3.Connection, table: str,
+                           column: str, sql_type: str) -> bool:
+    """Adds one column only when absent. Unexpected SQL errors are not hidden."""
+    if column in _table_columns(con, table):
+        return False
+    con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}")
+    return True
+
+
+def _migrate_database(con: sqlite3.Connection) -> int:
+    """Runs versioned, transactional migrations and returns the final version."""
+    version = int(con.execute("PRAGMA user_version").fetchone()[0])
+    if version > DB_SCHEMA_VERSION:
+        raise RuntimeError(
+            f"Database schema {version} is newer than supported {DB_SCHEMA_VERSION}.")
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        # Version 1 formalises columns previously created by ad-hoc migrations.
+        if version < 1:
+            for column, sql_type in [
+                ("notes", "TEXT DEFAULT ''"),
+                ("doi", "TEXT DEFAULT ''"),
+                ("pub_authors", "TEXT DEFAULT ''"),
+                ("pub_journal", "TEXT DEFAULT ''"),
+                ("pub_year", "INTEGER DEFAULT NULL"),
+                ("pub_volume", "TEXT DEFAULT ''"),
+                ("pub_pages", "TEXT DEFAULT ''"),
+                ("pub_title", "TEXT DEFAULT ''"),
+                ("pages_version", "INTEGER DEFAULT 0"),
+            ]:
+                _add_column_if_missing(con, "documents", column, sql_type)
+            for column, sql_type in [
+                ("unit_index", "INTEGER DEFAULT -1"),
+                ("parent_taxon_name", "TEXT DEFAULT ''"),
+                ("parent_rank", "TEXT DEFAULT ''"),
+                ("parent_id", "INTEGER DEFAULT NULL"),
+                ("manual_block_text", "TEXT DEFAULT NULL"),
+                ("active_block_source", "TEXT DEFAULT 'parser'"),
+                ("boundary_method", "TEXT DEFAULT 'parser'"),
+                ("boundary_reason", "TEXT DEFAULT ''"),
+                ("boundary_confidence", "REAL DEFAULT NULL"),
+                ("block_version", "INTEGER DEFAULT 1"),
+                ("manual_edited_at", "TEXT DEFAULT NULL"),
+                ("manual_edited_by", "TEXT DEFAULT NULL"),
+                ("start_unit_id", "INTEGER DEFAULT NULL"),
+                ("end_unit_id", "INTEGER DEFAULT NULL"),
+            ]:
+                _add_column_if_missing(con, "taxon_candidates", column, sql_type)
+            version = 1
+
+        # Version 2 adds recoverable document-processing state.
+        if version < 2:
+            for column, sql_type in [
+                ("processing_status", "TEXT DEFAULT 'ready'"),
+                ("processing_stage", "TEXT DEFAULT ''"),
+                ("processing_error", "TEXT DEFAULT ''"),
+                ("processing_started_at", "TEXT DEFAULT NULL"),
+                ("processing_finished_at", "TEXT DEFAULT NULL"),
+                ("processing_attempts", "INTEGER DEFAULT 0"),
+            ]:
+                _add_column_if_missing(con, "documents", column, sql_type)
+            con.execute("""
+                UPDATE documents
+                   SET processing_status='ready'
+                 WHERE processing_status IS NULL OR processing_status=''
+            """)
+            con.execute("CREATE INDEX IF NOT EXISTS idx_documents_processing ON documents(processing_status)")
+            con.execute("CREATE INDEX IF NOT EXISTS idx_pages_doc_page ON pages(document_id, page_number)")
+            con.executescript("""
+                CREATE TRIGGER IF NOT EXISTS trg_documents_delete_pages
+                AFTER DELETE ON documents BEGIN
+                    DELETE FROM pages WHERE document_id=OLD.id;
+                END;
+                CREATE TRIGGER IF NOT EXISTS trg_documents_delete_candidates
+                AFTER DELETE ON documents BEGIN
+                    DELETE FROM taxon_candidates WHERE document_id=OLD.id;
+                END;
+                CREATE TRIGGER IF NOT EXISTS trg_candidates_delete_fields
+                AFTER DELETE ON taxon_candidates BEGIN
+                    DELETE FROM occurrence_fields WHERE candidate_id=OLD.id;
+                END;
+                CREATE TRIGGER IF NOT EXISTS trg_candidates_delete_terms
+                AFTER DELETE ON taxon_candidates BEGIN
+                    DELETE FROM term_matches WHERE candidate_id=OLD.id;
+                END;
+                CREATE TRIGGER IF NOT EXISTS trg_goldset_delete_benchmarks
+                AFTER DELETE ON goldset_documents BEGIN
+                    DELETE FROM benchmark_runs WHERE goldset_doc_id=OLD.id;
+                END;
+                CREATE TRIGGER IF NOT EXISTS trg_candidates_delete_llm_runs
+                AFTER DELETE ON taxon_candidates BEGIN
+                    DELETE FROM llm_runs WHERE candidate_id=OLD.id;
+                END;
+                CREATE TRIGGER IF NOT EXISTS trg_candidates_delete_llm_proposals
+                AFTER DELETE ON taxon_candidates BEGIN
+                    DELETE FROM llm_field_proposals WHERE candidate_id=OLD.id;
+                END;
+            """)
+            version = 2
+
+        # Version 3 stores reproducible benchmark metrics and history.
+        if version < 3:
+            con.executescript("""
+                CREATE TABLE IF NOT EXISTS benchmark_runs (
+                    id INTEGER PRIMARY KEY,
+                    goldset_doc_id INTEGER NOT NULL,
+                    linked_document_id INTEGER NOT NULL,
+                    parser_version TEXT DEFAULT '',
+                    metrics_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(goldset_doc_id) REFERENCES goldset_documents(id),
+                    FOREIGN KEY(linked_document_id) REFERENCES documents(id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_benchmark_goldset
+                    ON benchmark_runs(goldset_doc_id, created_at);
+            """)
+            version = 3
+
+        # Version 4 adds LLM provenance, proposals and accepted-value audit data.
+        if version < 4:
+            for column, sql_type in [
+                ("provenance_run_id", "INTEGER DEFAULT NULL"),
+                ("accepted_at", "TEXT DEFAULT NULL"),
+                ("accepted_by", "TEXT DEFAULT NULL"),
+                ("source_value_hash", "TEXT DEFAULT ''"),
+            ]:
+                _add_column_if_missing(con, "occurrence_fields", column, sql_type)
+            con.executescript("""
+                CREATE TABLE IF NOT EXISTS llm_runs (
+                    id INTEGER PRIMARY KEY,
+                    candidate_id INTEGER DEFAULT NULL,
+                    task_type TEXT NOT NULL,
+                    model TEXT DEFAULT '', endpoint TEXT DEFAULT '',
+                    prompt_version TEXT DEFAULT '',
+                    system_prompt_hash TEXT DEFAULT '',
+                    user_input_hash TEXT DEFAULT '', response_hash TEXT DEFAULT '',
+                    temperature REAL DEFAULT 0.0, max_tokens INTEGER DEFAULT 0,
+                    json_mode INTEGER DEFAULT 0, status TEXT DEFAULT 'started',
+                    error_text TEXT DEFAULT '', duration_ms INTEGER DEFAULT 0,
+                    created_at TEXT NOT NULL, completed_at TEXT DEFAULT NULL,
+                    FOREIGN KEY(candidate_id) REFERENCES taxon_candidates(id)
+                );
+                CREATE TABLE IF NOT EXISTS llm_field_proposals (
+                    id INTEGER PRIMARY KEY,
+                    run_id INTEGER NOT NULL, candidate_id INTEGER NOT NULL,
+                    field_name TEXT NOT NULL, proposed_value TEXT NOT NULL,
+                    status TEXT DEFAULT 'proposed', created_at TEXT NOT NULL,
+                    reviewed_at TEXT DEFAULT NULL, reviewed_by TEXT DEFAULT NULL,
+                    review_note TEXT DEFAULT '',
+                    FOREIGN KEY(run_id) REFERENCES llm_runs(id),
+                    FOREIGN KEY(candidate_id) REFERENCES taxon_candidates(id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_llm_runs_candidate
+                    ON llm_runs(candidate_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_llm_proposals_candidate
+                    ON llm_field_proposals(candidate_id, status);
+            """)
+            version = 4
+
+        con.execute(f"PRAGMA user_version={version}")
+        con.commit()
+    except Exception:
+        con.rollback()
+        logging.exception("Database migration failed at version %s", version)
+        raise
+    return version
+
+
+@contextmanager
+def db_transaction(immediate: bool = False):
+    """Transaction context that always commits or rolls back and closes."""
+    con = db()
+    try:
+        con.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
+        yield con
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+
+
+def set_document_processing(document_id: int, status: str, stage: str = "",
+                            error: str = "", con: sqlite3.Connection = None) -> None:
+    """Persists a resumable document-processing state."""
+    allowed = {"new", "extracting", "detecting", "mapping", "translating",
+               "ready", "failed"}
+    if status not in allowed:
+        raise ValueError(f"Unknown processing status: {status}")
+    own = con is None
+    if own:
+        con = db()
+    now = datetime.now().isoformat()
+    finished = now if status in {"ready", "failed"} else None
+    con.execute("""
+        UPDATE documents
+           SET processing_status=?, processing_stage=?, processing_error=?,
+               processing_finished_at=COALESCE(?, processing_finished_at)
+         WHERE id=?
+    """, (status, stage, (error or "")[:4000], finished, document_id))
+    if own:
+        con.commit()
+        con.close()
+
+
+def recover_interrupted_documents() -> int:
+    """Marks stale in-progress records as failed after an app restart."""
+    active = ("new", "extracting", "detecting", "mapping", "translating")
+    con = db()
+    placeholders = ",".join("?" for _ in active)
+    stale_before = (datetime.now() - timedelta(hours=6)).isoformat()
+    rows = con.execute(
+        f"SELECT id, processing_stage FROM documents "
+        f"WHERE processing_status IN ({placeholders}) "
+        "AND COALESCE(processing_started_at, '') < ?",
+        (*active, stale_before)).fetchall()
+    if rows:
+        now = datetime.now().isoformat()
+        con.executemany("""
+            UPDATE documents
+               SET processing_status='failed',
+                   processing_error='Processing was interrupted by application restart.',
+                   processing_finished_at=?
+             WHERE id=?
+        """, [(now, row["id"]) for row in rows])
+        con.commit()
+    con.close()
+    return len(rows)
+
+
+def database_integrity_report(con: sqlite3.Connection = None) -> Dict[str, Any]:
+    """Runs lightweight integrity and orphan checks for diagnostics."""
+    own = con is None
+    if own:
+        con = db()
+    quick = con.execute("PRAGMA quick_check").fetchone()[0]
+    report = {
+        "quick_check": quick,
+        "schema_version": int(con.execute("PRAGMA user_version").fetchone()[0]),
+        "orphan_pages": con.execute("SELECT COUNT(*) FROM pages p LEFT JOIN documents d ON d.id=p.document_id WHERE d.id IS NULL").fetchone()[0],
+        "orphan_candidates": con.execute("SELECT COUNT(*) FROM taxon_candidates c LEFT JOIN documents d ON d.id=c.document_id WHERE d.id IS NULL").fetchone()[0],
+        "orphan_fields": con.execute("SELECT COUNT(*) FROM occurrence_fields f LEFT JOIN taxon_candidates c ON c.id=f.candidate_id WHERE c.id IS NULL").fetchone()[0],
+        "orphan_terms": con.execute("SELECT COUNT(*) FROM term_matches t LEFT JOIN taxon_candidates c ON c.id=t.candidate_id WHERE c.id IS NULL").fetchone()[0],
+        "duplicate_pages": con.execute("SELECT COUNT(*) FROM (SELECT document_id,page_number FROM pages GROUP BY document_id,page_number HAVING COUNT(*)>1)").fetchone()[0],
+    }
+    report["ok"] = quick == "ok" and not any(
+        report[k] for k in ("orphan_pages", "orphan_candidates", "orphan_fields", "orphan_terms", "duplicate_pages"))
+    if own:
+        con.close()
+    return report
+
 
 def init_db() -> None:
     BASE_DIR.mkdir(parents=True, exist_ok=True)
-    EXPORTS_DIR.mkdir(exist_ok=True)
-    UPLOADS_DIR.mkdir(exist_ok=True)
-    con = db()  # vždy správná cesta — legacy i user-specific (dle session)
+    current_user_paths().ensure()
+    con = db()  # always the correct path — legacy i user-specific (according to the session)
     con.executescript("""
     PRAGMA journal_mode=WAL;
     CREATE TABLE IF NOT EXISTS documents (
@@ -2500,7 +3193,13 @@ def init_db() -> None:
         pub_year INTEGER DEFAULT NULL,
         pub_volume TEXT DEFAULT '',
         pub_pages TEXT DEFAULT '',
-        pub_title TEXT DEFAULT ''
+        pub_title TEXT DEFAULT '',
+        processing_status TEXT DEFAULT 'ready',
+        processing_stage TEXT DEFAULT '',
+        processing_error TEXT DEFAULT '',
+        processing_started_at TEXT DEFAULT NULL,
+        processing_finished_at TEXT DEFAULT NULL,
+        processing_attempts INTEGER DEFAULT 0
     );
     CREATE TABLE IF NOT EXISTS pages (
         id INTEGER PRIMARY KEY,
@@ -2548,7 +3247,11 @@ def init_db() -> None:
         field_name TEXT NOT NULL,
         field_value TEXT DEFAULT '',
         source_pages TEXT DEFAULT '',
-        method TEXT DEFAULT 'manual'
+        method TEXT DEFAULT 'manual',
+        provenance_run_id INTEGER DEFAULT NULL,
+        accepted_at TEXT DEFAULT NULL,
+        accepted_by TEXT DEFAULT NULL,
+        source_value_hash TEXT DEFAULT ''
     );
     CREATE TABLE IF NOT EXISTS term_matches (
         id INTEGER PRIMARY KEY,
@@ -2587,8 +3290,56 @@ def init_db() -> None:
         created_at TEXT,
         FOREIGN KEY(goldset_doc_id) REFERENCES goldset_documents(id)
     );
+    CREATE TABLE IF NOT EXISTS benchmark_runs (
+        id INTEGER PRIMARY KEY,
+        goldset_doc_id INTEGER NOT NULL,
+        linked_document_id INTEGER NOT NULL,
+        parser_version TEXT DEFAULT '',
+        metrics_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(goldset_doc_id) REFERENCES goldset_documents(id),
+        FOREIGN KEY(linked_document_id) REFERENCES documents(id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_benchmark_goldset ON benchmark_runs(goldset_doc_id, created_at);
+    CREATE TABLE IF NOT EXISTS llm_runs (
+        id INTEGER PRIMARY KEY,
+        candidate_id INTEGER DEFAULT NULL,
+        task_type TEXT NOT NULL,
+        model TEXT DEFAULT '',
+        endpoint TEXT DEFAULT '',
+        prompt_version TEXT DEFAULT '',
+        system_prompt_hash TEXT DEFAULT '',
+        user_input_hash TEXT DEFAULT '',
+        response_hash TEXT DEFAULT '',
+        temperature REAL DEFAULT 0.0,
+        max_tokens INTEGER DEFAULT 0,
+        json_mode INTEGER DEFAULT 0,
+        status TEXT DEFAULT 'started',
+        error_text TEXT DEFAULT '',
+        duration_ms INTEGER DEFAULT 0,
+        created_at TEXT NOT NULL,
+        completed_at TEXT DEFAULT NULL,
+        FOREIGN KEY(candidate_id) REFERENCES taxon_candidates(id)
+    );
+    CREATE TABLE IF NOT EXISTS llm_field_proposals (
+        id INTEGER PRIMARY KEY,
+        run_id INTEGER NOT NULL,
+        candidate_id INTEGER NOT NULL,
+        field_name TEXT NOT NULL,
+        proposed_value TEXT NOT NULL,
+        status TEXT DEFAULT 'proposed',
+        created_at TEXT NOT NULL,
+        reviewed_at TEXT DEFAULT NULL,
+        reviewed_by TEXT DEFAULT NULL,
+        review_note TEXT DEFAULT '',
+        FOREIGN KEY(run_id) REFERENCES llm_runs(id),
+        FOREIGN KEY(candidate_id) REFERENCES taxon_candidates(id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_llm_runs_candidate ON llm_runs(candidate_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_llm_proposals_candidate ON llm_field_proposals(candidate_id, status);
     """)
-    # Migrations – bezpečné ALTER TABLE (SQLite ignoruje duplicity přes try/except)
+    _migrate_database(con)
+    # Legacy idempotent migrations kept for compatibility with older databases. (SQLite ignoruje duplicity pres try/except)
     try:
         con.execute("ALTER TABLE documents ADD COLUMN notes TEXT DEFAULT ''")
         con.commit()
@@ -2653,17 +3404,17 @@ def init_db() -> None:
         except Exception:
             pass
     try:
-        # pages_version se zvyšuje při KAŽDÉ změně obsahu stránek Documentu
-        # (re-index) — slouží jako invalidační klíč pro cache text units
-        # (viz get_cached_text_units / _bump_pages_version níže). Reset
-        # detekce ani schvalování kandidátu verzi NEmění, protože text
-        # stránek se tím nemění.
+        # pages_version zvysuje when KAZDE zmene obsahu stranek Documentu
+        # (re-index) — slouzi as invalidacni klic for cache text units
+        # (viz get_cached_text_units / _bump_pages_version nithat). Reset
+        # detection ani schvalovani kandidatu verzi NEmeni, because text
+        # stranek tim nemeni.
         con.execute("ALTER TABLE documents ADD COLUMN pages_version INTEGER DEFAULT 0")
         con.commit()
     except Exception:
         pass
-    # ── Výkonnostní indexy (bezpečné – IF NOT EXISTS) ─────────────────────────
-    # Bez indexu dotazy nad tisíci záznamy provádějí full-table scan.
+    # ── Performance indexes (safe – IF NOT EXISTS) ─────────────────────────
+    # Without indexes queries nad tisici records perform and full-table scan.
     for _idx_sql in [
         "CREATE INDEX IF NOT EXISTS idx_tc_status          ON taxon_candidates(status)",
         "CREATE INDEX IF NOT EXISTS idx_tc_docid           ON taxon_candidates(document_id)",
@@ -2679,35 +3430,34 @@ def init_db() -> None:
         except Exception:
             pass
     con.close()
+    recover_interrupted_documents()
 
 
 def db() -> sqlite3.Connection:
-    """Returns a DB connection for the active user (or legacy during migration)."""
-    u = st.session_state.get("pn_user") if st is not None else None
-    if u:
-        path = USERS_DIR / _sanitize_username(u) / "paleon.db"
-        path.parent.mkdir(parents=True, exist_ok=True)
-    else:
-        path = DB_FILE
-    con = sqlite3.connect(str(path), check_same_thread=False)
+    """Returns a configured connection to the active user's database."""
+    path = current_user_paths().db
+    con = sqlite3.connect(str(path), check_same_thread=False, timeout=30.0)
     con.row_factory = sqlite3.Row
-    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA foreign_keys=ON")
+    con.execute("PRAGMA busy_timeout=30000")
+    con.execute("PRAGMA synchronous=NORMAL")
+    con.execute("PRAGMA temp_store=MEMORY")
     return con
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CACHE TEXT UNITS  (výkon extract_block_for_candidate)
+# CACHE Text UNITS (performance extract_block_for_candidate)
 # ══════════════════════════════════════════════════════════════════════════════
 #
-# extract_block_for_candidate() dřív volalo build_text_units(pages_obj) —
-# tj. kompletní re-segmentaci celého Documentu — při KAŽDÉM volání. Při
-# hromadném schválení N kandidátu se tak Document re-segmentoval N×.
-# Cache níže je proces-wide (přežívá napříč Streamlit reruny i mezi
-# jednotlivými akcemi uživatele, ne jen po dobu jednoho requestu),
-# klíčovaná (document_id, pages_version) — díky explicitnímu verznímu
-# čísluv `documents.pages_version` je invalidace spolehlivá i robustní:
-# nezávisí na hashování obsahu ani na "náhodě", že se obsah nezmění.
-_TEXT_UNITS_CACHE: Dict[Tuple[int, int], List[Any]] = {}
+# extract_block_for_candidate() previously called build_text_units(pages_obj) —
+# tj. kompletni re-segmentaci celeho Documentu — on EVERY call. When
+# batch approval N kandidatu tak Document re-segmentoval N×.
+# The cache below is proces-wide (persists across Streamlit reruny i mezi
+# individual user actions, not only for one request),
+# klicovana (document_id, pages_version) — diky explicitnimu verznimu
+# cisluv `documents.pages_version` is invalidation is reliable i robustni:
+# does not depend on content hashing ani on "nahode", that obsah nezmeni.
+_TEXT_UNITS_CACHE: Dict[Tuple[str, int, int], List[Any]] = {}
 _TEXT_UNITS_CACHE_LOCK = threading.Lock()
 
 
@@ -2730,7 +3480,8 @@ def _bump_pages_version(document_id: int, con: Optional[sqlite3.Connection] = No
 def invalidate_text_units_cache(document_id: int) -> None:
     """Removes all cached text-unit variants for the given document."""
     with _TEXT_UNITS_CACHE_LOCK:
-        for key in [k for k in _TEXT_UNITS_CACHE if k[0] == document_id]:
+        user_key = _current_username()
+        for key in [k for k in _TEXT_UNITS_CACHE if k[0] == user_key and k[1] == document_id]:
             del _TEXT_UNITS_CACHE[key]
 
 
@@ -2746,7 +3497,7 @@ def get_cached_text_units(document_id: int) -> List[Any]:
         "SELECT pages_version FROM documents WHERE id=?", (document_id,)
     ).fetchone()
     pages_version = (row["pages_version"] if row and row["pages_version"] is not None else 0)
-    cache_key = (document_id, pages_version)
+    cache_key = (_current_username(), document_id, pages_version)
 
     with _TEXT_UNITS_CACHE_LOCK:
         cached = _TEXT_UNITS_CACHE.get(cache_key)
@@ -2767,14 +3518,16 @@ def get_cached_text_units(document_id: int) -> List[Any]:
         for r in pages_rows
     ]
     units = build_text_units(pages_obj)
-    # Duležité pro extract_block_for_candidate(): blokový filtr pracuje se
-    # zone_flags (caption, references, document_index...). Při čtení z cache
-    # proto musí mít jednotky stejné flagy jako při detekci kandidátu.
+    # Dulezite for extract_block_for_candidate(): blokovy filtr pracuje 
+    # zone_flags (caption, references, document_index...). When cteni from cache
+    # proto must mit jednotky stejne flagy as when detekci kandidatu.
     assign_zone_flags(units)
 
     with _TEXT_UNITS_CACHE_LOCK:
-        # Uklidit staré verze téhož Documentu, ať cache neroste bez mezí.
-        for key in [k for k in _TEXT_UNITS_CACHE if k[0] == document_id and k[1] != pages_version]:
+        # Uklidit stare verze tehoz Documentu, at cache neroste without mezi.
+        user_key = _current_username()
+        for key in [k for k in _TEXT_UNITS_CACHE
+                    if k[0] == user_key and k[1] == document_id and k[2] != pages_version]:
             del _TEXT_UNITS_CACHE[key]
         _TEXT_UNITS_CACHE[cache_key] = units
     return units
@@ -2808,7 +3561,118 @@ def _delete_candidates_for_document(document_id: int, con: Optional[sqlite3.Conn
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# EXTRAKCE TEXTU  (PDF dvousloupcová, DOCX, TXT)
+# SERVICE / REPOSITORY LAYER (UI-independent, testable)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class DocumentRepository:
+    """Small persistence boundary used by indexing and tests."""
+
+    @staticmethod
+    def create_with_pages(filename: str, stored_path: pathlib.Path, lang: str,
+                          pages: List[PageText], char_count: int) -> int:
+        now = datetime.now().isoformat()
+        with db_transaction(immediate=True) as con:
+            cur = con.execute(
+                "INSERT INTO documents (filename,path,lang,page_count,char_count,notes,created_at,"
+                "processing_status,processing_stage,processing_error,processing_started_at,processing_attempts) "
+                "VALUES (?,?,?,?,?,'',?,'detecting','candidate_detection','',?,1)",
+                (filename, str(stored_path), lang, len(pages), char_count, now, now))
+            document_id = int(cur.lastrowid)
+            con.executemany(
+                "INSERT INTO pages (document_id,page_number,text,method,ocr_note,layout_note) "
+                "VALUES (?,?,?,?,?,?)",
+                [(document_id, pg.page_number, pg.text, pg.method,
+                  pg.ocr_note, pg.layout_note) for pg in pages])
+        return document_id
+
+    @staticmethod
+    def get(document_id: int) -> Optional[Dict[str, Any]]:
+        con = db()
+        row = con.execute("SELECT * FROM documents WHERE id=?", (document_id,)).fetchone()
+        con.close()
+        return dict(row) if row else None
+
+    @staticmethod
+    def list_recent(limit: int = 1000) -> List[Dict[str, Any]]:
+        con = db()
+        rows = con.execute(
+            "SELECT * FROM documents ORDER BY created_at DESC LIMIT ?", (int(limit),)
+        ).fetchall()
+        con.close()
+        return [dict(row) for row in rows]
+
+
+class CandidateRepository:
+    """Read boundary for candidate records; avoids SQL duplication in new code."""
+
+    @staticmethod
+    def for_document(document_id: int,
+                     statuses: Tuple[str, ...] = ()) -> List[Dict[str, Any]]:
+        con = db()
+        if statuses:
+            marks = ",".join("?" for _ in statuses)
+            rows = con.execute(
+                f"SELECT * FROM taxon_candidates WHERE document_id=? "
+                f"AND status IN ({marks}) ORDER BY page_start,id",
+                (document_id, *statuses)).fetchall()
+        else:
+            rows = con.execute(
+                "SELECT * FROM taxon_candidates WHERE document_id=? ORDER BY page_start,id",
+                (document_id,)).fetchall()
+        con.close()
+        return [dict(row) for row in rows]
+
+
+def index_document_bytes(filename: str, content: bytes, lang: str,
+                         settings: Dict[str, Any]) -> DocumentIndexResult:
+    """Core upload/index operation without Streamlit dependencies.
+
+    It owns file persistence, page extraction, atomic document/page insertion,
+    candidate detection, processing states, and failure cleanup. UI-specific
+    translation and progress rendering remain outside this service.
+    """
+    document_id: Optional[int] = None
+    destination: Optional[pathlib.Path] = None
+    try:
+        safe_name = _safe_upload_name(filename)
+        destination = _unique_upload_path(safe_name)
+        destination.write_bytes(bytes(content))
+        pages = extract_pages_from_file(destination, settings)
+        if not pages:
+            raise ValueError("No readable pages were extracted from the document.")
+        char_count = sum(len(pg.text or "") for pg in pages)
+        document_id = DocumentRepository.create_with_pages(
+            safe_name, destination, lang, pages, char_count)
+        set_document_processing(document_id, "detecting", "candidate_detection")
+        diagnostics = detect_candidates(document_id, pages, settings)
+        set_document_processing(document_id, "mapping", "field_mapping")
+        return DocumentIndexResult(
+            ok=True, message="Document indexed", document_id=document_id,
+            stored_path=destination, pages=pages, diagnostics=diagnostics,
+            char_count=char_count,
+            details={"safe_filename": safe_name})
+    except Exception as exc:
+        if isinstance(exc, ValueError):
+            logging.warning("Document rejected (%r): %s", filename, exc)
+        else:
+            logging.exception("Core document indexing failed for %r", filename)
+        if document_id is not None:
+            try:
+                set_document_processing(document_id, "failed", "indexing", str(exc))
+            except Exception:
+                logging.exception("Could not persist failed document state %s", document_id)
+        elif destination is not None and destination.exists():
+            try:
+                destination.unlink()
+            except OSError:
+                logging.warning("Could not remove failed upload %s", destination)
+        return DocumentIndexResult(
+            ok=False, message=str(exc), error_code="INDEX_FAILED",
+            document_id=document_id, stored_path=destination)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Text EXTRACTION (PDF two-column, DOCX, TXT)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def detect_columns(blocks: list, width: float) -> bool:
@@ -2825,9 +3689,9 @@ def detect_columns(blocks: list, width: float) -> bool:
     return left >= 3 and right >= 3 and middle <= max(2, len(xs)*0.25)
 
 
-# Generický running-header/footer text typický pro akademické PDF
-# (na rozdíl od BOILERPLATE_RE, který chytá specifické fráze, toto chytá
-# tvar "Krátký text + velká písmena + číslo stránky" typický pro záhlaví).
+# Genericky running-header/footer text typicky for akademicke PDF
+# (on rozdil od BOILERPLATE_RE, which chyta specificke fraze, toto chyta
+# tvar "Kratky text + velka pismena + cislo pages" typicky for zahlavi).
 _HEADER_LIKE_RE = re.compile(
     r"^[A-ZÁČĎÉĚÍŇÓŘŠŤÚŮÝŽÄÖÜÀÂÆÇÈÊËÎÏÔÙÛÜ][\w\s\.,&–\-]{2,60}\d{1,4}\s*$"
 )
@@ -2853,11 +3717,11 @@ def _is_margin_block(
     bh = max(y1 - y0, 0.01)
     aspect = bh / bw
 
-    # Signál 1: rotovaný/popagesní text (vysoký úzký pruh u okraje stránky)
+    # Signal 1: rotovany/popagesni text (vysoky uzky pruh u okraje pages)
     if aspect > 5 and bw < width * 0.06:
         return True
 
-    # Signál 2: krátký text v horním/dolním pruhu stránky
+    # Signal 2: kratky text in hornim/dolnim pruhu pages
     in_top_strip    = y0 < height * 0.062
     in_bottom_strip = y1 > height * 0.94
     if (in_top_strip or in_bottom_strip) and len(txt) < 100:
@@ -2865,7 +3729,7 @@ def _is_margin_block(
         if _HEADER_LIKE_RE.match(compact) or compact.isupper():
             return True
 
-    # Signál 3: explicitní nakladatelský balast
+    # Signal 3: explicitni nakladatelsky balast
     if BOILERPLATE_RE.search(txt):
         return True
 
@@ -2901,21 +3765,21 @@ def reading_order(fitz_page: Any, settings: Dict) -> Tuple[str, str]:
         ordered = sorted(raw, key=lambda b: (b[1], b[0]))
         note = NOT_PROVIDED
 
-    # Spojovat bloky DVOJITÝM newline (paragraph-level granularita pro
-    # build_text_units), ale uvnitř KAŽDÉHO bloku sloučit jednotlivé
-    # vizuální řádky zpět do plynulého textu — PDF justifikovaný text
-    # obsahuje tvrdé zalomení na konci každého vizuálního řádku, což by
-    # jinak rozbilo větu na samostatné řádky ("provided\nthe\nfollowing…").
+    # Spojovat bloky DVOJITYM newline (paragraph-level granularita for
+    # build_text_units), but uvnitr KAZDEHO bloku sloucit jednotlive
+    # vizualni lines zpet to plynuleho textu — PDF justifikovany text
+    # contains tvrde zalomeni on konci kazdeho vizualniho radku, coz by
+    # jinak rozbilo vetu on samostatne lines ("provided\nthe\nfollowing…").
     joined_blocks = []
     for b in ordered:
         block_text = b[4]
-        # POŘADÍ JE KRITICKÉ:
-        # 1) Nojdřív dehyphenace na PŮVODNÍCH zalomeních řádku uvnitř bloku
-        #    (zde ještě exists skutečný \n mezi "low-" a "er", takže
-        #    HYPHEN_BREAK_RE muže spojit "low-\ner" → "lower").
+        # PORADI Is KRITICKE:
+        # 1) Nojdriv dehyphenace on PUVODNICH zalomenich radku uvnitr bloku
+        #    (zde jeste exists skutecny \n mezi "low-" and "er", takthat
+        #    HYPHEN_BREAK_RE muthat spojit "low-\ner" → "lower").
         block_text = HYPHEN_BREAK_RE.sub(r"\1\2", block_text)
-        # 2) Teprve POTOM sloučit zbylé konce vizuálních řádku do mezery,
-        #    ale zachovat skutečné odstavcové zlomy (dvojitý newline) beze změny.
+        # 2) Teprve POTOM sloucit zbyle konce vizualnich radku to mezery,
+        #    but zachovat skutecne odstavcove zlomy (dvojity newline) beze zmeny.
         block_text = re.sub(r"(?<!\n)\n(?!\n)", " ", block_text)
         block_text = re.sub(r"[ \t]{2,}", " ", block_text).strip()
         joined_blocks.append(block_text)
@@ -2942,36 +3806,36 @@ def _fix_ocr_diacritics(text: str) -> str:
     """
     import unicodedata
 
-    # NFC nejprve – zvládne true combining marks (U+030x série)
+    # NFC nejprve – zvladne true combining marks (U+030x serie)
     text = unicodedata.normalize("NFC", text)
 
-    # ── Private Use Area znaky → oddělovač odstavce ─────────────────────────
-    # U+F8E7 a sousední PUA znaky se v PDF z Cambridge Core, JSTOR apod.
-    # používají jako náhrada za bullet/section-break, ale při extrakci PyMuPDF
-    # je vloží doslova; bez nahrazení pak sekce nejsou odděleny newlinem a
-    # map_sections_from_block je nerozezná jako hranice pole.
+    # ── Private Use Area znaky → oddelovac odstavce ─────────────────────────
+    # U+F8E7 and sousedni PUA znaky in PDF from Cambridge Core, JSTOR apod.
+    # pouzivaji as nahrada za bullet/section-break, but when extrakci PyMuPDF
+    # is vlozi doslova; without nahrazeni pak sekce nejsou oddeleny newlinem and
+    # map_sections_from_block is nerozezna as hranice field.
     text = re.sub(r"[\uf8e0-\uf8ff\uf000-\uf0ff]", "\n\n", text)
 
     # ── Control characters ────────────────────────────────────────────────────
     text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", " ", text)
 
-    # ── Ligatures typické pro OCR starých tisku ──────────────────────────────
+    # ── Ligatures typicke for OCR starych tisku ──────────────────────────────
     text = (text
             .replace("\ufb00", "ff").replace("\ufb01", "fi")
             .replace("\ufb02", "fl").replace("\ufb03", "ffi").replace("\ufb04", "ffl"))
 
-    # ── Substituční tabulka: spacing diacritic + písmeno → composed ──────────
-    # Pořadí: nejdřív delší vzory (dvoupísmenné jako „ch"), pak kratší.
-    # Použity znaky: ´ (U+00B4 ACUTE ACCENT), ˇ (U+02C7 CARON),
+    # ── Substitucni tabulka: spacing diacritic + pismeno → composed ──────────
+    # Poradi: nejdriv delsi patterny (dvoupismenne as „ch"), pak kratsi.
+    # Pouzity znaky: ´ (U+00B4 ACUTE ACCENT), ˇ (U+02C7 CARON),
     #                ˚ (U+02DA RING ABOVE), ¨ (U+00A8 DIAERESIS/UMLAUT),
     #                ` (U+0060 GRAVE), ʹ (U+02B9), ′ (U+2032 PRIME)
     _ACUTE  = r"[´\u02B9\u2032\u0060\u2019]"  # acute-like spacing marks
-    _CARON  = r"[ˇ\u02C7]"                     # caron / háček
+    _CARON  = r"[ˇ\u02C7]"                     # caron / hacek
     _RING   = r"[˚\u02DA]"                     # ring above
     _UMLAUT = r"[¨\u00A8]"                     # diaeresis / umlaut
 
     _TABLE = [
-        # Acute — malá/velká
+        # Acute — mala/velka
         (rf"A{_ACUTE}", "Á"), (rf"a{_ACUTE}", "á"),
         (rf"E{_ACUTE}", "É"), (rf"e{_ACUTE}", "é"),
         (rf"I{_ACUTE}", "Í"), (rf"i{_ACUTE}", "í"),
@@ -2985,7 +3849,7 @@ def _fix_ocr_diacritics(text: str) -> str:
         (rf"{_ACUTE}O", "Ó"), (rf"{_ACUTE}o", "ó"),
         (rf"{_ACUTE}U", "Ú"), (rf"{_ACUTE}u", "ú"),
         (rf"{_ACUTE}Y", "Ý"), (rf"{_ACUTE}y", "ý"),
-        # Caron / háček — malá/velká
+        # Caron / hacek — mala/velka
         (rf"C{_CARON}", "Č"), (rf"c{_CARON}", "č"),
         (rf"D{_CARON}", "Ď"), (rf"d{_CARON}", "ď"),
         (rf"E{_CARON}", "Ě"), (rf"e{_CARON}", "ě"),
@@ -3003,12 +3867,12 @@ def _fix_ocr_diacritics(text: str) -> str:
         (rf"{_CARON}S", "Š"), (rf"{_CARON}s", "š"),
         (rf"{_CARON}T", "Ť"), (rf"{_CARON}t", "ť"),
         (rf"{_CARON}Z", "Ž"), (rf"{_CARON}z", "ž"),
-        # Ring above — u / Ů (česky), å / Å (skandinávsky)
+        # Ring above — u / U (cesky), a / A (skandinavsky)
         (rf"U{_RING}", "Ů"), (rf"u{_RING}", "u"),
         (rf"A{_RING}", "Å"), (rf"a{_RING}", "å"),
         (rf"{_RING}U", "Ů"), (rf"{_RING}u", "u"),
         (rf"{_RING}A", "Å"), (rf"{_RING}a", "å"),
-        # Umlaut / diaeresis — německy, estonsky, švédsky
+        # Umlaut / diaeresis — nemecky, estonsky, svedsky
         (rf"A{_UMLAUT}", "Ä"), (rf"a{_UMLAUT}", "ä"),
         (rf"O{_UMLAUT}", "Ö"), (rf"o{_UMLAUT}", "ö"),
         (rf"U{_UMLAUT}", "Ü"), (rf"u{_UMLAUT}", "ü"),
@@ -3019,14 +3883,14 @@ def _fix_ocr_diacritics(text: str) -> str:
     for pat, repl in _TABLE:
         text = re.sub(pat, repl, text)
 
-    # ── Mezerami oddělené diakritiky ─────────────────────────────────────────
-    # Po výše provedené substituci mohou zustat mezery uvnitř slov, kde OCR
-    # každou slabiku/souhlásku extrahoval zvlášť. Heuristika:
+    # ── Mezerami oddelene diakritiky ─────────────────────────────────────────
+    # After vyse provedene substituci mohou zustat mezery uvnitr slov, kde OCR
+    # kazdou slabiku/souhlasku extrahoval zvlast. Heuristika:
     #
-    # 1) Osamocený znak s háčkem/čárkou (1-2 znaky) obklopený delšími fragmenty
-    #    → pravděpodobně uprostřed slova: „Tý ř ovice" → „Týřovice"
-    #    Podmínka: předchozí fragment ≥ 2 znaky, následující ≥ 2 znaky,
-    #    osamocený znak je písmeno s diakritikou.
+    # 1) Osamoceny znak s hackem/carkou (1-2 znaky) obklopeny delsimi fragmenty
+    #    → pravdepodobne uprostred slova: „Ty r ovice" → „Tyrovice"
+    #    Podminka: predchozi fragment ≥ 2 znaky, nasledujici ≥ 2 znaky,
+    #    osamoceny znak is pismeno s diakritikou.
     DIACRITIC_SOLO = re.compile(
         r"(\b\w{1,6})\s+([áčďéěíňóřšťúuýžÁČĎÉĚÍŇÓŘŠŤÚŮÝŽäöüÄÖÜåÅ])\s+(\w{2,})",
         re.UNICODE
@@ -3037,17 +3901,17 @@ def _fix_ocr_diacritics(text: str) -> str:
             return m.group(0)
         return pre + solo + post
 
-    # Aplikovat opakovaně (kaskáda: „Sˇ á rka" → „Šárka" potřebuje 2 pruchody)
+    # Aplikovat opakovane (kaskada: „Sˇ a rka" → „Sarka" potrebuje 2 pruchody)
     for _ in range(3):
         prev = text
         text = DIACRITIC_SOLO.sub(_join_solo, text)
         if text == prev:
             break
 
-    # Případ 2: fragment zakončen hákovanou souhláskou + mezera + pokračování
-    # „Zahoř any" → „Zahořany", „Nahoř any" → „Nahořany"
-    # Hákové souhlásky (ř č š ž ď ť ň) téměř nikdy nestojí na konci samostatného
-    # slova — pokud za nimi následuje mezera a malé písmeno, jde o OCR split.
+    # Pripad 2: fragment zakoncen hakovanou souhlaskou + mezera + pokracovani
+    # „Zahor any" → „Zahorany", „Nahor any" → „Nahorany"
+    # Hakove souhlasky (r c s z d t n) temer nikdy nestoji on konci samostatneho
+    # slova — if za nimi nasleduje mezera and male pismeno, jde o OCR split.
     CARON_END_SPLIT = re.compile(
         r"([řčšžďťňŘČŠŽĎŤŇ])\s+([a-záčďéěíňóřšťúuýž]\w*)",
         re.UNICODE
@@ -3058,9 +3922,9 @@ def _fix_ocr_diacritics(text: str) -> str:
         if text == prev:
             break
 
-    # Případ 3: fragment zakončen u + mezera + 1-2 znakové pokračování
+    # Pripad 3: fragment zakoncen u + mezera + 1-2 znakove pokracovani
     # „Dvu r" → „Dvur", „lu v" → „luv"
-    # u stojící na konci fragmentu je téměř vždy nedokončené slovo.
+    # u stojici on konci fragmentu is temer vzdy nedokoncene slovo.
     RING_U_SPLIT = re.compile(
         r"(u)\s+([a-záčďéěíňóřšťúuýž]{1,2})\b",
         re.UNICODE
@@ -3071,11 +3935,11 @@ def _fix_ocr_diacritics(text: str) -> str:
         if text == prev:
             break
 
-    # Případ 4: KRÁTKÝ fragment (2-4 znaky) zakončen ostrou diakritikou +
-    # mezera + krátké pokračování → příjmení or pádová koncovka
-    # „Krá luv" → „Králuv", „Nová k" → „Novák"
-    # PODMÍNKA délky ≤ 4: „Dlouhá hora" (6 znaku) se NESPOJÍ — Dlouhá
-    # je complete adjektivum, hora je samostatné slovo.
+    # Pripad 4: KRATKY fragment (2-4 znaky) zakoncen ostrou diakritikou +
+    # mezera + kratke pokracovani → prijmeni or padova koncovka
+    # „Kra luv" → „Kraluv", „Nova k" → „Novak"
+    # PODMINKA delky ≤ 4: „Dlouha hora" (6 znaku) NESPOJI — Dlouha
+    # is complete adjektivum, hora is samostatne slovo.
     ACUTE_VOWEL_FINAL_SPLIT = re.compile(
         r"\b(\w{2,4}[áéíóúý])\s+(\w{1,4})\b(?![A-ZÁČĎÉĚÍŇÓŘŠŤÚŮÝŽ])"
         r"(?=[\s,;.(]|$)",
@@ -3088,12 +3952,12 @@ def _fix_ocr_diacritics(text: str) -> str:
         if text == prev:
             break
 
-    # ── Rozházená písmena OCR ("D i l y t e s" → "Dilytes") ─────────────────
-    # Starší skeny (Barrande, Holm, Novák) občas obsahují slova, kde OCR
-    # extrahuje každé písmeno zvlášť oddělené mezerou. Podmínka: velké
-    # písmeno následované 3 or více (mezera + malé písmeno) → sloučit.
-    # Lookbehind / lookahead (?<!\w) / (?!\w) zabrání shodě uvnitř normálních slov.
-    # Minimální délka 4 znaky (A b c = 3 malá) → vyhýbá se zkratkám.
+    # ── Rozhazena pismena OCR ("D i l y t e s" → "Dilytes") ─────────────────
+    # Starsi skeny (Barrande, Holm, Novak) obcas obsahuji slova, kde OCR
+    # extrahuje kazde pismeno zvlast oddelene mezerou. Podminka: velke
+    # pismeno nasledovane 3 or vice (mezera + male pismeno) → sloucit.
+    # Lookbehind / lookahead (?<!\w) / (?!\w) zabrani shode uvnitr normalnich slov.
+    # Minimalni delka 4 znaky (And b c = 3 mala) → vyhyba zkratkam.
     _SPACED_WORD_RE = re.compile(
         r"(?<!\w)"
         r"([A-ZÁČĎÉĚÍŇÓŘŠŤÚŮÝŽÄÖÜÀÂÆÇÈÊËÎÏÔÙÛÜА-ЯЁ])"
@@ -3105,21 +3969,21 @@ def _fix_ocr_diacritics(text: str) -> str:
         lambda m: m.group(1) + m.group(2).replace(" ", "").replace("	", ""),
         text
     )
-    # ── OCR word-split pro čínské práce: "A mbrolinevitus" → "Ambrolinevitus" ─
-    # Čínské papíry (skenované) občas rozlomí latinské jméno na hranici řádku tak,
-    # že první 1–2 písmena jsou oddělena mezerou od zbytku slova.
+    # ── OCR word-split for cinske prace: "And mbrolinevitus" → "Ambrolinevitus" ─
+    # Cinske papiry (skenovane) obcas rozlomi Latin name on hranici radku tak,
+    # that prvni 1–2 pismena are oddelena mezerou od zbytku slova.
     # Vzory:
-    #   "A mbrolinevitus" → "Ambrolinevitus" (1 velké + mezera + zbytek)
-    #   "p latyp" → "platyp" (1 malé + mezera + zbytek, uvnitř slova)
-    # Bezpečnostní podmínka: první fragment musí mít 1–2 znaky, pokračování ≥3 znaky
-    # a nesmí jít o volné jednopísmenné zkratky před novým slovem (s mezerou na obou pagesách).
+    #   "And mbrolinevitus" → "Ambrolinevitus" (1 velke + mezera + zbytek)
+    #   "p latyp" → "platyp" (1 male + mezera + zbytek, uvnitr slova)
+    # Bezpecnostni podminka: prvni fragment must mit 1–2 znaky, pokracovani ≥3 znaky
+    # and nesmi jit o volne jednopismenne zkratky before novym slovem (s mezerou on obou pagesach).
     _WORD_SPLIT_ZH_RE = re.compile(
         r"(?<![A-Za-z])([A-Z]{1,2}) ([a-z]{3,})(?=[^a-zA-Z]|$)",
         re.UNICODE)
     text = _WORD_SPLIT_ZH_RE.sub(lambda m: m.group(1) + m.group(2), text)
-    # ── Krátká cyriličká strukturní slova (versálky) ────────────
-    # Sovětské monografie používají "versálky" (rozepsané velké) pro rankové labely,
-    # kde finální písmena jsou VELKÁ i u malých slov: "RoД" = Род (no, it's Р о Д).
+    # ── Kratka cyrilicka strukturni slova (versalky) ────────────
+    # Sovetske monografie pouzivaji "versalky" (rozepsane velke) for rankove labely,
+    # kde final pismena are VELKA i u malych slov: "RoД" = Род (no, it's Р о Д).
     _CYRILLIC_SHORT = {
         # Род
         "Р о Д": "Род",   # R o D (versal D)
@@ -3172,15 +4036,15 @@ def _paragraphize(text: str) -> str:
     text = re.sub(r"[ \t]{2,}", " ", text)
     # Soft wrap: hyphen-break
     text = HYPHEN_BREAK_RE.sub(r"\1\2", text)
-    # Soft wrap: řádek pokračuje malým písmenem → sloučit na mezeru
+    # Soft wrap: line pokracuje malym pismenem → sloucit on mezeru
     text = re.sub(
         r"([a-záčďéěíňóřšťúuýžäöü,;])\n([a-záčďéěíňóřšťúuýžäöü])",
         r"\1 \2", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
-    # ── OCR split-word oprava pro sekční nadpisy a latinské termíny ──────────
+    # ── OCR split-word oprava for sekcni nadpisy and latinske terms ──────────
     # "Diag nosis" → "Diagnosis", "Descr iption" → "Description" atd.
-    # Vzor: 3-8 písmen začínající VELKÝM + mezera + 3-8 malých písmen
-    # (pouze pokud obě části dohromady tvoří slovo bez mezerový výsledek)
+    # Pattern: 3-8 pismen zacinajici VELKYM + mezera + 3-8 malych pismen
+    # (only if obe casti dohromady tvori slovo without mezerovy result)
     _KNOWN_SECTION_SPLITS = [
         (r"\bDiag\s+nosis\b", "Diagnosis"),
         (r"\bDiagn\s+osis\b", "Diagnosis"),
@@ -3221,6 +4085,41 @@ def _extract_txt(path: pathlib.Path) -> List[PageText]:
     return [PageText(i+1, _paragraphize(c), "txt") for i, c in enumerate(chunks) if c.strip()]
 
 
+def _serialize_docx_table(tbl) -> str:
+    """
+    Převede tabulku z DOCX na text tak, aby nerozbila následné mapování polí.
+
+    Klíčový případ: synonymické tabulky v paleontologických DOCX mají tvar
+    dvousloupcové mřížky [rok | citace] ("1893" | "Hyolithus dispar Holm…").
+    Slepení buněk přes " | " by do textu vložilo umělé oddělovače a rozbilo
+    detekci year-lines. Místo toho:
+      • dvousloupcový [rok | text] řádek → "rok\\ttext" (year-line, kterou
+        synonymy heuristika rozpozná);
+      • prázdné buňky se vynechají (řádek ["", "Plate 1…"] → "Plate 1…");
+      • ostatní tabulky → buňky spojené tabem, prázdné vynechány.
+    Každý řádek je na samostatné řádce.
+    """
+    _YEAR_CELL = re.compile(r"^\s*\d{3,4}[a-z]?\s*$")
+    lines: List[str] = []
+    for row in tbl.rows:
+        cells = [c.text.strip() for c in row.cells]
+        # deduplikace horizontalne sloucenych bunek (python-docx is opakuje)
+        dedup: List[str] = []
+        for cell in cells:
+            if not dedup or dedup[-1] != cell:
+                dedup.append(cell)
+        nonempty = [c for c in dedup if c]
+        if not nonempty:
+            continue
+        if len(dedup) >= 2 and _YEAR_CELL.match(dedup[0]) and any(dedup[1:]):
+            # [rok | citace] → year-line "rok\ttext"
+            rest = " ".join(c for c in dedup[1:] if c)
+            lines.append(f"{dedup[0].strip()}\t{rest}")
+        else:
+            lines.append("\t".join(nonempty))
+    return "\n".join(lines)
+
+
 def _extract_docx(path: pathlib.Path) -> List[PageText]:
     if not HAS_DOCX:
         return [PageText(1, "", "docx_failed", "python-docx not installed")]
@@ -3228,19 +4127,18 @@ def _extract_docx(path: pathlib.Path) -> List[PageText]:
         doc = _DocxDoc(str(path))
         parts = [p.text for p in doc.paragraphs if p.text.strip()]
         for tbl in doc.tables:
-            for row in tbl.rows:
-                parts.append(" | ".join(c.text for c in row.cells))
-        full = _paragraphize("\n".join(parts))
+            parts.append(_serialize_docx_table(tbl))
+        full = _paragraphize("\n".join(p for p in parts if p.strip()))
         full = _normalize_chinese_systematic_text(full)
 
-        # ── Inteligentní chunking na hranicích paragrafu ──────────────────
-        # Místo tvrdého chunking každých 3000 znaku rozdělíme na logické
-        # bloky (odstavce oddělené prázdným řádkem). Každý blok se stane
-        # samostatnou "stránkou". Bloky delší než MAX_CHUNK se dále rozdělí
-        # jen tehdy, pokud neexists kratší přirozená hranice.
-        # Výhoda: pro čínské/ruské Documenty každý taxonomický záznam
-        # (oddělený prázdnou řádkou) tvoří samostatnou stránku — PaleoN pak
-        # správně detekuje kandidáty a extrahuje bloky bez cross-page šumu.
+        # ── Inteligentni chunking on hranicich paragrafu ──────────────────
+        # Misto tvrdeho chunking kazdych 3000 znaku rozsplitsme on logicke
+        # bloky (odstavce oddelene prazdnym radkem). Each blok stane
+        # samostatnou "strankou". Bloky delsi nez MAX_CHUNK dale rozsplits
+        # only tehdy, if neexists kratsi prirozena hranice.
+        # Vyhoda: for cinske/ruske Documenty each taxonomicky zaznam
+        # (oddeleny prazdnou radkou) tvori samostatnou stranku — PaleoN pak
+        # spravne detekuje kandidaty and extrahuje bloky without cross-page sumu.
         MAX_CHUNK = 4000
         raw_paras = [p.strip() for p in full.split("\n\n") if p.strip()]
         pages: List[str] = []
@@ -3256,7 +4154,7 @@ def _extract_docx(path: pathlib.Path) -> List[PageText]:
         if current:
             pages.append(current)
 
-        # Fallback: pokud bychom skončili s nula stránkami, použij puvodní split
+        # Fallback: if bychom skoncili s nula strankami, pouzij puvodni split
         if not pages:
             pages = [full[i:i+3000] for i in range(0, len(full), 3000)]
 
@@ -3283,14 +4181,23 @@ def _extract_pdf_fitz(path: pathlib.Path, settings: Dict) -> List[PageText]:
     pdf = fitz.open(str(path))
     out: List[PageText] = []
     min_chars = int(settings.get("pdf_min_chars", 80))
+    # OCR is expensive — enable it only when allowed And is k dispozici alespon
+    # jeden engine (easyocr / fitz_ocr / tesseract). Driv testoval only
+    # HAS_TESSERACT, takthat easyocr-only instalace (without tesseract binarky)
+    # never started OCR, although _ocr_page can use them.
+    ocr_on = bool(settings.get("ocr_enabled")) and _HAS_ANY_OCR()
     for i, page in enumerate(pdf):
-        txt, note = reading_order(page, settings)
-        method = "pymupdf_blocks"
-        if len(txt.strip()) < min_chars and settings.get("ocr_enabled") and HAS_TESSERACT:
-            otxt, onote = _ocr_page(path, i, settings)
+        txt, layout_note = reading_order(page, settings)
+        method   = "pymupdf_blocks"
+        ocr_note = NOT_PROVIDED
+        # Run OCR only "when needed": the native text layer is prilis
+        # ridka (skenovana/obrazkova stranka). Pass the open page onward,
+        # so the PDF is not reopened.
+        if ocr_on and len(txt.strip()) < min_chars:
+            otxt, engine = _ocr_page(path, i, settings, page=page)
             if otxt.strip():
-                txt, note, method = otxt, onote, "tesseract_ocr"
-        out.append(PageText(i+1, _paragraphize(txt), method, NOT_PROVIDED, note))
+                txt, method, ocr_note = otxt, engine, engine
+        out.append(PageText(i+1, _paragraphize(txt), method, ocr_note, layout_note))
     pdf.close()
     return out
 
@@ -3305,31 +4212,80 @@ def _extract_pdf_plumber(path: pathlib.Path, settings: Dict) -> List[PageText]:
     return out
 
 
-def _render_page_image(path: pathlib.Path, page_idx: int, dpi: int = 300) -> bytes:
-    """Renders a PDF page as PNG bytes (high DPI for OCR)."""
-    pdf  = fitz.open(str(path))
-    page = pdf.load_page(page_idx)
+def _render_page_image(path: pathlib.Path, page_idx: int, dpi: int = 300,
+                       page: Any = None) -> bytes:
+    """Renders a PDF page as PNG bytes (high DPI for OCR).
+
+    Pokud je předán již otevřený fitz `page`, použije se přímo — ušetří se
+    tím opětovné otevírání/zavírání PDF (podstatné při OCR mnoha stránek).
+    """
     zoom = dpi / 72.0
-    pix  = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
-    png  = pix.tobytes("png")
-    pdf.close()
-    return png
+    if page is not None:
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+        return pix.tobytes("png")
+    pdf = fitz.open(str(path))
+    try:
+        pg  = pdf.load_page(page_idx)
+        pix = pg.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+        return pix.tobytes("png")
+    finally:
+        pdf.close()
 
 
-def _ocr_page(path: pathlib.Path, page_idx: int, settings: Dict) -> Tuple[str, str]:
+# ── Cache easyocr Readeru ────────────────────────────────────────────────────
+# easyocr.Reader nahrava modely to (In)RAM and jeho vytvoreni is drahe, proto 
+# inicializuje line and sdili napric strankami. When bezi Streamlit, cachujeme
+# in st.session_state; jinak (batch/CLI mimo Streamlit) in modulovem dictu.
+_EASYOCR_READER_CACHE: Dict[str, Any] = {}
+
+
+def _easyocr_gpu_available() -> bool:
+    """Best-effort detekce GPU pro easyocr (při nejistotě padá na CPU)."""
+    try:
+        import torch
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
+
+
+def _get_easyocr_reader(easy_langs: List[str]) -> Any:
+    """Vrátí cachovaný easyocr.Reader pro danou sadu jazyků (líná inicializace)."""
+    cache_key = "_easyocr_reader_" + "_".join(easy_langs)
+    store = st.session_state if st is not None else _EASYOCR_READER_CACHE
+    if cache_key not in store:
+        store[cache_key] = _easyocr.Reader(
+            easy_langs, gpu=_easyocr_gpu_available(), verbose=False)
+    return store[cache_key]
+
+
+def _ocr_page(path: pathlib.Path, page_idx: int, settings: Dict,
+              page: Any = None) -> Tuple[str, str]:
     """
-    Multi-engine OCR of a PDF page.
-    Order: easyocr (if available and GPU) → PyMuPDF built-in OCR
-    → pytesseract → chyba.
-    Vrací (text, metoda_label).
-    """
-    errors = []
+    Multi-engine OCR stránky PDF — voláno jen tehdy, když nativní extrakce
+    vrátí příliš málo textu (viz `_extract_pdf_fitz`).
 
-    # ── 1. easyocr (žádná externí binárka, GPU-akcelerované) ──────────────
+    Pořadí: easyocr (čistě pythonovský, GPU) → PyMuPDF built-in OCR →
+    pytesseract. Stránka se rasterizuje na PNG maximálně jednou a sdílí se
+    mezi enginy; případný již otevřený fitz `page` se použije přímo, aby se
+    PDF znovu neotvíralo. Vrací (text, label_enginu).
+    """
+    errors: List[str] = []
+    dpi = int(settings.get("ocr_dpi", 300))
+
+    # Lina rasterizace pages — provede JEDNOU and sdili ji easyocr i
+    # pytesseract (driv renderoval each engine zvlast, each navic znovu
+    # oteviral PDF).
+    _png_holder: Dict[str, bytes] = {}
+    def _png() -> bytes:
+        if "v" not in _png_holder:
+            _png_holder["v"] = _render_page_image(path, page_idx, dpi=dpi, page=page)
+        return _png_holder["v"]
+
+    # ── 1. easyocr (zadna externi binarka, GPU-akcelerovane) ──────────────
     if HAS_EASYOCR:
         try:
             lang_raw = settings.get("ocr_languages", "en")
-            # Převod tesseract kódu → easyocr (eng→en, ces→cs, deu→de …)
+            # Prevod tesseract kodu → easyocr (eng→en, ces→cs, deu→de …)
             _tess_to_easy = {"eng":"en","ces":"cs","deu":"de","fra":"fr",
                              "rus":"ru","chi_sim":"ch_sim","jpn":"ja"}
             easy_langs = []
@@ -3338,39 +4294,38 @@ def _ocr_page(path: pathlib.Path, page_idx: int, settings: Dict) -> Tuple[str, s
             easy_langs = list(dict.fromkeys(easy_langs))[:3]  # max 3, deduplikace
             if not easy_langs:
                 easy_langs = ["en"]
-            # Lazy init readeru (sdílený přes session_state kvuli výkonu)
-            _cache_key = f"_easyocr_reader_{'_'.join(easy_langs)}"
-            if _cache_key not in st.session_state:
-                st.session_state[_cache_key] = _easyocr.Reader(
-                    easy_langs, gpu=True, verbose=False)
-            reader = st.session_state[_cache_key]
-            png = _render_page_image(path, page_idx, dpi=300)
-            result = reader.readtext(png, detail=0, paragraph=True)
+            reader = _get_easyocr_reader(easy_langs)
+            result = reader.readtext(_png(), detail=0, paragraph=True)
             txt = "\n".join(result)
             if txt.strip():
                 return _paragraphize(txt), "easyocr"
         except Exception as exc:
             errors.append(f"easyocr: {exc}")
 
-    # ── 2. PyMuPDF built-in OCR (vyžaduje tesseract, ale přes fitz API) ──
+    # ── 2. PyMuPDF built-in OCR (vyzaduje tesseract, but pres fitz API) ──
     if HAS_FITZ:
         try:
             lang_fitz = settings.get("ocr_languages", "eng").split("+")[0]
-            pdf  = fitz.open(str(path))
-            page = pdf.load_page(page_idx)
-            tp   = page.get_textpage_ocr(language=lang_fitz, dpi=300, full=True)
-            txt  = page.get_text(textpage=tp)
-            pdf.close()
+            if page is not None:
+                tp  = page.get_textpage_ocr(language=lang_fitz, dpi=dpi, full=True)
+                txt = page.get_text(textpage=tp)
+            else:
+                pdf = fitz.open(str(path))
+                try:
+                    pg  = pdf.load_page(page_idx)
+                    tp  = pg.get_textpage_ocr(language=lang_fitz, dpi=dpi, full=True)
+                    txt = pg.get_text(textpage=tp)
+                finally:
+                    pdf.close()
             if txt.strip():
                 return _paragraphize(txt), "fitz_ocr"
         except Exception as exc:
             errors.append(f"fitz_ocr: {exc}")
 
-    # ── 3. pytesseract (přímé volání) ─────────────────────────────────────
+    # ── 3. pytesseract (prime volani) ─────────────────────────────────────
     if HAS_TESSERACT:
         try:
-            png  = _render_page_image(path, page_idx, dpi=300)
-            img  = _PILImage.open(io.BytesIO(png))
+            img  = _PILImage.open(io.BytesIO(_png()))
             lang = settings.get("ocr_languages", "eng")
             cfg  = "--oem 3 --psm 6"
             txt  = pytesseract.image_to_string(img, lang=lang, config=cfg)
@@ -3383,23 +4338,23 @@ def _ocr_page(path: pathlib.Path, page_idx: int, settings: Dict) -> Tuple[str, s
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DETEKČNÍ ENGINE  (vylepšená verze)
+# DETECTION ENGINE (improved version)
 # ══════════════════════════════════════════════════════════════════════════════
 
-# ── Druhotná segmentace (re-segmentace) ────────────────────────────────────────
-# U nativních PDF dělí PyMuPDF text na čisté odstavcové bloky automaticky.
-# U OCR'd/skenovaných PDF je granularita bloku hrubší — "Class:", "Order:",
-# "Family:", "Genus Name Autor, Rok" se mohou ocitnout SLOUČENÉ v jediném
-# odstavci/bloku. Tato funkce takový blok dodatečně rozseká podle
-# strukturálních kotev (rank-labely, schema-labely, popisky obrázku,
-# "n. sp."/"sp. nov." nadpisy), takže detekce kandidátu dostane granularitu
-# nezávislou na kvalitě PDF extrakce.
+# ── Secondary segmentation (re-segmentation) ────────────────────────────────────────
+# In native PDFs splits PyMuPDF text into clean paragraph blocks automatically.
+# U OCR'd/skenovanych PDF is block granularity is coarser — "Class:", "Order:",
+# "Family:", "Genus Name Autor, Rok" may be MERGED in jedinem
+# odstavci/bloku. This function takovy blok additionally splits podle
+# strukturalnich kotev (rank-labely, schema-labely, popisky obrazku,
+# "n. sp."/"sp. nov." nadpisy), takthat detection kandidatu gets granularity
+# independent of PDF extraction quality.
 
-# Rank-labely jako kotvy uprostřed textu — "Genus Nophrotheca Marek, 1966"
-# uprostřed odstavce signalizuje začátek nového nadpisu.
-# Samostatný "Class:"/"Order:"/"Family:" label — pokud takový stojí TĚSNĚ
-# před nadpisem rodu, patří logicky k NĚMU (viz vzorový Document:
-# "Family: GRACILITHECIDAE Sysoev, 1972" je součástí záznamu rodu Gracilitheca).
+# Rank-labely as anchors inside the text — "Genus Nophrotheca Marek, 1966"
+# uprostred odstavce signals the start of and new heading.
+# Standalone "Class:"/"Order:"/"Family:" label — if takovy stoji TESNE
+# before nadpisem genusu, logically belongs to IT (viz patternovy Document:
+# "Family: GRACILITHECIDAE Sysoev, 1972" is part of the record genusu Gracilitheca).
 _RANK_PREFIX_LABEL_RE = re.compile(
     r"^(Class|Order|Family|Subfamily|Superfamily|Tribe|Subtribe|Семейство|Отряд|Класс|Надсемейство|科|目|纲|门)"
     r"\\s*:?\\s+[A-ZÁČĎÉĚÍŇÓŘŠŤÚŮÝŽА-ЯЁ]",
@@ -3414,9 +4369,9 @@ _RESPLIT_RANK_RE = re.compile(
     r"\s*:?\s+(?=[A-ZÁČĎÉĚÍŇÓŘŠŤÚŮÝŽÄÖÜÀÂÆÇÈÊËÎÏÔÙÛÜА-ЯЁ])",
     re.UNICODE)
 
-# Resplit na koncovkách (pro Documenty bez explicitních rank-labelu):
-# -ida (řád), -morpha (třída), -idae (čeleď) jako kotvy pro nový blok.
-# Záměrně oddělené od _RESPLIT_RANK_RE — aplikuje se jako sekundární pruchod.
+# Resplit on koncovkach (for Documenty without explicitnich rank-labelu):
+# -ida (rad), -morpha (trida), -idae (family) as anchors for new blok.
+# Intentionally separated od _RESPLIT_RANK_RE — aplikuje as sekundarni pruchod.
 _RESPLIT_SUFFIX_RE = re.compile(
     r"(?<!\w)"
     r"(?=[A-Z][A-Za-z\-]+"
@@ -3425,22 +4380,22 @@ _RESPLIT_SUFFIX_RE = re.compile(
     r"(?=[A-Z])",
     re.UNICODE)
 
-# Popisky obrázku/tabulek jako kotvy — "Fig. 2. Nophrotheca sophia..." s tečkou
-# za číslem a velkým písmenem hned po ní (na rozdíl od inline odkazu "(Fig. 3D, E)").
+# Popisky obrazku/tabulek as anchors — "Fig. 2. Nophrotheca sophia..." s teckou
+# za cislem and velkym pismenem hned after ni (unlike an inline reference "(Fig. 3D, E)").
 _RESPLIT_CAPTION_RE = re.compile(
     r"(?<![\w(])"
     r"(?:Fig(?:s)?\.?|Figure(?:s)?|Plate(?:s)?|Pl\.?|Table(?:s)?|Tab\.?)"
     r"\s*\d+[A-Za-z]?\.\s+(?=[A-ZÁČĎÉĚÍŇÓŘŠŤÚŮÝŽ])",
     re.UNICODE)
 
-# Nový-taxon marker jako kotva — POZOR: "n. sp." / "sp. nov." se v textu
-# objevuje JAK ve vlastním nadpisu, TAK opakovaně ve zpětných odkazech uvnitř
-# Discussion/Occurrence sections stejného druhu ("Nophrotheca sophia n. sp.
+# New-taxon marker as kotva — POZOR: "n. sp." / "sp. nov." in textu
+# objevuje BOTH in its own heading AND repeatedly in back-references uvnitr
+# Discussion/Occurrence sections stejneho druhu ("Nophrotheca sophia n. sp.
 # clearly fits with concept of…", "…together with the Nophrotheca betula…").
-# Klíčové rozlišení: skutečný NADPIS je vždy buď na konci kusu textu, or
-# bezprostředně následován "(Figs …)" — zatímco zpětný odkaz pokračuje další
-# prózou. Lookahead toto vynucuje a eliminuje naprostou většinu falešných
-# rozdělení bez nutnosti seznamu zakázaných slov.
+# Key distinction: and real HEADING is vzdy bud at the end of and text fragment, or
+# immediately followed by "(Figs …)" — while zpetny odkaz pokracuje dalsi
+# prozou. The lookahead enforces this and eliminuje naprostou vetsinu falesnych
+# rozdeleni without requiring and stop-word list.
 _RESPLIT_NEWTAXON_RE = re.compile(
     r"(?<![\w(])"
     r"([A-ZÁČĎÉĚÍŇÓŘŠŤÚŮÝŽ][a-záčďéěíňóřšťúuýž]+\s+"
@@ -3464,7 +4419,7 @@ def _resplit_unit_text(text: str, schema_label_pattern: Optional[re.Pattern]) ->
       Fáze 2 — teprve kusy, které NEJSOU popiskem obrázku, dál rozdělit podle
                rank-labelu, schema-labelu a n. sp./sp. nov. markeru.
     """
-    # ── Fáze 1: rozdělení podle popisku obrázku ──────────────────────────────
+    # ── Faze 1: rozdeleni podle popisku obrazku ──────────────────────────────
     caption_cuts = sorted(
         m.start() for m in _RESPLIT_CAPTION_RE.finditer(text)
     )
@@ -3484,11 +4439,11 @@ def _resplit_unit_text(text: str, schema_label_pattern: Optional[re.Pattern]) ->
     else:
         stage1 = [text]
 
-    # ── Fáze 2: další dělení jen u ne-popiskových kusu ───────────────────────
+    # ── Faze 2: dalsi deleni only u ne-popiskovych kusu ───────────────────────
     final_pieces: List[str] = []
     for piece in stage1:
         if CAPTION_RE.match(piece):
-            # Toto JE popisek obrázku — necháme ho vcelku, dál nedělíme.
+            # Toto Is popisek obrazku — nechame ho vcelku, dal nesplitsme.
             final_pieces.append(piece)
             continue
 
@@ -3526,7 +4481,7 @@ def build_text_units(pages: List[PageText]) -> List[TextUnit]:
     Applies secondary re-segmentation na strukturální kotvy — robustní i pro
     OCR'd PDF, kde PyMuPDF/OCR vrstva nedělí text na čisté odstavce.
     """
-    # Schema-label regex pro re-segmentaci (stejné labely jako section mapping)
+    # Schema-label regex for re-segmentation (the same labels as section mapping)
     try:
         schema = load_schema()
         schema_pat, _ = build_section_regex(schema)
@@ -3561,10 +4516,10 @@ def assign_zone_flags(units: List[TextUnit]) -> None:
     sekci, bloky PŘED ní dostanou tento flag → score_candidate je penalizuje
     výrazněji (pravděpodobnost FP z úvodu/metodiky je vyšší).
     """
-    # Předsken stránek: odlišit reálný text od obsahu / indexu Documentu.
-    # Duležité: "Systematic paleontology" v obsahu NESMÍ aktivovat systematic zónu.
+    # Predsken stranek: odlisit realny text od obsahu / indexu Documentu.
+    # Dulezite: "Systematic paleontology" in obsahu NESMI aktivovat systematic zonu.
     _SYS_RE = get_systematic_re()  # dynamicky z TSV or fallback
-    _index_pages: set = set()          # abecední rejstřík na konci knihy
+    _index_pages: set = set()          # abecedni rejstrik on konci knihy
     _doc_index_pages: set = set()      # obsah / front-matter index Documentu
     _page_lines: Dict[int, List[str]] = {}
     for u in units:
@@ -3594,25 +4549,29 @@ def assign_zone_flags(units: List[TextUnit]) -> None:
         flags: List[str] = []
         t = u.text.strip()
 
-        # Abecední index / rejstřík → přeskočit při detekci kandidátu
+        # Abecedni index / rejstrik → preskocit when detekci kandidatu
         if u.page_number in _index_pages:
             flags.append("book_index")
-        # Obsah / index Documentu ve front matter → nikdy nevytvářet kandidáty
-        # a nikdy z něj nespouštět systematickou ani references zónu.
+        # Obsah / index Documentu in front matter → nikdy nevytvaret kandidaty
+        # and nikdy from nej nespoustet systematickou ani references zonu.
         in_document_index_page = u.page_number in _doc_index_pages
         if in_document_index_page:
             flags.append("document_index")
             u.zone_flags = ",".join(flags)
             continue
 
-        # Systematická sekce — jen v reálné textové části, ne v obsahu.
-        if _SYS_RE.search(t):
+        # Systematicka sekce — only in realne textove casti, ne in obsahu.
+        # Navic: ceska literatura pouziva "Rod Hyolithus Eichw." as zahlavi genusoveho
+        # oddilu (without explicitniho "Systematicka paleontologie") → spustit systematickou zonu.
+        _is_genus_header = bool(re.match(
+            r"^Rod\s+[A-Z][a-z]+|^Genus\s+[A-Z][a-z]+", t, re.UNICODE))
+        if _SYS_RE.search(t) or _is_genus_header:
             in_systematic = True
             systematic_encountered = True
         if END_REGION_RE.search(t):
             in_references = True
             in_systematic = False
-        # Reset synonymy po prázdném řádku or novém nadpisu
+        # Reset synonymy after prazdnem radku or novem nadpisu
         if in_synonymy and (not SYNONYMY_LINE_RE.match(t)):
             in_synonymy = False
 
@@ -3620,18 +4579,18 @@ def assign_zone_flags(units: List[TextUnit]) -> None:
             flags.append("systematic")
         if in_references:
             flags.append("references")
-        # Blok PŘED systematickou sections (pokud vubec exists) → extra penalizace
+        # Blok Before systematickou sections (if vubec exists) → extra penalizace
         if has_systematic_section and not systematic_encountered and not in_systematic:
             flags.append("pre_systematic")
 
         # Caption
         if CAPTION_RE.match(t):
             flags.append("caption")
-        # Synonymy řádek — "synonymy" se přidá jen JEDNOU (dřív se tu
-        # přidávalo dvakrát: jednou při přímé shodě SYNONYMY_LINE_RE a
-        # znovu vzápětí přes "if in_synonymy" — neškodilo to, protože
-        # score_candidate flags převádí na set(), ale bylo to matoucí
-        # a zbytečné).
+        # Synonymy line — "synonymy" adds only JEDNOU (driv tu
+        # pridavalo dvakrat: jednou when prime shode SYNONYMY_LINE_RE and
+        # znovu vzapeti pres "if in_synonymy" — neskodilo to, because
+        # score_candidate flags prevadi on set(), but bylo to matouci
+        # and zbytecne).
         if SYNONYMY_LINE_RE.match(t):
             in_synonymy = True
         if in_synonymy:
@@ -3649,13 +4608,13 @@ def _clean_candidate(text: str) -> str:
     return text.strip()
 
 
-# Druhé slovo (domnělý druhový epiteton) nesmí být spojka/předložka —
-# zabraňuje falešným shodám typu "Gracilitheca and Nophrotheca..." (name článku).
+# The second word (the presumed species epithet) must not be and conjunction/preposition —
+# prevents false matches typu "Gracilitheca and Nophrotheca..." (name clanku).
 EPITHET_STOPWORDS = {
-    # Gramatické funkční slova
+    # Grammatical function words
     "and", "or", "in", "of", "the", "with", "from", "to", "et", "und",
     "is", "are", "was", "were", "has", "have", "by", "at", "on", "for",
-    # Morfologické podstatné jméno jako druhý člen falešného binomia
+    # Morphological noun as the second part of and false binomial
     "layer", "layers", "region", "regions", "surface", "surfaces",
     "section", "sections", "portion", "portions", "margin", "margins",
     "edge", "edges", "line", "lines", "groove", "grooves", "rib", "ribs",
@@ -3664,7 +4623,7 @@ EPITHET_STOPWORDS = {
     "angle", "angles", "axis", "axes", "wall", "walls", "base", "apex",
     "specimens", "specimen", "material", "collection", "collections",
     "formation", "formations", "limestone", "sandstone", "shale",
-    # Angličtina: druhá slova v "adjective noun" nadpisech sections
+    # English: second words in "adjective noun" nadpisech sections
     "characteristics", "characteristic", "description", "discussion",
     "remarks", "comment", "comments", "comparison", "comparisons",
     "assignment", "affinity", "affinities", "identification",
@@ -3679,6 +4638,14 @@ def _match_name(text: str, prev_rank: str = "") -> Tuple[Optional[str], str, str
     Podporuje latinu, Cyrilici a vzor 'Rank Name Author, Year'.
     """
     t = _clean_candidate(text)
+
+    # Starsi paleontologicka literatura (Barrande 1867 aj.) cisluje taxony:
+    # "1. Hyolithes aduncus. Barr.", "2. Hyolithes alter. Barr."
+    # Poradove cislo odstranime, so that SPECIES_RE/GENUS_AUTHOR_RE mohly normalne matchovat.
+    t = re.sub(r"^\d+[.)]\s+", "", t).strip()
+    if not t:
+        return None, "", ""
+
     words = t.split()
     first_word = words[0].strip("?.,;:\"'").lower() if words else ""
     second_word = words[1].strip("?.,;:\"'").lower() if len(words) > 1 else ""
@@ -3686,7 +4653,7 @@ def _match_name(text: str, prev_rank: str = "") -> Tuple[Optional[str], str, str
         return None, "", ""
 
     # Vzor "Family Hyolithidae Smith, 1900" or "Genus Examplius Smith, 1900"
-    # RANK_LABEL_RE → použij rank jako Context a name jako target
+    # RANK_LABEL_RE → pouzij rank as Context and name as target
     rm = RANK_LABEL_RE.match(t)
     if rm:
         if rm.group(2).strip():
@@ -3695,48 +4662,48 @@ def _match_name(text: str, prev_rank: str = "") -> Tuple[Optional[str], str, str
             sub_name, _, sub_pat = _match_name(sub, detected_rank)
             if sub_name:
                 return sub_name, detected_rank, sub_pat
-        # Slovo, které by JINAK bylo rank-labelem (Class/Order/Family/Genus/…),
-        # se tu použilo jako běžné slovo na začátku věty ("Class discussion
+        # Slovo, which by JINAK bylo rank-labelem (Class/Order/Family/Genus/…),
+        #  tu pouzilo as bezne slovo on zacatku vety ("Class discussion
         # of hyolith affinities remains controversial.") a pokus interpretovat
-        # zbytek jako jméno taxonu selhal. Taková věta NIKDY není skutečný
-        # nadpis — pokud bychom tu nekončili, mohla by dál projít přes
-        # SPECIES_RE níže jako falešné binomium (Velké-slovo + malé-slovo
-        # strukturálně vypadá jako "Genus species", i když jde o obyčejnou
-        # anglickou/českou/atd. větu).
+        # zbytek as name taxonu selhal. Takova veta NIKDY neni skutecny
+        # nadpis — if bychom tu nekoncili, mohla by dal projit pres
+        # SPECIES_RE nithat as falesne binomium (Velke-slovo + male-slovo
+        # strukturalne vypada as "Genus species", i when jde o obycejnou
+        # anglickou/ceskou/atd. vetu).
         return None, "", ""
 
-    # Stopwords check (až po pokusu s rank-label prefixem)
+    # Stopwords check (az after pokusu s rank-label prefixem)
     if first_word in TAXON_STOPWORDS:
         return None, "", ""
 
-    # Cyrillic binomial (ruské, ukrajinské názvy)
+    # Cyrillic binomial (ruske, ukrajinske nazvy)
     cm = CYRILLIC_SPECIES_RE.match(t)
     if cm:
         name = cm.group("name").strip()
         if name:
             return name, prev_rank or "Species", "cyrillic_species"
 
-    # Čínský nadpis: čínské jméno + latinský name (+ rank znak)
-    if t and "\u4e00" <= t[0] <= "\u9fff":   # začíná čínským znakem
-        # Přeskočit etymologické řádky: "属名来源 Eo——始、古之意"
+    # Cinsky nadpis: Chinese name + latinsky name (+ rank znak)
+    if t and "\u4e00" <= t[0] <= "\u9fff":   # zacina cinskym znakem
+        # Preskocit etymologicke lines: "属名来源 Eo——始、古之意"
         if _CHINESE_ETYMOLOGY_RE.search(t):
             return None, "", ""
         zm = CHINESE_TAXON_RE.match(t)
         if zm:
             name = zm.group("name").strip()
             # ── Oprava OCR artifact: "A mbrolinevitus" → "Ambrolinevitus" ──────
-            # V čínských pracích OCR někdy rozlomí slovo na hranici řádku tak,
-            # že první písmeno/slabika je oddělena mezerou od zbytku slova.
-            # Pravidlo: začáteční 1–2 písmena + mezera + pokračování (3+ znaku) = jeden celek.
+            # In cinskych pracich OCR nekdy rozlomi slovo on hranici radku tak,
+            # that prvni pismeno/slabika is oddelena mezerou od zbytku slova.
+            # Pravidlo: zacatecni 1–2 pismena + mezera + pokracovani (3+ znaku) = jeden celek.
             name = re.sub(r"^([A-Z]{1,2}) ([a-z]{3,})", r"\1\2", name)
-            # Opravit rozlomení druhového epitetu: "p latyp" → "platyp" (uvnitř jména)
+            # Fixest rozlomeni druhoveho epitetu: "p latyp" → "platyp" (uvnitr jmena)
             name = re.sub(r"([A-Za-z]{2,}) ([a-z]{1,3}) ([a-z]{3,})\b",
                           lambda m: m.group(1) + " " + m.group(2) + m.group(3),
                           name)
             if name and name.lower() not in TAXON_STOPWORDS:
                 rank_char = zm.group("rankchar")
                 zh_rank = _CHINESE_RANK_CHARS.get(rank_char or "", "")
-                # Rank: z rank znaku, jinak podle přítomnosti druhového epitetu
+                # Rank: from rank znaku, jinak podle pritomnosti druhoveho epitetu
                 if not zh_rank:
                     zh_rank = "Species" if " " in name else "Genus"
                 return name, zh_rank or prev_rank, "chinese_taxon"
@@ -3754,19 +4721,19 @@ def _match_name(text: str, prev_rank: str = "") -> Tuple[Optional[str], str, str
             if name.lower() not in TAXON_STOPWORDS:
                 return name, rank_guess, pname
 
-    # Samostatný "Rod Autor, Rok" bez druhového epitetu (genus-level nadpis).
-    # Striktně ukotveno na celý text (whole-line match), takže riziko
-    # falešné shody s běžnou větou je minimální.
+    # Standalone "Rod Autor, Rok" without druhoveho epitetu (genus-level nadpis).
+    # Striktne ukotveno on cely text (whole-line match), takthat riziko
+    # falesne shody s beznou vetou is minimalni.
     gam = GENUS_AUTHOR_RE.match(t)
     if gam:
         bare_name = gam.group("name").strip()
         if bare_name.lower() not in TAXON_STOPWORDS:
-            # Vrátit CELÝ zápis "Rod Autor, Rok" (ne jen holý rod) —
-            # konzistentní s formátem vzorových records ("Gracilitheca Sysoev, 1968").
+            # Vratit CELY zapis "Rod Autor, Rok" (ne only holy genus) —
+            # konzistentni s formatem patternovych records ("Gracilitheca Sysoev, 1968").
             full_name = gam.group(0).strip().rstrip(".")
             return full_name, prev_rank or "Genus", "genus_author"
 
-    # Jednoslovný rod jen se silnou podmínkou
+    # Jednoslovny genus only silnou podminkou
     if prev_rank.lower() in ("genus", "subgenus"):
         m = GENUS_RE.match(t)
         if m:
@@ -3774,7 +4741,7 @@ def _match_name(text: str, prev_rank: str = "") -> Tuple[Optional[str], str, str
             if name.lower() not in TAXON_STOPWORDS:
                 return name, "Genus", "genus"
 
-    # Name s explicitním rankovým suffixem bez autora:
+    # Name s explicitnim rankovym suffixem without authora:
     # "CRISPATELLA gen.", "HYOLITHIDAE fam. nov.", "Examplius gen. nov."
     _RANK_SUFFIX_RE = re.compile(
         r"^([A-ZА-ЯЁ一-鿿][A-Za-zА-ЯЁа-яёčšžřéíúuý一-鿿]+)\s+"
@@ -3806,30 +4773,30 @@ def _is_ordinary_sentence(text: str) -> bool:
     """
     t = text.strip()
 
-    # Příliš dlouhé na nadpis
+    # Prilis dlouhe on nadpis
     if len(t) > 200:
         return True
 
     words = t.split()
     n_words = len(words)
 
-    # Věta s tečkou na konci a více než 6 slovy bez nomenklaturního aktu
+    # Veta s teckou on konci and vice nez 6 slovy without nomenklaturniho aktu
     if t.endswith(".") and n_words > 6 and not NEW_TAXON_RE.search(t):
         return True
 
-    # Slova indikující větu (kopula, pomocná slovesa)
+    # Slova indikujici vetu (kopula, pomocna slovesa)
     if re.search(r"\b(is|are|was|were|has|have|known|found|consists|shows|"
                  r"comes|occurs|represents|suggests|indicates|reveals)\b", t, re.I):
         if n_words > 5:
             return True
 
-    # Dvě slova — buď legitimní rod/druh (chytí SPECIES_RE) or morfologická fráze.
-    # Rozlišení: pravý druhový epiteton je latinský (jen písmena, pomlčky, tečky).
-    # Fráze jako "Faunal comparison", "Monoclaviculate operculum" nesplňují
-    # kritérium latinského epitetu — slova jsou příliš obecná (Angličtina/adj.).
+    # Dve slova — bud legitimni genus/druh (chyti SPECIES_RE) or morfologicka fraze.
+    # Rozliseni: pravy species epithet is latinsky (only pismena, pomlcky, tecky).
+    # Fraze as "Faunal comparison", "Monoclaviculate operculum" nesplnuji
+    # kriterium latinskeho epitetu — slova are prilis obecna (English/adj.).
     if n_words == 2:
         second = words[1].lower().rstrip(".,;:")
-        # Druhé slovo je běžné anglické slovo, ne pravý druhový epiteton
+        # The second word is bezne English slovo, ne pravy species epithet
         _ENG_NONADJ = {
             "comparison", "operculum", "used", "incomplete", "other",
             "conch", "aperture", "specimen", "material", "fauna",
@@ -3839,11 +4806,11 @@ def _is_ordinary_sentence(text: str) -> bool:
         }
         if second in _ENG_NONADJ:
             return True
-        # Druhé slovo příliš krátké pro druhový epiteton (min. 3 znaky)
+        # The second word prilis kratke for species epithet (min. 3 znaky)
         if len(second) < 3 and not second.endswith("."):
             return True
 
-    # Particip or adjektivum na prvním místě (typický začátek diagnózy, ne nadpisu)
+    # Particip or adjektivum on prvnim miste (typicky zacatek diagnozy, ne nadpisu)
     # "Characterized by", "Distinguished from", "Represented by" atd.
     _PARTICIP_STARTERS = {
         "characterized", "distinguished", "separated", "represented",
@@ -3857,15 +4824,15 @@ def _is_ordinary_sentence(text: str) -> bool:
     return False
 
 
-_STRONG_SECTION_RE_CACHE: Optional[re.Pattern] = None
-_PURE_LABEL_RE_CACHE: Optional[re.Pattern] = None
-# Cache pro nejdražší schema-odvozené struktury (invalidace v reload_schema).
-# build_section_regex iteruje 1300+ řádku a kompiluje obří regex — bez cache
-# se to dělo při KAŽDÉM map_sections_from_block/annotate_raw_block.
-_SECTION_REGEX_CACHE: Optional[Tuple[re.Pattern, Dict[str, str]]] = None
-_STRONG_FIELDS_CACHE: Optional[set] = None
-_STRONG_LABELS_CACHE: Optional[set] = None
-_LABEL_ONLY_PAT_CACHE: Optional[re.Pattern] = None
+_STRONG_SECTION_RE_CACHE: Dict[int, re.Pattern] = {}
+_PURE_LABEL_RE_CACHE: Dict[int, re.Pattern] = {}
+# Cache for nejdrazsi schema-odvozene struktury (invalidace in reload_schema).
+# build_section_regex iteruje 1300+ radku and kompiluje obri regex — without cache
+#  to delo when KAZDEM map_sections_from_block/annotate_raw_block.
+_SECTION_REGEX_CACHE: Dict[int, Tuple[re.Pattern, Dict[str, str]]] = {}
+_STRONG_FIELDS_CACHE: Dict[int, set] = {}
+_STRONG_LABELS_CACHE: Dict[int, set] = {}
+_LABEL_ONLY_PAT_CACHE: Dict[int, re.Pattern] = {}
 _SCHEMA_DERIVED_RE_LOCK = threading.Lock()
 
 
@@ -3875,32 +4842,31 @@ def _invalidate_schema_derived_regex_cache() -> None:
     pure-section-label). MUSÍ se zavolat vždy, když se mění samotné schéma
     (viz reload_schema) — jinak by se dál používal starý, zastaralý regex.
     """
-    global _STRONG_SECTION_RE_CACHE, _PURE_LABEL_RE_CACHE
-    global _SECTION_REGEX_CACHE, _STRONG_FIELDS_CACHE, _STRONG_LABELS_CACHE
-    global _LABEL_ONLY_PAT_CACHE
     with _SCHEMA_DERIVED_RE_LOCK:
-        _STRONG_SECTION_RE_CACHE = None
-        _PURE_LABEL_RE_CACHE = None
-        _SECTION_REGEX_CACHE = None
-        _STRONG_FIELDS_CACHE = None
-        _STRONG_LABELS_CACHE = None
-        _LABEL_ONLY_PAT_CACHE = None
+        _STRONG_SECTION_RE_CACHE.clear()
+        _PURE_LABEL_RE_CACHE.clear()
+        _SECTION_REGEX_CACHE.clear()
+        _STRONG_FIELDS_CACHE.clear()
+        _STRONG_LABELS_CACHE.clear()
+        _LABEL_ONLY_PAT_CACHE.clear()
 
 
 def _get_strong_section_regex(schema: pd.DataFrame) -> re.Pattern:
-    global _STRONG_SECTION_RE_CACHE
+    cache_key = id(schema)
     with _SCHEMA_DERIVED_RE_LOCK:
-        if _STRONG_SECTION_RE_CACHE is not None:
-            return _STRONG_SECTION_RE_CACHE
-        labels = sorted(
-            {str(row.get("label", "")).strip() for _, row in schema.iterrows()
-             if str(row.get("is_strong", "0")).strip() == "1"
-             and len(str(row.get("label", "")).strip()) >= 3},
-            key=len, reverse=True)
-        pat = (re.compile("|".join(re.escape(l) for l in labels), re.IGNORECASE | re.UNICODE)
-               if labels else re.compile(r"(?!x)x"))  # nikdy nic nenajde
-        _STRONG_SECTION_RE_CACHE = pat
-        return pat
+        cached = _STRONG_SECTION_RE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    labels = sorted(
+        {str(row.get("label", "")).strip() for _, row in schema.iterrows()
+         if str(row.get("is_strong", "0")).strip() == "1"
+         and len(str(row.get("label", "")).strip()) >= 3},
+        key=len, reverse=True)
+    pat = (re.compile("|".join(re.escape(l) for l in labels), re.IGNORECASE | re.UNICODE)
+           if labels else re.compile(r"(?!x)x"))
+    with _SCHEMA_DERIVED_RE_LOCK:
+        _STRONG_SECTION_RE_CACHE[cache_key] = pat
+    return pat
 
 
 def _after_has_strong_section(after_text: str, strong_fields: set) -> bool:
@@ -3920,8 +4886,8 @@ def _after_has_strong_section(after_text: str, strong_fields: set) -> bool:
     return bool(pat.search(after_text))
 
 
-# Znaky téměř nikdy se nevyskytující v normální taxonomické próze, ale
-# typické pro OCR šum z map/legend/diagramu ("Cam bri: —sy ly [| srauseiee").
+# Characters almost never occurring in normal taxonomic prose, but
+# typical of OCR noise from map/legend/diagramu ("Cam bri: —sy ly [| srauseiee").
 _GARBAGE_CHARS_RE = re.compile(r"[\[\]|<>]")
 
 
@@ -3956,7 +4922,7 @@ def score_candidate(
     """
     flags = set(f for f in unit.zone_flags.split(",") if f)
     debug: Dict = {"bonuses": {}, "penalties": {}}
-    score = 0.40   # základní Score za detekci jména
+    score = 0.40   # zakladni Score za detekci jmena
 
     # ── Bonusy ──────────────────────────────────────────────────────────────
     if "family" in pattern:
@@ -3968,19 +4934,19 @@ def score_candidate(
     elif "species" in pattern or "genus_sp" in pattern:
         score += 0.15;  debug["bonuses"]["species_pattern"] = 0.15
     elif "genus" in pattern:
-        # Rodová úroveň ("Genus Examplius Sysoev, 1968" / bare "Examplius"
-        # s rank Contextem) dřív NEDOSTÁVALA žádný strukturní bonus — jen
-        # family a species patterny ho měly. Rodové nadpisy tak systematicky
-        # skórovaly níž, přestože jsou stejně platnou hranicí bloku jako
+        # Rodova uroven ("Genus Examplius Sysoev, 1968" / bare "Examplius"
+        # s rank Contextem) driv NEDOSTAVALA zadny strukturni bonus — only
+        # family and species patterny ho mely. Rodove nadpisy tak systematicky
+        # skorovaly niz, although are stejne platnou hranici bloku as
         # family/species (viz extract_block_for_candidate). Bonus o 0.05
-        # nižší než species, protože holé rodové jméno (bez binomia) je
-        # o něco méně specifický signál.
-        # P 1.3: holý rod + autor + rok → silnější signal než species pattern
+        # nizsi nez species, because hole genusove name (without binomia) is
+        # o neco mene specificky signal.
+        # P 1.3: holy genus + author + year → silnejsi signal nez species pattern
         genus_bonus = 0.15 if pattern == "genus_author" else 0.10
         score += genus_bonus;  debug["bonuses"]["genus_pattern"] = genus_bonus
 
     if NEW_TAXON_RE.search(unit.text):
-        # P 1.1: v krátkém nadpisu (<100 znaku) je n. sp. silnější signál
+        # P 1.1: in kratkem nadpisu (<100 znaku) is n. sp. silnejsi signal
         nsp_bonus = 0.35 if len(unit.text.strip()) < 100 else 0.25
         score += nsp_bonus;  debug["bonuses"]["new_taxon_marker"] = nsp_bonus
 
@@ -4005,9 +4971,9 @@ def score_candidate(
     if AUTHOR_YEAR_RE.search(unit.text):
         score += 0.10;  debug["bonuses"]["author_year"] = 0.10
 
-    # Gazetteer (taxons.txt) — měkký bonus, NE tvrdý filtr. Nopřítomnost
-    # jména v seznamu nic nepenalizuje (nově popisované druhy v aktuálním
-    # článku tam logicky missing); přítomnost zvyšuje duvěru.
+    # Gazetteer (taxons.txt) — mekky bonus, NOT and hard filter. Nopritomnost
+    # jmena in seznamu nic nepenalizuje (newly described species in aktualnim
+    # clanku tam logicky missing); pritomnost zvysuje duveru.
     genera, binomials = load_gazetteer()
     name_words = name.lower().split()
     gaz_bonus = float(settings.get("gazetteer_bonus", 0.10))
@@ -4019,19 +4985,19 @@ def score_candidate(
             score += gaz_bonus
             debug["bonuses"]["gazetteer_genus"] = gaz_bonus
 
-    # ── Penalizace suspektních OCR fragmentu ─────────────────────────────────
-    # Krátká první slova (≤5 znaku) která nejsou v gazetteeru jsou typically
+    # ── Penalizace suspektnich OCR fragmentu ─────────────────────────────────
+    # Kratka prvni slova (≤5 znaku) which nejsou in gazetteeru are typically
     # OCR-split artefakty ("Speci|men", "Diag|nosis", "Descr|iption") or
-    # obecná anglická slova. Pokud je gazetteer neprázdný a jméno v něm missing,
-    # aplikujeme výraznou penalizaci.
+    # obecna anglicka slova. If is gazetteer neprazdny and name in nem missing,
+    # aplikujeme vyraznou penalizaci.
     _first_w = name_words[0] if name_words else ""
     _gaz_non_empty = bool(genera)
     if _first_w and len(_first_w) <= 5 and _gaz_non_empty and _first_w not in genera:
         score -= 0.45
         debug["penalties"]["short_unknown_genus"] = -0.45
     elif _first_w and len(_first_w) <= 4 and _first_w not in genera:
-        # I bez gazetteeru: 4 a méně znaku je velmi suspicious (SPECIES_RE
-        # vyžaduje ≥1 char rod – ale "Sp" "Gen" "Fam" apod. nejsou validní rody)
+        # I without gazetteeru: 4 and mene znaku is velmi suspicious (SPECIES_RE
+        # vyzaduje ≥1 char genus – but "Sp" "Gen" "Fam" apod. nejsou validni genusy)
         score -= 0.35
         debug["penalties"]["very_short_genus"] = -0.35
 
@@ -4056,33 +5022,493 @@ def score_candidate(
     if _is_ordinary_sentence(unit.text):
         score -= 0.30;  debug["penalties"]["ordinary_sentence"] = -0.30
 
-    # Pozn.: dřív tu byla i podmínka "systematic_heading" not in flags —
-    # ten flag ale NIKDE v assign_zone_flags() nevznikal (mrtvý kód, který
-    # jen matoucně naznačoval funkčnost, jež neexistovala). Odpagesěno.
+    # Note:: driv tu byla i podminka "systematic_heading" not in flags —
+    # ten flag but NIKDE in assign_zone_flags() nevznikal (mrtvy kod, which
+    # only matoucne naznacoval funkcnost, jez neexistovala). Odpageseno.
     if "systematic" not in flags:
         pen = float(settings.get("outside_systematic_penalty", 0.20))
         if "pre_systematic" in flags:
-            # P 1.2: blok PŘED systematickou sections — agresivní penalizace.
-            pen = min(1.0, pen + 0.45)   # místo 0.30
+            # P 1.2: blok Before systematickou sections — agresivni penalizace.
+            pen = min(1.0, pen + 0.45)   # instead of 0.30
             debug["penalties"]["pre_systematic_extra"] = -0.45
-            # Anulovat n. sp. bonus (v úvodu/abstraktu je to jen citace)
+            # Anulovat n. sp. bonus (in uvodu/abstraktu is to only citace)
             if debug.get("bonuses", {}).get("new_taxon_marker"):
                 score -= debug["bonuses"]["new_taxon_marker"]
                 debug["penalties"]["pre_systematic_nsp_cancel"] = -debug["bonuses"]["new_taxon_marker"]
-            # Anulovat gazetteer bonusy (taxa z gazetteeru se v úvodu citují)
+            # Anulovat gazetteer bonusy (taxa from gazetteeru in uvodu cituji)
             for gk in ("gazetteer_binomial", "gazetteer_genus"):
                 if debug.get("bonuses", {}).get(gk):
                     score -= debug["bonuses"][gk]
                     debug["penalties"][f"pre_systematic_{gk}_cancel"] = -debug["bonuses"][gk]
         score -= pen;   debug["penalties"]["outside_systematic"] = -pen
 
-    if len(name.split()) == 1 and rank.lower() not in ("genus","subgenus") and \
+    if len(name.split()) == 1 and rank.lower() not in ("genus","subgenus") and\
             not re.search(r"(idae|inae|ini|oidea)$", name, re.I):
         score -= 0.30;  debug["penalties"]["single_word_no_rank"] = -0.30
 
     score = round(max(0.0, min(1.0, score)), 4)
     debug["final_score"] = score
     return score, debug
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# RECORD-MARKER INDEXING  (predanotovane "Record N - rank" DOCX)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Nektere vstupni DOCX jsou predzpracovane verze publikaci, v nichz je pred
+# kazdym taxonomickym zaznamem vlozen marker "Record N - <rank>" (EN) nebo
+# "Zaznam N <jmeno>" (CS). Marker je autoritativni: udava HRANICI zaznamu i
+# jeho RANK. Prvni radek za markerem je vzdy NADPIS taxonu (jmeno + autor +
+# rok, pripadne s odkazem na tabuli). Tela zaznamu obsahuji sekcni labely
+# (Diagnosis/Description/Dimensions/Rapp. et differ./Диагноз/Описание/...),
+# ktere se mapuji na pole pres map_sections_from_block().
+#
+# Bez tohoto detektoru heuristicka detekce jmen na OCR-sumu a cizojazycnych
+# textech (FR/RU/SV) selhava (0-1 kandidatu misto skutecnych 4-8). S nim
+# parser indexuje presne podle vlozeneho vzoru.
+
+_RECORD_MARKER_RE = re.compile(
+    r"^\s*(?:Record|Z[aá]znam)\s+(\d+)\s*[-\u2013\u2014:]*\s*"
+    r"(genus|species|subspecies|family|subfamily|class|subclass|order|suborder"
+    r"|subgenus|phylum|tribe|superfamily|infraorder"
+    r"|rod|druh|\u0440\u043e\u0434|\u0432\u0438\u0434|\u0441\u0435\u043c\u0435\u0439\u0441\u0442\u0432\u043e"
+    r"|\u043a\u043b\u0430\u0441\u0441|\u043e\u0442\u0440\u044f\u0434)?"
+    r"(?:\s+(.+?))?\s*$",
+    re.IGNORECASE | re.UNICODE)
+
+_REC_HIGHER_RANKS = {"Phylum", "Class", "Subclass", "Superorder", "Order",
+                     "Suborder", "Superfamily", "Family", "Subfamily",
+                     "Genus", "Subgenus"}
+
+# Cyrillic -> Latin homoglyph fold (OCR mixes scripts inside one word:
+# "\u0421i\u0433\u0441o\u0442h\u0435\u0441\u0430" -> "Circotheca").
+_REC_CYR2LAT = {
+    "\u0410":"A","\u0412":"B","\u0415":"E","\u041a":"K","\u041c":"M","\u041d":"H",
+    "\u041e":"O","\u0420":"P","\u0421":"C","\u0422":"T","\u0423":"Y","\u0425":"X",
+    "\u0430":"a","\u0435":"e","\u043e":"o","\u0440":"p","\u0441":"c","\u0443":"y",
+    "\u0445":"x","\u0433":"r","\u0442":"t","\u043f":"n","\u0438":"u","\u043a":"k",
+    "\u043c":"m","\u043d":"h","\u0406":"I","\u0456":"i",
+}
+_REC_HAS_CYR = re.compile(r"[\u0400-\u04ff]")
+_REC_HAS_LAT = re.compile(r"[A-Za-z]")
+_REC_OCR_GLYPH_RE = re.compile(r"[\ue000-\uf8ff\ufffd]")
+_REC_SPACED_CYR_RE = re.compile(r"(?:[\u0410-\u042f\u0401][ .]){2,}[\u0410-\u042f\u0401]")
+_REC_SPACED_LAT_FRAG_RE = re.compile(r"\b(?:[A-Z]{1,6} ){2,}[A-Z]{2,6}\b")
+_REC_SPACED_YEAR_RE = re.compile(r"\b(1[5-9]\d|20[012])\s+(\d)\b")
+_REC_SPACED_THOUSAND_RE = re.compile(r"\b(1)\s+(\d{3})\b")
+
+
+def _rec_fix_spaced_year(text: str) -> str:
+    """Repair OCR-split years: '1 963'->'1963', '1 9 6 3'->'1963'."""
+    prev = None
+    while prev != text:
+        prev = text
+        text = _REC_SPACED_YEAR_RE.sub(r"\1\2", text)
+        text = _REC_SPACED_THOUSAND_RE.sub(r"\1\2", text)
+    return text
+_REC_PLATE_TAIL_RE = re.compile(
+    r"\s*(?:Pl\.|Pl\b|Plate|Tab\.|Tabl\.|\u0422\u0430\u0431\u043b\.|Taf\.|Taft\.|Tafl\.|TaH\.|Tall\.|"
+    r"Text-?figs?|Text-?figures?|Figures?\.|Figures?\s+\d|Figs?\.|Fig\b|\u0444\u0438\u0433\.)[\s\S]*$",
+    re.IGNORECASE | re.UNICODE)
+_REC_RANK_WORD = (r"Phylum|Subphylum|Class|Subclass|Superorder|Order|Suborder|Infraorder"
+                  r"|Superfamily|Family|Subfamily|Tribe|Subtribe|Genus|Subgenus|Species|Subspecies")
+_REC_LEADING_RANK_RE = re.compile(rf"^(?:{_REC_RANK_WORD})\s+", re.IGNORECASE)
+_REC_TRAILING_NOM_RE = re.compile(
+    r"\s+(?:"
+    r"gen\.?\s*nov\.?|sp\.?\s*nov\.?|fam\.?\s*nov\.?|"   # gen./sp./fam. nov.
+    r"nov\.?\s*gen\.?|nov\.?\s*sp\.?|"                    # nov. gen./sp.
+    r"n\.\s*sp\.|n\.\s*gen\.|n\.\s*fam\.|"               # n. sp./gen./fam.
+    r"sp\.\s*n\.|gen\.\s*n\.|fam\.\s*n\.|"               # sp./gen./fam. n. ← pridano
+    r"emend\.?"
+    r")\s*$",
+    re.IGNORECASE)
+_REC_LATIN_IN_NOISE_RE = re.compile(
+    r"([A-Z][A-Za-z]{3,}(?:\s+[A-Za-z][A-Za-z.,]*|\s*,?\s*\d{4}|\s+[a-z]{3,})*)")
+
+_REC_OCR_LETTER_FIXES = [
+    (re.compile(r"\bHyo1ith"), "Hyolith"),
+    (re.compile(r"\bHyol1th"), "Hyolith"),
+    (re.compile(r"1ith(es|us|a|ida)\b"), r"lith\1"),
+    (re.compile(r"\bBan\.\b"), "Barr."),
+    (re.compile(r"I<\b"), "K"),
+]
+
+
+def _rec_fold_mixed_script(text: str) -> str:
+    """Fold Cyrillic->Latin only in tokens that mix both scripts (OCR artefact)."""
+    out = []
+    for tok in text.split(" "):
+        if _REC_HAS_CYR.search(tok) and _REC_HAS_LAT.search(tok):
+            tok = "".join(_REC_CYR2LAT.get(ch, ch) for ch in tok)
+        out.append(tok)
+    return " ".join(out)
+
+
+def _rec_despace_caps(text: str) -> str:
+    """Collapse spaced-out Cyrillic runs and heavily fragmented Latin caps."""
+    text = _REC_SPACED_CYR_RE.sub(lambda m: re.sub(r"[ .]", "", m.group(0)), text)
+    return _REC_SPACED_LAT_FRAG_RE.sub(lambda m: m.group(0).replace(" ", ""), text)
+
+
+def _rec_extract_latin_name(text: str) -> str:
+    """Pull the Latin uninomial/binomial + author,year out of a noisy heading."""
+    m = re.search(r"[A-Z][A-Za-z]", text)
+    if not m:
+        return text
+    tail = text[m.start():]
+    mm = _REC_LATIN_IN_NOISE_RE.match(tail)
+    return (mm.group(1) if mm else tail).strip()
+
+
+def _rec_pick_rank_segment(text: str, rank: str) -> str:
+    """From a merged multi-rank heading, return the name after the LAST match of rank.
+    Stops at the next rank-word ONLY when it is a standalone taxonomic rank label
+    (i.e. NOT preceded by 'new' or 'n.' — those are part of the taxon name itself,
+    e.g. 'Genus Robardetlites new genus' where 'new genus' = nomenclatural act,
+    not a rank boundary).
+    """
+    if not rank:
+        return text
+    # Lookahead: stop only at a rank-word that is NOT preceded by 'new' or 'n.'
+    rx = re.compile(
+        rf"\b{re.escape(rank)}\b\s+(.+?)"
+        rf"(?=\s+(?<!new\s)(?<!n\.\s)(?:{_REC_RANK_WORD})\b|$)",
+        re.IGNORECASE)
+    hits = list(rx.finditer(text))
+    if not hits:
+        return text
+    result = hits[-1].group(1).strip()
+    # If the result ends ' new' (nomenclatural act), remove it —
+    # 'Robardetlites new' → 'Robardetlites'
+    result = re.sub(r"\s+new\s*$", "", result, flags=re.IGNORECASE).strip()
+    return result if result else text
+
+
+def _rec_title_caps_word(name: str) -> str:
+    """CIRCOTHECIDAE -> Circothecidae for all-caps higher-rank names and author names."""
+    def fix(tok):
+        core = tok.rstrip(".,;:")
+        suffix = tok[len(core):]
+        if len(core) >= 4 and core.isupper() and core.isalpha():
+            return core[0] + core[1:].lower() + suffix
+        return tok
+    return " ".join(fix(t) for t in name.split())
+
+
+def _rec_gazetteer_correct(name: str, rank: str) -> str:
+    """
+    Opravi drobne OCR chyby v rodovem/druhovem jmene fuzzy shodou proti
+    gazetteeru znamych taxonu (taxons.txt). Opt-in: bez gazetteeru je no-op.
+
+    - Uninominal (rod/celed/...): opravi cely prvni token.
+    - Binomial (druh): opravi rodovy token; pokud sedi cely binom, pouzije jej.
+    Autor + rok zustavaji nedotcene. Prah 0.82 (SequenceMatcher) — dost pro
+    'Circot11eca'->'Circotheca' i 'Clrcotheca'->'Circotheca', ale ne pro
+    zamenu za jiny existujici rod.
+    """
+    if not name:
+        return name
+    try:
+        genera, binomials = load_gazetteer()
+    except Exception:
+        return name
+    if not genera:
+        return name
+
+    # Rodovy token = prvni "slovo" az po mezeru; muze obsahovat OCR-cislice
+    # ('Circot11eca') nebo homoglyfy, ktere chceme do fuzzy shody zahrnout.
+    m = re.match(r"^([A-Z][^\s]*?)(\s.*|)$", name)
+    if not m:
+        return name
+    genus_tok, rest = m.group(1), m.group(2)
+    # ocisti koncovou interpunkci rodoveho tokenu do 'rest'
+    tm = re.match(r"^([A-Za-z0-9]+)(.*)$", genus_tok)
+    if tm and tm.group(2):
+        rest = tm.group(2) + rest
+        genus_tok = tm.group(1)
+    gl = genus_tok.lower()
+    if gl in genera:
+        return name  # uz spravne
+    # fuzzy jen pro tokeny, ktere aspon zacinaji jako latinske slovo
+    if not re.match(r"^[A-Za-z]", genus_tok):
+        return name
+
+    cand = difflib.get_close_matches(gl, genera, n=1, cutoff=0.82)
+    if not cand:
+        return name
+    best = cand[0]
+    corrected = best[:1].upper() + best[1:]
+    return corrected + rest
+
+
+def _clean_record_heading(line: str, rank: str) -> str:
+    """
+    Extract a clean taxon name from the first line following a Record marker.
+    Robust to OCR noise, spaced-out Cyrillic/Latin caps, plate references,
+    mixed-script homoglyphs, leading rank labels and trailing nomenclatural acts.
+    """
+    s = unicodedata.normalize("NFKC", line or "").strip()
+    s = _REC_OCR_GLYPH_RE.sub("", s)
+    s = re.sub(r"[\t ]+", " ", s)
+    s = _rec_despace_caps(s)
+    # split a Cyrillic ALL-CAPS run glued to a following Latin name:
+    #   "\u041a\u041b\u0410\u0421\u0421HYOLITHA" -> "\u041a\u041b\u0410\u0421\u0421 HYOLITHA"
+    s = re.sub(r"([\u0410-\u042f\u0401]{2,})([A-Z][A-Za-z])", r"\1 \2", s)
+    s = _rec_fold_mixed_script(s)
+    for rx, rep in _REC_OCR_LETTER_FIXES:
+        s = rx.sub(rep, s)
+    s = _REC_PLATE_TAIL_RE.sub("", s).strip()
+    s = _rec_fix_spaced_year(s)
+    if rank in _REC_HIGHER_RANKS and re.search(r"[\u0410-\u042f\u0401]", s) and re.search(r"[A-Za-z]{3,}", s):
+        s = _rec_extract_latin_name(s)
+    else:
+        s = re.sub(r"^(?:[\u0410-\u042f\u0401]\s?)+(?=[A-Z][a-z])", "", s)
+        s = re.sub(r"^[\u0410-\u042f\u0401]{3,}(?=[A-Z])", "", s)
+    s = _rec_pick_rank_segment(s, rank)
+    s = _REC_LEADING_RANK_RE.sub("", s)
+    prev = None
+    while prev != s:
+        prev = s
+        s = _REC_TRAILING_NOM_RE.sub("", s).strip()
+    # Remove (emended ...) / (emend. ...) from the end of the name Before clean_latin_taxon_ocr,
+    # because ta function removes uzaviraci ')' and znemozni regex matching.
+    s = re.sub(r"\s*\(emend(?:ed)?\.?\s+[^)]+\)\s*$", "", s, flags=re.IGNORECASE).strip()
+    # Strip anglickych nomenklaturnich aktu: 'Robardetlites new genus' -> 'Robardetlites'
+    s = re.sub(r"\s+new\s+(?:genus|species|subspecies|family|combination|name)\s*$",
+               "", s, flags=re.IGNORECASE).strip()
+    s = re.sub(r"\s+(?:gen(?:us)?|sp(?:ecies)?|fam(?:ily)?)\.\s+et\s+sp\.\s+n\.\s*$",
+               "", s, flags=re.IGNORECASE).strip()
+    s = _clean_latin_taxon_ocr(s)
+    if rank in _REC_HIGHER_RANKS:
+        s = _rec_title_caps_word(s)
+    s = s.strip(" .,;:\u2013-\u2014").strip()
+    # Restore the period za 'sp'/'spp'/'indet' (the final strip removed it):
+    # 'Cavernolites sp' → 'Cavernolites sp.'
+    s = re.sub(r"\b(sp|spp|indet)\s*$", r"\1.", s)
+    # Remove (emended ...) / (emend. ...) from the end of the name — to belongs in NOMENCLATURAL ACTS
+    s = re.sub(r"\s*\(emend(?:ed)?\.?\s+[^)]+\)\s*$", "", s, flags=re.IGNORECASE).strip()
+    # ── Finalizace: obnov useknutou parovou zavorku a spravne mezery ─────────
+    # _clean_latin_taxon_ocr strippuje koncove ')' i u "(Boll, 1859)" — vratime
+    # ji, pokud pocet '(' prevysuje pocet ')'.
+    if s.count("(") > s.count(")"):
+        s = s + ")"
+    # spaced year kdekoli (i za zavorkou: "(Syssoiev) , 1 959" -> "..., 1959")
+    s = _rec_fix_spaced_year(s)
+    # normalizuj mezeru pred interpunkci: ") ," -> ")," ; "( " -> "("
+    s = re.sub(r"\s+([,)])", r"\1", s)
+    s = re.sub(r"\(\s+", "(", s)
+    s = s.strip()
+    # volitelna korekce rezidualni OCR errors proti gazetteeru znamych taxonu
+    s = _rec_gazetteer_correct(s, rank)
+    return s.strip()
+
+
+def _rank_label_matches_name(name: str, rank: str) -> bool:
+    """
+    Heuristicky ověří, zda extrahované jméno odpovídá očekávanému ranku.
+    Používá se k detekci merged headingů (Class+Order+Family na jednom řádku),
+    kde _clean_record_heading vrátí jméno z nesprávné hierarchické úrovně.
+    """
+    if not name or not rank:
+        return True   # nelze posoudit → neblokovat
+    rank_l = rank.lower()
+    name_s = name.strip()
+    tok0 = name_s.split()[0] if name_s else ""
+    # Family/Subfamily — name by melo koncit -idae, -inae, -aceae, -oidea, -ales
+    if rank_l in ("family", "subfamily", "superfamily", "tribe"):
+        return bool(re.search(r"(idae|inae|aceae|ales|oidea|acea|iformes|ini)$", tok0, re.I))
+    # Order — name by melo byt uninominal without yearu, or obsahovat -ida/-iformes
+    if rank_l in ("order", "suborder"):
+        return bool(re.match(r"^[A-Z][a-z]+(?:ida|ina|iformes|ormes)?$", tok0))
+    # Class — uninominal zacinajici velk. pism.
+    if rank_l in ("class", "subclass"):
+        return bool(re.match(r"^[A-Z][a-z]{2,}$", tok0)) and len(name_s.split()) <= 3
+    # Genus — prvni tok vel. pismeno, druhy tok (is-li) is year or subgenus
+    if rank_l in ("genus", "subgenus"):
+        return bool(re.match(r"^[A-Z][a-z]+$", tok0))
+    # Species — prvni tok vel., druhy tok maly
+    if rank_l == "species":
+        parts = name_s.split()
+        return (len(parts) >= 2
+                and parts[0][:1].isupper()
+                and parts[1][:1].islower())
+    return True   # ostatni ranky nechej projit
+
+
+def _document_has_record_markers(pages: List[PageText], min_markers: int = 2) -> bool:
+    """True if the document carries >= min_markers Record/Zaznam marker lines."""
+    count = 0
+    for pg in pages:
+        for line in (pg.text or "").split("\n"):
+            if _RECORD_MARKER_RE.match(line.strip()):
+                count += 1
+                if count >= min_markers:
+                    return True
+    return False
+
+
+def _extract_record_marker_treatments(document_id: int, pages: List[PageText],
+                                      settings: Dict) -> Optional[Dict[str, Any]]:
+    """
+    Priority indexing path for pre-annotated "Record N - rank" documents.
+    Uses each marker as an authoritative record boundary and rank source,
+    derives the taxon name from the first line after the marker, maps the
+    remaining body to fields, and writes candidates to the DB.
+
+    Returns a diagnostics dict, or None if the document is not marker-based
+    (so detect_candidates falls back to the heuristic detector).
+    """
+    # Rebuild paragraph-level lines from pages, keeping page provenance.
+    lines: List[Tuple[str, int]] = []
+    for pg in pages:
+        for raw in (pg.text or "").split("\n"):
+            raw = raw.strip()
+            if raw:
+                lines.append((raw, pg.page_number))
+
+    # Split into records on marker lines.
+    records: List[Dict[str, Any]] = []
+    cur: Optional[Dict[str, Any]] = None
+    body: List[Tuple[str, int]] = []
+
+    def _flush():
+        if cur is not None:
+            cur["body"] = body[:]
+            records.append(cur)
+
+    for text, pageno in lines:
+        m = _RECORD_MARKER_RE.match(text)
+        if m:
+            _flush()
+            rank_raw = (m.group(2) or "").strip()
+            rank = _canonical_rank_label(rank_raw) if rank_raw else ""
+            cur = {"n": int(m.group(1)), "rank": rank,
+                   "inline_name": (m.group(3) or "").strip(),
+                   "page_start": pageno}
+            body = []
+        elif cur is not None:
+            body.append((text, pageno))
+
+    _flush()
+
+    if len(records) < 2:
+        return None
+
+    con = db()
+    _delete_candidates_for_document(document_id, con)
+    now = datetime.now().isoformat()
+    accepted = 0
+
+    for i, rec in enumerate(records):
+        rank = rec["rank"]
+        # Heading = inline name on the marker line, else the first body line.
+        if rec["inline_name"]:
+            heading_line = rec["inline_name"]
+            field_lines = rec["body"]
+        elif rec["body"]:
+            heading_line = rec["body"][0][0]
+            field_lines = rec["body"][1:]
+        else:
+            heading_line = ""
+            field_lines = []
+
+        name = _clean_record_heading(heading_line, rank)
+
+        # Fallback: if heading contains merged ranky vyssiho/nizsiho stupne
+        # (typicky Class+Order+Family on jednom radku), try prvni body-line as
+        # alternativni zdroj jmena — ta muthat obsahovat presny rank-label + name.
+        # Priklad: heading = "Class Hyolitha Order Hyolithida", rank = "Family",
+        #          body[0] = "Family Hyolithidae NICHOLSON, 1872" → correct name.
+        if (name and rank in _REC_HIGHER_RANKS and field_lines
+                and not _rank_label_matches_name(name, rank)):
+            alt_line = field_lines[0][0].strip()
+            alt_name = _clean_record_heading(alt_line, rank)
+            if alt_name and _rank_label_matches_name(alt_name, rank):
+                # Presuneme prvni field_line to headingu, zbytek zustane as field_lines
+                heading_line = alt_line
+                name = alt_name
+                field_lines = field_lines[1:]
+
+        if not name:
+            # last resort: reuse the existing body-inference helper
+            name = _infer_taxon_name_from_body([b for b, _ in rec["body"]], rank)
+        if not name:
+            continue
+
+        block = "\n".join(b for b, _ in field_lines).strip()
+        heading = heading_line.strip()
+        ps = rec["page_start"]
+        pe = field_lines[-1][1] if field_lines else ps
+
+        cur_ins = con.execute(
+            "INSERT INTO taxon_candidates "
+            "(document_id,taxon_name,rank_guess,confidence,status,heading_text,"
+            "context_before,context_after,page_start,block_text,created_at,"
+            "block_end_page,unit_index,debug_json,boundary_method,boundary_reason,"
+            "boundary_confidence) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (document_id, name, rank or "", 0.97, "pending", heading,
+             "", "", ps, block, now, pe, i,
+             json.dumps({"detector": "record_marker",
+                         "record_n": rec["n"],
+                         "rank_basis": "record_marker"}, ensure_ascii=False),
+             "record_marker", "record_marker_to_next_marker", 0.97))
+        cid = cur_ins.lastrowid
+        try:
+            fields = map_sections_from_block(block, rank)
+            for fname, fval in fields.items():
+                if fval and fval != NOT_PROVIDED:
+                    con.execute(
+                        "INSERT INTO occurrence_fields "
+                        "(candidate_id,field_name,field_value,source_pages,method) "
+                        "VALUES (?,?,?,?,?)",
+                        (cid, fname, fval, f"{ps}-{pe}" if pe != ps else str(ps),
+                         "record_marker"))
+        except Exception as exc:
+            logging.warning(f"Record-marker field mapping failed: {exc}")
+        accepted += 1
+
+    con.commit()
+    con.close()
+
+    # ── Překladový průchod (ekvivalent druhého průchodu v detect_candidates) ──
+    # Normální detect_candidates přeskočí druhý průchod, protože _extract_record_marker_treatments
+    # vrátí výsledek předčasně. Voláme proto překlad tady, pokud je LLM dostupné.
+    # force=True: neblokovat na llm_auto_translate (výchozí False); llm_enabled se kontroluje uvnitř.
+    n_translated_rm = 0
+    if settings.get("llm_enabled") and accepted > 0:
+        try:
+            _doc_lang_row = db().execute(
+                "SELECT lang FROM documents WHERE id=?", (document_id,)
+            ).fetchone()
+            _doc_lang_rm = (_doc_lang_row["lang"] or "") if _doc_lang_row else ""
+            _rm_cands = db().execute(
+                "SELECT id, block_text FROM taxon_candidates WHERE document_id=? ORDER BY unit_index",
+                (document_id,)
+            ).fetchall()
+            for _rc in _rm_cands:
+                try:
+                    n_translated_rm += auto_translate_candidate_fields(
+                        _rc["id"], _doc_lang_rm, settings,
+                        force=True, block=(_rc["block_text"] or ""))
+                except Exception as _te:
+                    logging.warning("record_marker translation cand %s: %s", _rc["id"], _te)
+        except Exception as _exc_rm:
+            logging.warning("record_marker translation pass failed: %s", _exc_rm)
+
+    diag_out = {
+        "Pages": len(pages),
+        "Text units": len(lines),
+        "Candidates found": accepted,
+        "Accepted": accepted,
+        "Low-confidence": 0,
+        "Rejected": 0,
+        "Method": "record_marker",
+    }
+    if n_translated_rm:
+        diag_out["Fields translated"] = n_translated_rm
+    return diag_out
 
 
 def detect_candidates(
@@ -4093,6 +5519,18 @@ def detect_candidates(
     """
     Main detector. Returns diagnostics and writes candidates to the DB.
     """
+    # ── Priority path: pre-annotated "Record N - rank" documents ─────────────
+    # Pokud dokument obsahuje vlozene Record/Zaznam markery, jsou autoritativni
+    # (hranice zaznamu + rank). Indexujeme presne podle nich; heuristika by na
+    # OCR-sumu a cizojazycnych textech (FR/RU/SV) jinak selhala.
+    if settings.get("use_record_marker_indexing", True):
+        try:
+            if _document_has_record_markers(pages):
+                rec_diag = _extract_record_marker_treatments(document_id, pages, settings)
+                if rec_diag:
+                    return rec_diag
+        except Exception as exc:
+            logging.warning(f"Record-marker indexing failed; falling back: {exc}")
     if settings.get("use_chinese_goldset_indexing", True):
         try:
             zh_diag = _extract_goldset_style_chinese_treatments(document_id, pages, settings)
@@ -4121,21 +5559,21 @@ def detect_candidates(
     }
 
     con = db()
-    # Pozn.: dřív se tu mazalo taxon_candidates JAKO PRVNÍ a teprve pak
-    # occurrence_fields přes subquery na taxon_candidates — subquery po
-    # smazání taxon_candidates už nic nenajde, takže occurrence_fields
-    # (a term_matches) zustávaly osiřelé. _delete_candidates_for_document
-    # maže ve správném pořadí (závislosti první).
+    # Note:: driv tu mazalo taxon_candidates As PRVNI and teprve pak
+    # occurrence_fields pres subquery on taxon_candidates — subquery after
+    # smazani taxon_candidates uz nic nenajde, takthat occurrence_fields
+    # (and term_matches) zustavaly osirele. _delete_candidates_for_document
+    # mathat in spravnem poradi (zavislosti prvni).
     _delete_candidates_for_document(document_id, con=con)
 
-    # Post-detekce deduplication: zakázat pre_systematic kandidáty jejichž
-    # jméno se vyskytuje i v systematické zóně (jsou to citační zmínky).
-    _pre_sys_seen: set = set()    # jména z pre_systematic zóny
-    _sys_seen:     set = set()    # jména ze systematic zóny
+    # Post-detection deduplication: zakazat pre_systematic kandidaty jejichz
+    # name vyskytuje i in systematicke zone (are to citacni zminky).
+    _pre_sys_seen: set = set()    # jmena from pre_systematic zony
+    _sys_seen:     set = set()    # jmena from systematic zony
 
     prev_rank = ""
     # Feature 3: rank stack pro parent-child hierarchii
-    # P 5.1: rozšířit o subspecies
+    # P 5.1: rozsirit o subspecies
     _RANK_ORDER = ["phylum","subphylum","class","subclass","order","suborder",
                    "superfamily","family","subfamily","tribe","genus","subgenus",
                    "species","subspecies"]
@@ -4160,22 +5598,22 @@ def detect_candidates(
             continue
         if "references" in flags:
             continue
-        # Přeskočit stránky abecedního indexu i front-matter obsahu Documentu.
-        # Candidates z nich nemají taxonomický blok — jsou to jen odkazy na stránky.
+        # Preskocit pages abecedniho indexu i front-matter obsahu Documentu.
+        # Candidates from nich nemaji taxonomicky blok — are to only odkazy on pages.
         if "book_index" in flags or "document_index" in flags:
             continue
-        # Boilerplate guard – running header/footer junk z akademických PDF
-        # (e.g. "Downloaded by [...] at ... 2013") nesmí nikdy vygenerovat kandidáta.
+        # Boilerplate guard – running header/footer junk from akademickych PDF
+        # (e.g. "Downloaded by [...] at ... 2013") nesmi nikdy vygenerovat candidate.
         if BOILERPLATE_RE.search(u.text.strip()):
             continue
-        # Section label guard – nezaměnit "Diagnosis:" za nadpis taxonu
+        # Section label guard – nezamenit "Diagnosis:" za nadpis taxonu
         if _is_pure_section_label(u.text.strip(), schema):
             continue
         # Synonymy entry guard
         if SYNONYMY_LINE_RE.match(u.text.strip()):
             continue
 
-        # Rank-only řádek → Context pro příští
+        # Rank-only line → Context for pristi
         rm = RANK_LABEL_RE.match(u.text.strip())
         if rm and not rm.group(2).strip():
             prev_rank = rm.group(1).title()
@@ -4184,12 +5622,12 @@ def detect_candidates(
         name, rank, pattern = _match_name(u.text.strip(), prev_rank)
         if not name:
             continue
-        # P 5.1: odvod rank z tvaru jména pokud missing
-        # Rozšířeno: rozpoznává poddruh (trinomen), nadčeleď, řád i podrod.
+        # P 5.1: odvod rank from tvaru jmena if missing
+        # Rozsireno: rozpoznava poddruh (trinomen), nadfamily, rad i podgenus.
         if not rank:
             _nm = name.strip()
             _words = _nm.split()
-            # Odečíst případný "(Autor, rok)" pro počítání slov epitetu
+            # Odecist caseny "(Autor, year)" for pocitani slov epitetu
             _epithet_words = [w for w in _words
                               if not w.startswith("(") and not w[0].isdigit()]
             if re.search(r"(oidea)$", _nm, re.I):
@@ -4200,17 +5638,17 @@ def detect_candidates(
                 rank = "Subfamily"
             elif re.search(r"(ini)$", _nm, re.I) and _nm[0].isupper():
                 rank = "Tribe"
-            elif re.search(r"(iformes|ida|ina)$", _nm, re.I) and len(_words) == 1 \
+            elif re.search(r"(iformes|ida|ina)$", _nm, re.I) and len(_words) == 1\
                     and _nm[0].isupper():
-                # řádové/podřádové zakončení (jednoslovné, velké počáteční)
+                # radove/podradove zakonceni (jednoslovne, velke pocatecni)
                 rank = "Order"
             elif "(" in _nm and ")" in _nm and len(_epithet_words) >= 2:
                 # binomen s podrodem: "Genus (Subgenus) species"
-                # → stále species-level, ale zachytíme jako Species
+                # → stale species-level, but capturesme as Species
                 rank = "Species"
             elif len([w for w in _epithet_words
                       if w and w[0].islower()]) >= 2 and len(_epithet_words) >= 3:
-                # trinomen: "Genus epithet subepithet" (2 malá slova za rodem)
+                # trinomen: "Genus epithet subepithet" (2 mala slova za genusem)
                 # → poddruh
                 rank = "Subspecies"
             elif " " in _nm:
@@ -4223,7 +5661,7 @@ def detect_candidates(
         before = "\n".join(u2.text for u2 in units[max(0, i-3):i])
 
         score, debug_info = score_candidate(u, name, rank, pattern, after, settings, strong_fields)
-        # Sledovat jména dle zóny pro post-detekci deduplication
+        # Sledovat jmena dle zony for post-detekci deduplication
         _norm_name = name.strip().lower()
         _flags_set = set(f for f in u.zone_flags.split(",") if f)
         if "pre_systematic" in _flags_set:
@@ -4231,11 +5669,11 @@ def detect_candidates(
         elif "systematic" in _flags_set:
             _sys_seen.add(_norm_name)
 
-        # Strážce titulku článku: úplně PRVNÍ jednotka Documentu je téměř
-        # vždy nadpis článku ("Gracilitheca astronauta n. sp. and Nophrotheca
-        # sophia n. sp. (Hyolitha, Orthothecida) from the Cambrian…"), což
-        # vypadá jako legitimní nadpis druhu, ale NENÍ jím. Vyžadovat extra
-        # silný dukaz (nomenklaturní akt I gazetteer shoda současně).
+        # Strazce titulku clanku: uplne PRVNI jednotka Documentu is temer
+        # vzdy nadpis clanku ("Gracilitheca astronauta n. sp. and Nophrotheca
+        # sophia n. sp. (Hyolitha, Orthothecida) from the Cambrian…"), coz
+        # vypada as legitimni nadpis druhu, but NENI jim. Vyzadovat extra
+        # silny dukaz (nomenclatural act I gazetteer shoda soucasne).
         if i == 0:
             has_strong_evidence = (
                 debug_info.get("bonuses", {}).get("new_taxon_marker") and
@@ -4246,7 +5684,7 @@ def detect_candidates(
                 score = round(max(0.0, score - 0.35), 4)
                 debug_info.setdefault("penalties", {})["likely_article_title"] = -0.35
 
-        # P 1.2: pre_systematic s nízkým Score → rovnou rejected
+        # P 1.2: pre_systematic s nizkym Score → rovnou rejected
         if "pre_systematic" in _flags_set and score < 0.50:
             score = round(max(0.0, score - 0.10), 4)  # extra trest pro jistotu
             debug_info.setdefault("penalties", {})["pre_systematic_autorej"] = -0.10
@@ -4262,19 +5700,19 @@ def detect_candidates(
                 "text": u.text[:80], "page": u.page_number,
                 "score": score, "debug": debug_info
             })
-            # POZOR: prev_rank se ZÁMĚRNĚ NEMAŽE tady. Dřív se mazal hned
-            # při jakémkoli úspěšném _match_name() zásahu, BEZ OHLEDU na
-            # finální Score — takže když mezi "Family:" a skutečným rodovým
-            # nadpisem ležela jednotka, kterou _match_name() omylem (byť jen
-            # slabě) rozpoznal jako jméno, ale která byla nakonec zamítnuta
-            # (rejected), rank Context se ztratil a skutečný nadpis o pár
-            # jednotek dál už žádný rank Context neměl. Rank Context teď
-            # přežívá až do PRVNÍHO kandidáta, který byl skutečně přijat
-            # (pending/low_confidence) — viz větev níže.
+            # POZOR: prev_rank ZAMERNE NEMAZE tady. Driv mazal hned
+            # when jakemkoli uspesnem _match_name() zasahu, Without OHLEDU on
+            # final Score — takthat when mezi "Family:" and skutecnym genusovym
+            # nadpisem lethatla jednotka, kterou _match_name() omylem (byt only
+            # slabe) rozpoznal as name, but which byla nakonec zamitnuta
+            # (rejected), rank Context ztratil and skutecny nadpis o par
+            # jednotek dal uz zadny rank Context nemel. Rank Context ted
+            # preziva az to PRVNIHO candidate, which byl skutecne prijat
+            # (pending/low_confidence) — viz vetev nithat.
             continue
 
-        # Kandidát byl přijat (pending/low_confidence) → rank Context je
-        # "spotřebován" a čeká na další rank-label or taxon nadpis.
+        # Candidate byl prijat (pending/low_confidence) → rank Context is
+        # "spotrebovan" and ceka nand others rank-label or taxon nadpis.
         prev_rank = ""
 
         _pid, _pname, _prank = _get_parent_for_rank(rank or "")
@@ -4299,14 +5737,14 @@ def detect_candidates(
     con.commit()
     con.close()
 
-    # ── Druhý pruchod: extrakce bloku a automatické mapování sections ───────────
-    # Pro VŠECHNY nově detekované kandidáty (včetně rejected):
-    #   1. Extrahujeme verbatim blok textu (z již cachovaných text units).
-    #   2. Uložíme block_text přímo do taxon_candidates.
-    #   3. Spustíme auto_map_candidate_fields — vyplníme prázdná pole
-    #      (metoda='auto'); manuálně editovaná pole se nepřepisují.
-    # Text units jsou stále v cache z tohoto volání build_text_units()
-    # → druhý pruchod je výcountně levný.
+    # ── Druhy pruchod: extrakce bloku and automaticke mapping sections ───────────
+    # For All nove detekovane kandidaty (vcetne rejected):
+    #   1. Extract verbatim blok textu (from jiz cachovanych text units).
+    #   2. Ulozime block_text primo to taxon_candidates.
+    #   3. Spustime auto_map_candidate_fields — vyplnime prazdna field
+    #      (metoda='auto'); manualne editovana field neprepisuji.
+    # Text units are stale in cache from tohoto volani build_text_units()
+    # → druhy pruchod is vycountne levny.
     try:
         con2 = db()
         new_cands = con2.execute(
@@ -4314,42 +5752,45 @@ def detect_candidates(
             "WHERE document_id=? ORDER BY unit_index",
             (document_id,)
         ).fetchall()
-        # Zjistit jazyk Documentu pro překladový pruchod
-        doc_lang_row = con2.execute(
-            "SELECT lang FROM documents WHERE id=?", (document_id,)
-        ).fetchone()
-        doc_lang = (doc_lang_row["lang"] or "en") if doc_lang_row else "en"
         con2.close()
 
         n_blocks = 0
-        n_fields = 0
-        n_translated = 0
+        mapped_payloads: Dict[int, Dict[str, str]] = {}
+        block_updates: List[Tuple[str, int]] = []
+        ranks_by_id: Dict[int, str] = {}
+        if new_cands:
+            _ids = [int(r["id"]) for r in new_cands]
+            _ph = ",".join("?" * len(_ids))
+            _cr = db()
+            for _r in _cr.execute(
+                    f"SELECT id,rank_guess FROM taxon_candidates WHERE id IN ({_ph})", _ids).fetchall():
+                ranks_by_id[int(_r["id"])] = str(_r["rank_guess"] or "")
+            _cr.close()
         for cand_row in new_cands:
-            block = extract_block_for_candidate(
-                cand_row["id"], document_id, cand_row["page_start"])
-            if block:
-                con3 = db()
-                con3.execute(
-                    "UPDATE taxon_candidates SET block_text=? WHERE id=? "
-                    "AND (block_text IS NULL OR block_text='')",
-                    (block, cand_row["id"]))
-                con3.commit(); con3.close()
-                n_blocks += 1
-                n_fields += auto_map_candidate_fields(cand_row["id"], block)
+            cid = int(cand_row["id"])
+            block = extract_block_for_candidate(cid, document_id, cand_row["page_start"])
+            if not block:
+                continue
+            block_updates.append((block, cid))
+            n_blocks += 1
+            mapped = map_sections_from_block(block, rank=ranks_by_id.get(cid, "")) or {}
+            mapped_payloads[cid] = {k: v for k, v in mapped.items() if v and str(v).strip()}
 
-                # Přeložit pole LLM, pokud Document není anglicky a je překlad povolen.
-                # Překlad následuje AŽ PO auto_map, aby měl co překládat.
-                n_translated += auto_translate_candidate_fields(
-                    cand_row["id"], doc_lang, settings)
-
+        if block_updates:
+            _bc = db()
+            _bc.executemany(
+                "UPDATE taxon_candidates SET block_text=? WHERE id=? "
+                "AND (block_text IS NULL OR block_text='')", block_updates)
+            _bc.commit(); _bc.close()
+        n_fields = save_fields_batch(mapped_payloads, method="auto_index",
+                                     update_fts=False, update_terms=False,
+                                     write_audit=False, only_empty=True)
         diag["Blocks extracted"] = n_blocks
         diag["Fields auto-mapped"] = n_fields
-        if n_translated:
-            diag["Fields translated"] = n_translated
     except Exception as exc:
         logging.warning(f"Auto-map second pass failed: {exc}")
 
-    # Feature 5: Cross-reference synonym → automatické propojení records
+    # Feature 5: Cross-reference synonym → automaticke propojeni records
     try:
         n_links = _link_synonyms_for_document(document_id)
         if n_links:
@@ -4357,8 +5798,8 @@ def detect_candidates(
     except Exception as _e5:
         logging.warning(f"Synonym linking failed: {_e5}")
 
-    # Post-detekce: auto-reject pre_systematic kandidátu jejichž jméno
-    # se vyskytuje i v systematické zóně → jsou to citační zmínky, ne popisy.
+    # Post-detection: auto-reject pre_systematic kandidatu jejichz name
+    #  vyskytuje i in systematicke zone → are to citacni zminky, ne popisy.
     _duplicates = _pre_sys_seen & _sys_seen
     if _duplicates:
         try:
@@ -4370,8 +5811,8 @@ def detect_candidates(
             _dup_ids = []
             for _dr in _dup_rows:
                 if (_dr["taxon_name"] or "").strip().lower() in _duplicates:
-                    # Candidates s pre_systematic penalizací mají confidence výrazně nižší
-                    # než systematičtí — odmítnout ty s confidence < threshold * 0.75
+                    # Candidates s pre_systematic penalizaci maji confidence vyrazne nizsi
+                    # nez systematicti — odmitnout ty s confidence < threshold * 0.75
                     _dup_ids.append(_dr["id"])
             if _dup_ids:
                 _dup_con.execute(
@@ -4398,23 +5839,25 @@ def _get_pure_label_regex(schema: pd.DataFrame) -> re.Pattern:
     Regex: label na začátku, pak buď jeden z ':'/'.' (b,c), or libovolná
     kombinace mezer/':'/​'.' až do konce řetězce (a).
     """
-    global _PURE_LABEL_RE_CACHE
+    cache_key = id(schema)
     with _SCHEMA_DERIVED_RE_LOCK:
-        if _PURE_LABEL_RE_CACHE is not None:
-            return _PURE_LABEL_RE_CACHE
-        labels = sorted(
-            {str(row.get("label", "")).strip() for _, row in schema.iterrows()
-             if len(str(row.get("label", "")).strip()) >= 4},
-            key=len, reverse=True)
-        if labels:
-            alt = "|".join(re.escape(l) for l in labels)
-            pat = re.compile(
-                r"^(?:" + alt + r")(?:[:.]|[\s:.]*$)",
-                re.IGNORECASE | re.UNICODE)
-        else:
-            pat = re.compile(r"(?!x)x")  # nikdy nic nenajde
-        _PURE_LABEL_RE_CACHE = pat
-        return pat
+        cached = _PURE_LABEL_RE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    labels = sorted(
+        {str(row.get("label", "")).strip() for _, row in schema.iterrows()
+         if len(str(row.get("label", "")).strip()) >= 4},
+        key=len, reverse=True)
+    if labels:
+        alt = "|".join(re.escape(l) for l in labels)
+        pat = re.compile(
+            r"^(?:" + alt + r")(?:[:.]|[\s:.]*$)",
+            re.IGNORECASE | re.UNICODE)
+    else:
+        pat = re.compile(r"(?!x)x")
+    with _SCHEMA_DERIVED_RE_LOCK:
+        _PURE_LABEL_RE_CACHE[cache_key] = pat
+    return pat
 
 
 def _is_pure_section_label(line: str, schema: pd.DataFrame) -> bool:
@@ -4475,8 +5918,8 @@ def extract_block_for_candidate(
         con.close()
         return ""
 
-    # Všichni kandidáti Documentu seřazení podle unit_index (= pořadí v textu).
-    # 'rejected' se VYNECHÁVÁ (nejsou hranicí), all ostatní SE POČÍTÁ.
+    # Vsichni kandidati Documentu serazeni podle unit_index (= poradi in textu).
+    # 'rejected' VYNECHAVA (nejsou hranici), all ostatni POCITA.
     all_cands = con.execute(
         """SELECT id, unit_index FROM taxon_candidates
            WHERE document_id=? AND status != 'rejected'
@@ -4492,8 +5935,8 @@ def extract_block_for_candidate(
     if not has_pages:
         return ""
 
-    # Fallback pro staré záznamy bez unit_index (zpětná kompatibilita
-    # s kandidáty vytvořenými před zavedením tohoto pole, unit_index=-1)
+    # Fallback for stare records without unit_index (zpetna kompatibilita
+    # s kandidaty vytvorenymi before zavedenim tohoto field, unit_index=-1)
     if cand["unit_index"] is None or cand["unit_index"] < 0:
         con = db()
         pages_rows = con.execute(
@@ -4504,16 +5947,16 @@ def extract_block_for_candidate(
         con.close()
         return _extract_block_legacy_substring(cand, all_cands, pages_rows)
 
-    # Text units z per-Documentové cache — dřív se tu volalo
-    # build_text_units(pages_obj) ZNOVU při KAŽDÉM volání této funkce,
-    # takže hromadné schválení 50 kandidátu re-segmentovalo Document 50×.
+    # Text units from per-Documentove cache — driv tu volalo
+    # build_text_units(pages_obj) ZNOVU on EVERY call teto function,
+    # takthat hromadne schvaleni 50 kandidatu re-segmentovalo Document 50×.
     units = get_cached_text_units(document_id)
 
     my_idx = cand["unit_index"]
     if my_idx >= len(units):
         return ""
 
-    # Najít unit_index předchozího a dalšího kandidáta (ohraničí blok)
+    # Najit unit_index predchoziho and othersho candidate (ohranici blok)
     cand_unit_indices = sorted(r["unit_index"] for r in all_cands if r["unit_index"] is not None and r["unit_index"] >= 0)
     next_idx = None
     prev_idx = None
@@ -4523,9 +5966,9 @@ def extract_block_for_candidate(
         if ui < my_idx:
             prev_idx = ui
 
-    # Pohltit bezprostředně PŘEDCHÁZEJÍCÍ "Class:"/"Order:"/"Family:" labely —
-    # patří logicky k TOMUTO (genus-level) nadpisu, ne k předchozímu záznamu
-    # (viz vzor: "Family: GRACILITHECIDAE Sysoev, 1972" patří k rodu Gracilitheca).
+    # Pohltit bezprostredne PREDCHAZEJICI "Class:"/"Order:"/"Family:" labely —
+    # patri logicky k TOMUTO (genus-level) nadpisu, ne k predchozimu zaznamu
+    # (viz pattern: "Family: GRACILITHECIDAE Sysoev, 1972" patri k genusu Gracilitheca).
     start_idx = my_idx
     lower_bound = (prev_idx + 1) if prev_idx is not None else 0
     while (start_idx - 1 >= lower_bound and
@@ -4535,42 +5978,42 @@ def extract_block_for_candidate(
     end_slice = next_idx if next_idx is not None else len(units)
     block_units = units[start_idx:end_slice]
 
-    # Vyfiltrovat popisky obrázku/tabulek a OCR šum z map/legend/diagramu
-    # PŘÍMO z obsahu bloku — ne jen z kandidátní detekce. Vlastní nadpis
-    # taxonu (na pozici heading_rel_idx, NE nutně na indexu 0 — viz pohlcení
-    # předcházejících Class:/Order:/Family: labels výše) se NIKDY nefiltruje.
+    # Vyfiltrovat popisky obrazku/tabulek and OCR sum from map/legend/diagramu
+    # PRIMO from obsahu bloku — ne only from kandidatni detection. Vlastni nadpis
+    # taxonu (on pozici heading_rel_idx, NE nutne on indexu 0 — viz pohlceni
+    # predchazejicich Class:/Order:/Family: labels vyse) NIKDY nefiltruje.
     heading_rel_idx = my_idx - start_idx
     kept_units = []
     for i, u in enumerate(block_units):
         if i == heading_rel_idx:
-            kept_units.append(u)   # nadpis taxonu vždy zachovat
+            kept_units.append(u)   # nadpis taxonu vzdy zachovat
             continue
         stripped = u.text.strip()
         _unit_flags = set(f for f in u.zone_flags.split(",") if f)
         if "book_index" in _unit_flags or "document_index" in _unit_flags:
-            continue   # rejstřík/obsah Documentu nepatří do taxonomického bloku
+            continue   # rejstrik/obsah Documentu nebelongs in taxonomickeho bloku
         if CAPTION_RE.match(stripped):
-            continue   # popisek obrázku/tabulky/desky
+            continue   # popisek obrazku/tabulky/desky
         if _garbage_penalty(u.text) <= -0.35:
-            continue   # OCR šum z map/legend/diagramu
+            continue   # OCR sum from map/legend/diagramu
         if BOILERPLATE_RE.search(stripped):
-            continue   # nakladatelský balast / běžící záhlaví
+            continue   # nakladatelsky balast / bezici zahlavi
         if len(stripped) < 5:
-            continue   # zbytkové OCR smetí ("bt", "7)" apod.)
+            continue   # zbytkove OCR smeti ("bt", "7)" apod.)
         kept_units.append(u)
 
-    # Posledních 1-3 jednotky END_SLICE jsou "Class:"/"Order:"/"Family:" labely,
-    # které předcházejí DALŠÍMU (genus-level) kandidátovi — patří logicky k NĚMU,
-    # ne k aktuálnímu bloku (viz vzor: "Family: GRACILITHECIDAE Sysoev, 1972"
-    # patří k záznamu rodu Gracilitheca, ne k předchozímu druhu).
+    # Poslednich 1-3 jednotky END_SLICE are "Class:"/"Order:"/"Family:" labely,
+    # which predchazeji DALSIMU (genus-level) kandidatovi — logically belongs to IT,
+    # ne k aktualnimu bloku (viz pattern: "Family: GRACILITHECIDAE Sysoev, 1972"
+    # patri k zaznamu genusu Gracilitheca, ne k predchozimu druhu).
     while (len(kept_units) > 1 and
            _RANK_PREFIX_LABEL_RE.match(kept_units[-1].text.strip())):
         kept_units.pop()
 
     result = "\n\n".join(u.text for u in kept_units).strip()
 
-    # Save block_end_page = poslední stránka bloku, aby PDF viewer zobrazil
-    # allchny stránky záznamu (vícestránkové záznamy).
+    # Save block_end_page = posledni stranka bloku, so that PDF viewer zobrazil
+    # allchny pages zaznamu (vicestrankove records).
     if kept_units:
         _blk_end_pg = max(u.page_number for u in kept_units)
         _blk_start_pg = int(cand["page_start"] or 1)
@@ -4584,15 +6027,15 @@ def extract_block_for_candidate(
             except Exception:
                 pass
 
-    # Tvrdá hranice: blok NIKDY nesmí přetéct do Acknowledgements/References.
+    # Tvrda hranice: blok NIKDY nesmi pretect to Acknowledgements/References.
     m = END_REGION_RE.search(result)
     if m and m.start() > 50:
         result = result[:m.start()].rstrip()
 
-    # Odstraň Cambridge Core / DOI bannerové řádky z bloku — jsou to
-    # artefakty stahování PDF z webu ("https://doi.org/… Downloaded from
-    # https://www.cambridge.org/core IP address:…") které se přimíchají
-    # do textu, když PyMuPDF čte PDF s URL na každé stránce.
+    # Remove Cambridge Core / DOI bannerove lines from bloku — are to
+    # artefakty stahovani PDF from webu ("https://doi.org/… Downloaded from
+    # https://www.cambridge.org/core IP address:…") which primichaji
+    # to textu, when PyMuPDF cte PDF s URL on kazde page.
     _URL_LINE_RE = re.compile(
         r"^https?://\S+.*$|"
         r"^.*cambridge\.org/core.*$|"
@@ -4602,8 +6045,8 @@ def extract_block_for_candidate(
     result = _URL_LINE_RE.sub("", result)
     result = re.sub(r"\n{3,}", "\n\n", result).strip()
 
-    # Normalizuj typografické varianty labels i v saveeném bloku
-    # (aby byl DB text čistý pro manuální prohlížení i re-mapping)
+    # Normalizuj typograficke varianty labels i in saveenem bloku
+    # (so that byl DB text cisty for manualni prohlithatni i re-mapping)
     result = _normalize_label_variants(result)
 
     return result
@@ -4616,15 +6059,13 @@ def _extract_block_legacy_substring(cand, all_cands, pages_rows) -> str:
     používají přesnou unit_index metodu výše.
     """
     cand_ids = [r["id"] for r in all_cands]
-    try:
-        idx = cand_ids.index(cand["id"])
-    except ValueError:
+    if cand["id"] not in cand_ids:
         return ""
 
     start_page = cand["page_start"]
     end_page = None
-    # Bez unit_index nelze spolehlivě najít "dalšího" kandidáta podle pořadí;
-    # použijeme nejbližší vyšší page_start jako hrubý odhad.
+    # Without unit_index nelze spolehlive najit "dalsiho" candidate podle poradi;
+    # pouzijeme nejblizsi vyssi page_start as hruby odhad.
     con = db()
     next_row = con.execute(
         """SELECT page_start FROM taxon_candidates
@@ -4662,10 +6103,10 @@ def _extract_block_legacy_substring(cand, all_cands, pages_rows) -> str:
 # SECTION MAPPING  (TSV-driven)
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Synonymický year-line: "1891 Hyolithes signatulus NOV.; ..."
-# Používá se v map_sections_from_block() pro auto-detekci synonymiky v blocích,
-# kde missing explicitní label "Synonymy:" (typically starší literatury).
-# Podmínka: 4-místný rok + mezera + Velké písmeno + mezera + malé písmeno.
+# Synonymicky year-line: "1891 Hyolithes signatulus NOV.; ..."
+# Pouziva in map_sections_from_block() for auto-detekci synonymiky in blocich,
+# kde missing explicitni label "Synonymy:" (typically older literatury).
+# Podminka: 4-mistny year + mezera + Velke pismeno + mezera + male pismeno.
 _SYNONYMY_YEAR_LINE_RE = re.compile(
     r"(?m)^(\d{4})\s+"
     r"[A-ZÁČĎÉĚÍŇÓŘŠŤÚŮÝŽÄÖÜÀÂÆÇÈÊËÎÏÔÙÛÜ]"
@@ -4681,11 +6122,11 @@ def _get_label_only_pattern(schema: pd.DataFrame) -> Optional[re.Pattern]:
     them (usedoužívá se k vkládání \\n před labely uprostřed odstavce). Invalidace
     přes reload_schema → _invalidate_schema_derived_regex_cache.
     """
-    global _LABEL_ONLY_PAT_CACHE
+    cache_key = id(schema)
     with _SCHEMA_DERIVED_RE_LOCK:
-        if _LABEL_ONLY_PAT_CACHE is not None:
-            # Sentinel: prázdný never-match znamená "spočítáno, ale žádné labely"
-            return _LABEL_ONLY_PAT_CACHE if _LABEL_ONLY_PAT_CACHE.pattern != "(?!x)x" else None
+        cached = _LABEL_ONLY_PAT_CACHE.get(cache_key)
+    if cached is not None:
+        return cached if cached.pattern != "(?!x)x" else None
     pat: Optional[re.Pattern] = None
     try:
         has_lr = "label_regex" in schema.columns
@@ -4709,12 +6150,12 @@ def _get_label_only_pattern(schema: pd.DataFrame) -> Optional[re.Pattern]:
         _tmp.sort(key=lambda x: (x[0], x[1]), reverse=True)
         label_parts = [x[2] for x in _tmp]
         if label_parts:
-            # Robustní detekce labelu UPROSTŘED odstavce (typický OCR artefakt
-            # kde missing zalomení: "…concave.Description: conch straight…").
-            # Podmínky (aby se předešlo falešným pozitivum):
-            #  - před labelem je věta-ukončující interpunkce [.!?;)] (0-3 mezer)
-            #  - PO labelu MUSÍ následovat dvojtečka / em-dash / en-dash
-            #    (silný signál nadpisu; brání matchování prózových slov)
+            # Robustni detection labelu UPROSTRED odstavce (typical OCR artefact
+            # kde missing zalomeni: "…concave.Description: conch straight…").
+            # Podminky (so that predeslo falesnym pozitivum):
+            #  - before labelem is veta-ukoncujici interpunkce [.!?;)] (0-3 mezer)
+            #  - After labelu Must nasledovat dvojtecka / em-dash / en-dash
+            #    (silny signal nadpisu; brani matchovani prozovych slov)
             pat = re.compile(
                 r"(?<!\n)(?<!\A)"
                 r"(?P<delim>[.!?;)\u3002\uff01\uff1f\uff1b\uff0c]\s{0,3})"
@@ -4725,8 +6166,102 @@ def _get_label_only_pattern(schema: pd.DataFrame) -> Optional[re.Pattern]:
     except Exception:
         pat = None
     with _SCHEMA_DERIVED_RE_LOCK:
-        _LABEL_ONLY_PAT_CACHE = pat if pat is not None else re.compile(r"(?!x)x")
+        _LABEL_ONLY_PAT_CACHE[cache_key] = pat if pat is not None else re.compile(r"(?!x)x")
     return pat
+
+
+# ── Predkompilovane patterny for _normalize_label_variants (sekce 6–8) ──────────
+# Kompilace jednou at module level: _normalize_label_variants bezi for each
+# blok kazdeho candidate (desitky–stovky volani on document), takthat inline
+# re.sub s retezcovym patternem by pattern zbytecne rekompiloval.
+
+# Prostrkana cyrilska pismena: „Д и а г н о з" → „Диагноз" (≥3 jednotkova + 1).
+_CYR_SPACED_1_RE = re.compile(
+    r"(?<![\u0400-\u04ff])([\u0400-\u04ff] ){3,}[\u0400-\u04ff](?![\u0400-\u04ff])")
+_CYR_SPACED_2_RE = re.compile(
+    r"(?<![\u0400-\u04ff])([\u0400-\u04ff]  ){2,}[\u0400-\u04ff](?![\u0400-\u04ff])")
+
+# Konsolidovana OCR-repair tabulka ruskych sekcnich labelu. Pokryva tri tridy
+# poskozeni naraz: (and) odtrthatne/zvetsene koncove pismeno („Диагно З."),
+# (b) prostrkani after jednotlivych pismenech („Д и а г н о з"), (c) slepena
+# dvouslovna navesti („Типовоивид"). Vse kotveno on zacatek radku, nahrada
+# kanonickou podobou labelu, kterou zna section_schema.tsv.
+_RU_LABEL_REPAIRS = [
+    (re.compile(r"(?im)^\s*Д\s*и\s*а\s*г\s*н\s*о\s*[зЗ](?=[\s.\u0410-\u044f]|$)"), "Диагноз"),
+    (re.compile(r"(?im)^\s*О\s*п\s*и\s*с\s*а\s*н\s*и\s*[еЕ](?=[\s.\u0410-\u044f]|$)"), "Описание"),
+    (re.compile(r"(?im)^\s*С\s*р\s*а\s*в\s*н\s*е\s*н\s*и\s*[еЕ](?=[\s.\u0410-\u044f]|$)"), "Сравнение"),
+    (re.compile(r"(?im)^\s*З\s*а\s*м\s*е\s*ч\s*а\s*н\s*и\s*[яЯ](?=[\s.\u0410-\u044f]|$)"), "Замечания"),
+    (re.compile(r"(?im)^\s*М\s*а\s*т\s*е\s*р\s*и\s*а\s*л(?=[\s.\u0410-\u044f]|$)"), "Материал"),
+    (re.compile(r"(?im)^\s*С\s*о\s*с\s*т\s*а\s*[вВ](?=[\s.\u0410-\u044f]|$)"), "Состав"),
+    (re.compile(r"(?im)^\s*Р\s*а\s*з\s*м\s*е\s*р\s*ы(?=[\s.\u0410-\u044f]|$)"), "Размеры"),
+    (re.compile(r"(?im)^\s*Типово\s*й\s*вид\b"), "Типовой вид"),
+    (re.compile(r"(?im)^\s*Типовойвид\b"), "Типовой вид"),
+    (re.compile(r"(?im)^\s*Типово\s*й\s*род\b"), "Типовой род"),
+    (re.compile(r"(?im)^\s*Типовойрод\b"), "Типовой род"),
+]
+
+# OCR-repair francouzskych navesti (Barrande 1867): „Rapp. et di-fier.",
+# „Gisem1. et local." — prvni slovo citelne, zbytek rozbity; kotveno on
+# zacatek radku, nahrada kanonickou variantou from schematu.
+_FR_LABEL_CHARS = r"[a-z\u00c0-\u024f0-9.\u2022\u00b7\-]"
+_FR_RAPP_RE = re.compile(rf"(?im)^\s*Rapp{_FR_LABEL_CHARS}*\.?\s*et\s*{_FR_LABEL_CHARS}+\.")
+_FR_GISEM_RE = re.compile(rf"(?im)^\s*Gisem{_FR_LABEL_CHARS}*\.?\s*et\s*{_FR_LABEL_CHARS}+\.")
+
+# Odkaz on tabuli/figuru on ZACATKU textu (for rozklad REST → FIGURES).
+# Robustni vuci OCR: odkaz is souvisly uvodni usek slothatny vyhradne from
+# "figurovych" tokenu — navesti (Pl./Plate/Text-fig/Табл./Taf./OCR tig./
+# tabl. …), cisel, rozsahu ("1-12", "3And-B"), rimskych cislic, jednotlivych
+# pismen and interpunkce. Skonci, jakmile zacne bezne slovo (≥3 mala pismena,
+# jez neni figurove navesti). Detekci provadi _split_leading_figure_ref().
+_FIG_LABEL_TOKEN_RE = re.compile(
+    r"^(?:pl|plate|planche|tab|tabl|tabel|tafel|taf|taft|tafl|tall|tah|"
+    r"pi|pls|"                        # Pi. = older ceska/latinska zkratka for Plate
+    r"текст|табл|text|text-?fig|text-?figs|text-?figure|text-?figures|"
+    r"fig|figs|figure|figures|tig|tigs|фиг|рис)\.?$",
+    re.IGNORECASE)
+_FIG_VALUE_TOKEN_RE = re.compile(
+    r"^(?:[IVXLCХІ]+|\d+[A-Za-z]?|[A-Za-z])"
+    r"(?:[-\u2013](?:[IVXLCХІ]+|\d+[A-Za-z]?|[A-Za-z]))?[.,;:]*$",
+    re.UNICODE)
+
+# Referencni/synonymicky line "Rod druh: Autor, year…" (EN/RU), tolerantni
+# vuci OCR in roce and jmene authora. Slouzi k rozpoznani, that REST is fakticky
+# blok bibliografickych referenci (→ SYNONYMY), ne popis.
+_REST_REFERENCE_LINE_RE = re.compile(
+    r"[A-ZА-ЯЁ][A-Za-zА-Яа-яёäöü.]*\s+[a-zа-яё]{2,}\s*:\s*"
+    r"[A-ZА-ЯЁ][A-Za-zА-Яа-яёäöü.]+",
+    re.UNICODE)
+
+def _split_leading_figure_ref(text: str) -> Tuple[str, str]:
+    """
+    Rozdělí text na (figure_reference, zbytek). Prochází tokeny od začátku;
+    dokud jsou to figurová návěští / čísla / rozsahy / interpunkce, patří do
+    odkazu. Vrací ("", text) pokud text odkazem nezačíná.
+    """
+    # tokenizace zachovanim pozice: pracujeme nad slovy oddelenymi mezerami
+    toks = text.split()
+    if not toks:
+        return "", text
+    n_taken = 0
+    saw_label = False
+    saw_value = False
+    for tok in toks:
+        core = tok.strip("([{)]}")
+        if _FIG_LABEL_TOKEN_RE.match(core):
+            saw_label = True
+            n_taken += 1
+            continue
+        if _FIG_VALUE_TOKEN_RE.match(core) or core in {"-", "\u2013", "&", "and", "et"}:
+            saw_value = True
+            n_taken += 1
+            continue
+        break
+    # vyzaduj aspon jedno navesti + jednu hodnotu (jinak to neni odkaz)
+    if not (saw_label and saw_value) or n_taken == 0:
+        return "", text
+    fig = " ".join(toks[:n_taken]).strip(" .,;:\u2013-")
+    rest = " ".join(toks[n_taken:]).strip()
+    return fig, rest
 
 
 def _normalize_label_variants(text: str) -> str:
@@ -4742,32 +6277,33 @@ def _normalize_label_variants(text: str) -> str:
       • „ﬁgure" → „figure" — typografické ligatury
       • „De\u00adscription" — soft-hyphen (neviditelný v textu, rozbije matching)
     """
-    # 1. OCR/PDF ligatury + ® artefakt (starý OCR nahrazoval ﬁ znakem ®)
+    # 1. OCR/PDF ligatury + ® artefakt (old OCR nahrazoval ﬁ znakem ®)
     _LIG = [("ﬁ","fi"),("ﬂ","fl"),("ﬀ","ff"),("ﬃ","ffi"),("ﬄ","ffl"),
             ("ﬅ","st"),("ﬆ","st"),("Ꜳ","AA"),("ꜳ","aa"),("Ǳ","DZ"),("ǲ","Dz"),
             ("ǳ","dz"),("ĳ","ij"),("Ĳ","IJ"),("ŉ","nʼ")]
     # ® (U+00AE) jako OCR artefakt za ﬁ ligaturou: "dif®culties" → "difficulties"
-    # Bezpečné: ® uvnitř slova je vždy OCR chyba; skutečný znak ® je vždy osamocený.
+    # Bezpecne: ® uvnitr slova is vzdy OCR chyba; skutecny znak ® is vzdy osamoceny.
     text = re.sub(r"(?<=[A-Za-z])®(?=[A-Za-z])", "fi", text)
-    # Opravit i ¬ (U+00AC, NOT sign) — v PDF se občas zaměnil za - or ﬁ
+    # Fixest i ¬ (U+00AC, NOT sign) — in PDF obcas zamenil za - or ﬁ
     text = re.sub(r"(?<=[A-Za-z])¬(?=[A-Za-z])", "-", text)
     for src, dst in _LIG:
         text = text.replace(src, dst)
 
-    # 2. Soft-hyphen (U+00AD) — neviditelný rozbíječ slov
+    # 2. Soft-hyphen (U+00AD) — neviditelny rozbijec slov
     text = text.replace("\u00ad", "")
 
-    # 3. Hyphenation na konci řádku uvnitř slova:
+    # 3. Hyphenation on konci radku uvnitr slova:
     #    „Descrip-\ntion" → „Description"
-    #    Jen lowercase continuation (ne věta za pomlčkou)
+    #    Only lowercase continuation (ne veta za pomlckou)
     text = re.sub(r"([A-Za-záčďéěíňóřšťúuýžäöüàâèêëîïôùûü])-\n([a-záčďéěíňóřšťúuýžäöüàâèêëîïôùûü])",
                   r"\1\2", text)
 
     # 4. Spaced single letters: „D i a g n o s i s" → „Diagnosis"
-    #    Podmínka: ≥3 jednotková slova + 1 závěrečné (celkem ≥4 písmena)
-    #    → kratší sekvence (n sp., U S A) jsou bezpečně přeskočeny
+    #    Podminka: ≥3 jednotkova slova + 1 zaverecne (celkem ≥4 pismena)
+    #    → kratsi sekvence (n sp., U S And) are bezpecne preskoceny
+    # Pokryva latinku + diakritiku (sv a/o/a, fr e/e/a, de a/o/u, cs c/s/z)
     text = re.sub(
-        r"(?<![A-Za-z\u00c0-\u024f])([A-Za-z] ){3,}[A-Za-z](?![A-Za-z\u00c0-\u024f])",
+        r"(?<![A-Za-z\u00c0-\u024f])([A-Za-z\u00c0-\u024f] ){3,}[A-Za-z\u00c0-\u024f](?![A-Za-z\u00c0-\u024f])",
         lambda m: m.group(0).replace(" ", ""), text)
 
     # 4b. Double-spaced: „D  i  a  g" → „Diag"
@@ -4776,16 +6312,51 @@ def _normalize_label_variants(text: str) -> str:
         lambda m: re.sub(r" {2}", "", m.group(0)), text)
 
     # 4c. ALL-CAPS word-chunks: „STRA TI GRA PHY" → „STRATIGRAPHY"
-    #     Artefakt z PDF 2-column layoutu. Podmínka: ≥3 ALL-CAPS tokeny.
+    #     Artefakt from PDF 2-column layoutu. Podminka: ≥3 ALL-CAPS tokeny.
     text = re.sub(
         r"(?<![A-Za-z])([A-Z]{2,} ){2,}[A-Z]{2,}(?![a-z])",
         lambda m: m.group(0).replace(" ", ""), text)
 
     # 5. Dotted single letters: „D.i.a.g.n.o.s.i.s." → „Diagnosis"
-    #    Podmínka: ≥4 X. skupiny (U.S.A. = 3 → bezpečně přeskočeno)
+    #    Podminka: ≥4 X. skupiny (U.S.And. = 3 → bezpecne preskoceno)
     text = re.sub(
         r"(?<![A-Za-z])([A-Za-z]\.){4,}[A-Za-z]\.?(?![A-Za-z])",
         lambda m: re.sub(r"\.", "", m.group(0)), text)
+
+    # 6. Spaced single CYRILLIC letters: prostrkane ruske nadpisy sekci
+    #    (Sysoev, Meskova) -> "Диагноз/Описание/Сравнение/Состав/Материал".
+    #    Bez tohoto kroku spadnou vsechna pole ruskych zaznamu do REST.
+    text = _CYR_SPACED_1_RE.sub(lambda m: m.group(0).replace(" ", ""), text)
+    text = _CYR_SPACED_2_RE.sub(lambda m: re.sub(r" {2}", "", m.group(0)), text)
+
+    # 7. OCR-repair francouzskych navesti (Barrande 1867). Viz _FR_*_RE.
+    text = _FR_RAPP_RE.sub("Rapports et différences.", text)
+    text = _FR_GISEM_RE.sub("Gisement et localité.", text)
+
+    # 8. OCR-repair ruskych sekcnich navesti (Sysoev, Meskova) — odtrthatne/
+    #    prostrkane/slepene labely vyssich taxonu. Viz _RU_LABEL_REPAIRS.
+    for _rx, _repl in _RU_LABEL_REPAIRS:
+        text = _rx.sub(_repl, text)
+
+    # 9. (sekce 4 nyni pokryva i diakritiku — svedsky despacing is tam integrovan)
+
+    # 10. Botanicke nomenklaturni zkratky: normalizace variant (OCR + rukopis).
+    #    "comb.nov." / "comb nov" / "comb. nov" → "comb. nov."
+    #    Kotvime lookbehind/lookahead, so that nepridavala tecka za existujici tecku.
+    def _nom_abbr(pattern: str, replacement: str, t: str) -> str:
+        t = re.sub(pattern, replacement, t, flags=re.IGNORECASE)
+        # odstranit duplicitni tecku: "comb. nov.." → "comb. nov."
+        t = re.sub(r"(nov|cons|illeg|nud|inval|rej)\.\.", r"\1.", t, flags=re.IGNORECASE)
+        return t
+
+    text = _nom_abbr(r"\bcomb\.?\s*nov\.?", "comb. nov.", text)
+    text = _nom_abbr(r"\bstat\.?\s*nov\.?", "stat. nov.", text)
+    text = _nom_abbr(r"\bnom\.?\s*nov\.?", "nom. nov.", text)
+    text = _nom_abbr(r"\bnom\.?\s*cons\.?", "nom. cons.", text)
+    text = _nom_abbr(r"\bnom\.?\s*illeg\.?", "nom. illeg.", text)
+    text = _nom_abbr(r"\bnom\.?\s*nud\.?", "nom. nud.", text)
+    text = _nom_abbr(r"\bnom\.?\s*inval\.?", "nom. inval.", text)
+    text = _nom_abbr(r"\bnom\.?\s*rej\.?", "nom. rej.", text)
 
     return text
 
@@ -4810,24 +6381,24 @@ def map_sections_from_block(block_text: str, rank: str = "") -> Dict[str, str]:
     schema = load_schema()
     sec_re, label_to_field = build_section_regex(schema)
 
-    # ── Pre-processing: vložit \\n před labely uprostřed odstavce ────────────
-    # Bez tohoto kroku by label uvnitř věty (bez preceding newline) nebyl
-    # rozpoznán regexem sec_re (který vyžaduje ^|\\n před labelem).
-    # Regex se cachuje (viz _LABEL_ONLY_PAT_CACHE) — dřív se přestavoval
-    # při KAŽDÉM volání (1300+ labels → drahá kompilace na každý blok).
+    # ── Pre-processing: vlozit \\n before labely uprostred odstavce ────────────
+    # Without tohoto kyearu by label uvnitr vety (without preceding newline) nebyl
+    # rozpoznan regexem sec_re (which vyzaduje ^|\\n before labelem).
+    # Regex cachuje (viz _LABEL_ONLY_PAT_CACHE) — driv prestavoval
+    # on EVERY call (1300+ labels → draha kompilace on each blok).
     _label_only_pat = _get_label_only_pattern(schema)
 
-    # ── KROK 0: Normalizace typografických variant labels ────────────────────
-    # Musí proběhnout PŘED vším ostatním (boilerplate strip, label_only_pat).
+    # ── KROK 0: Normalizace typografickych variant labels ────────────────────
+    # Must probehnout Before vsim ostatnim (boilerplate strip, label_only_pat).
     block_text = _normalize_label_variants(block_text)
 
     # ── Strip embedded publication interruptions ─────────────────────────────
-    # Záhlaví stránek, čísla pages a jiný boilerplate vložený uprostřed bloku
-    # rozbijí detekci labels — "Description:" za "210\nM. Valent / Annales..."
-    # není nalezeno, protože regex vidí pouze předchozí newline.
+    # Zahlavi stranek, cisla pages and jiny boilerplate vlothatny uprostred bloku
+    # rozbiji detekci labels — "Description:" za "210\nM. Valent / Annales..."
+    # neni nalezeno, because regex vidi only predchozi newline.
     _block_boilerplate_res = [
-        re.compile(r"(?m)^\s*\d{1,4}\s*$"),                         # holé číslo pagesy
-        re.compile(r"(?m)^.{2,40}/\s*.{5,60}\(\d{4}\)\s*\d+.*$"),  # "Autor / Časopis (rok) str."
+        re.compile(r"(?m)^\s*\d{1,4}\s*$"),                         # hole cislo pagesy
+        re.compile(r"(?m)^.{2,40}/\s*.{5,60}\(\d{4}\)\s*\d+.*$"),  # "Autor / Casopis (year) str."
         re.compile(r"(?im)^(centre de conservation|département du rh|cahiers scientifiques"
                    r"|citer ce document|fichier pdf|author.s personal copy"
                    r"|downloaded from|copyright ©|all rights reserved"
@@ -4842,7 +6413,7 @@ def map_sections_from_block(block_text: str, rank: str = "") -> Dict[str, str]:
     processed = re.sub(r"\n{3,}", "\n\n", processed)
 
     if _label_only_pat:
-        # Vložit \n před label — ale zachovat délky (neměnit obsah)
+        # Vlozit \n before label — but zachovat delky (nemenit obsah)
         processed = _label_only_pat.sub(
             lambda m: m.group("delim") + "\n" + m.group("label") + m.group("sep"),
             processed
@@ -4857,34 +6428,45 @@ def map_sections_from_block(block_text: str, rank: str = "") -> Dict[str, str]:
         if field:
             positions.append((m.start(1), field, m.end(), label))
 
-    # ── Synonymy heuristika: detekce bloku začínajících rokem ───────────────
-    # Pokud schema nenašlo žádný "Synonymy:" label, ale v bloku jsou řádky
-    # formátu "1891 Hyolithes signatulus NOV.; ..." (year-lines), injektujeme
-    # pozici jako SYNONYMY bez labelu — tak text se správně přiřadí.
+    # ── Synonymy heuristika: detection bloku zacinajicich yearem ───────────────
+    # If schema nenaslo zadny "Synonymy:" label, but in bloku are lines
+    # formatu "1891 Hyolithes signatulus NOV.; ..." (year-lines), injektujeme
+    # pozici as SYNONYMY without labelu — tak text spravne priradi.
     #
-    # Podmínky pro injekci (ochrana před falešnými pozitivy):
-    #   A) ≥2 year-lines → jednoznačný synonymický blok (i krátká synonymika)
-    #   B) 1 year-line AND odpovídá přísnějšímu SYNONYMY_LINE_RE (má pl./fig./p.)
+    # Podminky for injekci (ochrana before falesnymi pozitivy):
+    #   And) ≥2 year-lines → jednoznacny synonymicky blok (i kratka synonymika)
+    #   B) 1 year-line AND odpovida prisnejsimu SYNONYMY_LINE_RE (ma pl./fig./p.)
     has_synonymy_label = any(f == "SYNONYMY" for _, f, _, _ in positions)
     if not has_synonymy_label:
         yr_matches = list(_SYNONYMY_YEAR_LINE_RE.finditer(processed))
         strict_matches = [m for m in SYNONYMY_LINE_RE.finditer(processed)]
         ru_matches = list(SYNONYMY_LINE_RE_RU.finditer(processed))
-        # P 3.3: přísnější heuristika — ≥5 year-lines bez labelu, or ≥2 na začátku bloku
+        # P 3.3: prisnejsi heuristika — ≥5 year-lines without labelu, or ≥2 on zacatku bloku
         _first_pos = yr_matches[0].start(1) if yr_matches else 9999
-        _at_start   = _first_pos < 80                      # první year-line blízko začátku bloku
+        _at_start   = _first_pos < 80                      # prvni year-line blizko zacatku bloku
+        # Prisny SYNONYMY_LINE_RE (vyzaduje pl./fig./p. za yearem) on zacatku
+        # bloku is silny signal i for jedinou citaci — pokryva case B).
+        _strict_at_start = bool(strict_matches) and strict_matches[0].start() < 80
         inject_synonymy = (
-            len(yr_matches) >= 5                                    # EN/CS: ≥5 year-lines (méně FP)
-            or (_at_start and len(yr_matches) >= 2)                 # na začátku bloku: ≥2 stačí
-            or (len(yr_matches) >= 2 and not positions)             # celý blok = jen synonymy
+            len(yr_matches) >= 5                                    # EN/CS: ≥5 year-lines (mene FP)
+            or (_at_start and len(yr_matches) >= 2)                 # on zacatku bloku: ≥2 staci
+            or (len(yr_matches) >= 2 and not positions)             # cely blok = only synonymy
+            or (_strict_at_start and len(strict_matches) >= 1)      # B) 1 prisna citace on zacatku
             or len(ru_matches) >= 3                                  # RU: ≥3 citace
         )
         if inject_synonymy:
-            first_yr_pos = yr_matches[0].start(1)
-            # Injektujeme jen pokud je year-line před existujícími pozicemi
-            # NEBO pokud positions je prázdné (celý blok je synonymika).
-            if not positions or first_yr_pos < positions[0][0]:
-                # text_start = first_yr_pos: rok je součástí obsahu synonymie
+            # first_yr_pos: preferuj year-line; if zadna neni, pouzij
+            # zacatek prvni prisne citace (case B without detekovane year-line).
+            if yr_matches:
+                first_yr_pos = yr_matches[0].start(1)
+            elif strict_matches:
+                first_yr_pos = strict_matches[0].start()
+            else:
+                first_yr_pos = None
+            # Injektujeme only if is year-line before existujicimi pozicemi
+            # Or if positions is prazdne (cely blok is synonymika).
+            if first_yr_pos is not None and (not positions or first_yr_pos < positions[0][0]):
+                # text_start = first_yr_pos: year is soucasti obsahu synonymie
                 positions.append((first_yr_pos, "SYNONYMY", first_yr_pos, "Synonymy"))
 
     if not positions:
@@ -4892,10 +6474,10 @@ def map_sections_from_block(block_text: str, rank: str = "") -> Dict[str, str]:
 
     positions.sort(key=lambda x: x[0])
 
-    # ── Deduplikace + řešení překryvu ────────────────────────────────────────
-    # 1) Stejná pozice + pole → zachovat jednu.
-    # 2) Překrývající se labely (start2 spadá do labelu1) → zachovat DELŠÍ label
-    #    (specifičtější: "Type species" > "Type", "Stratigraphic range and
+    # ── Deduplikace + reseni prekryvu ────────────────────────────────────────
+    # 1) Stejna pozice + field → zachovat jednu.
+    # 2) Prekryvajici labely (start2 spada to labelu1) → zachovat DELSI label
+    #    (specifictejsi: "Type species" > "Type", "Stratigraphic range and
     #    distribution" > "Stratigraphic range").
     seen_pos = set()
     dedup_positions = []
@@ -4904,20 +6486,20 @@ def map_sections_from_block(block_text: str, rank: str = "") -> Dict[str, str]:
         if key not in seen_pos:
             seen_pos.add(key)
             dedup_positions.append(p)
-    # Overlap resolution: procházet seřazené, zahodit kratší label který
-    # začíná uvnitř textového rozsahu předchozího labelu (do jeho text_startu).
+    # Overlap resolution: prochazet serazene, zahodit kratsi label which
+    # zacina uvnitr textoveho rozsahu predchoziho labelu (to jeho text_startu).
     _resolved: List[Tuple[int, str, int, str]] = []
     for p in dedup_positions:
         _pos, _field, _ts, _label = p
         if _resolved:
             _lp, _lf, _lts, _ll = _resolved[-1]
-            # Pokud tento label začíná ještě uvnitř labelu předchozího
-            # (tzn. jsou to konkurenční varianty téhož místa)
+            # If this label zacina jeste uvnitr labelu predchoziho
+            # (tzn. are to konkurencni varianty tehoz mista)
             if _pos < _lts:
-                # Ponechat ten s DELŠÍM labelem (specifičtější)
+                # Ponechat ten s DELSIM labelem (specifictejsi)
                 if len(_label) > len(_ll):
                     _resolved[-1] = p
-                # jinak předchozí (delší) zustává, tento zahodit
+                # jinak predchozi (delsi) zustava, this zahodit
                 continue
         _resolved.append(p)
     positions = _resolved
@@ -4929,33 +6511,33 @@ def map_sections_from_block(block_text: str, rank: str = "") -> Dict[str, str]:
         if not chunk:
             continue
 
-        # ── Normalizace odstavce: sloučit soft-wrap single-\\n → mezera ──────
-        # Zachovat dvojitý \\n (skutečný odstavec), sloučit jednoduchý \\n
-        # kde pokračuje text malým písmenem (soft wrap z OCR).
+        # ── Normalizace odstavce: sloucit soft-wrap single-\\n → mezera ──────
+        # Zachovat dvojity \\n (skutecny odstavec), sloucit jednoduchy \\n
+        # kde pokracuje text malym pismenem (soft wrap from OCR).
         chunk = re.sub(
             r"([a-záčďéěíňóřšťúuýžäöü,;])\n([a-záčďéěíňóřšťúuýžäöü])",
             r"\1 \2", chunk)
         chunk = re.sub(r"\n{3,}", "\n\n", chunk).strip()
 
-        # ── Čištění artefaktu na začátku chunku ────────────────────────────
-        # Odpagesit zbytkové oddělovače/interpunkci co zustaly po labelu
-        # (e.g. ": " or "— " které separátor nespotřeboval).
+        # ── Cisteni artefaktu on zacatku chunku ────────────────────────────
+        # Odpagesit zbytkove oddelovace/interpunkci co zustaly after labelu
+        # (e.g. ": " or "— " which separator nespotreboval).
         chunk = re.sub(r"^[\s:.\u2014\u2013)\-–—;,]+", "", chunk).strip()
-        # Přeskočit prázdné or příliš krátké zbytky (< 2 znaky = artefakt)
+        # Preskocit prazdne or prilis kratke zbytky (< 2 znaky = artefakt)
         if len(chunk) < 2:
             continue
 
-        # ── TYPE TAXON ořez: "Type species" hodnota je typically JEN binomen
-        # + max. jedna věta (autor, rok, odkaz). Pokud chunk obsahuje delší
-        # text (protože další label chyběl), ořízni na první větu končící
-        # tečkou následovanou velkým písmenem or koncem. Zabraňuje tomu,
-        # aby se celý Diagnosis vsákl do TYPE TAXON když missing "Diagnosis:".
+        # ── TYPE TAXON orez: "Type species" value is typically Only binomen
+        # + max. jedna veta (author, year, odkaz). If chunk contains delsi
+        # text (because dalsi label chybel), orizni on prvni vetu koncici
+        # teckou nasledovanou velkym pismenem or koncem. Zabranuje tomu,
+        # so that cely Diagnosis vsakl to TYPE TAXON when missing "Diagnosis:".
         if field == "TYPE TAXON" and len(chunk) > 200:
             m_cut = re.search(r"\.\s+(?=[A-ZÁČĎÉĚÍŇÓŘŠŤÚŮÝŽ])", chunk[:250])
             if m_cut:
                 chunk = chunk[:m_cut.start() + 1].strip()
 
-        # P 3.2: pro DIAGNOSIS rozliš "Emended diagnosis" vs "Original diagnosis"
+        # P 3.2: for DIAGNOSIS rozlis "Emended diagnosis" vs "Original diagnosis"
         _label_low = (label or "").lower()
         _is_emended   = any(kw in _label_low for kw in ("emend", "revised", "amended"))
         _is_original  = any(kw in _label_low for kw in ("original", "original diagnosis"))
@@ -4966,22 +6548,22 @@ def map_sections_from_block(block_text: str, rank: str = "") -> Dict[str, str]:
         if field not in result:
             result[field] = _prefix + chunk if _prefix else chunk
         else:
-            # Stejné pole z více labels (Holotype + Paratype → TYPE SPECIMENS):
-            # zřetězit v pořadí výskytu, oddělit odstavcem.
+            # Stejne field from vice labels (Holotype + Paratype → TYPE SPECIMENS):
+            # zretezit in poradi vyskytu, oddelit odstavcem.
             _suffix = _prefix + chunk if _prefix else chunk
             result[field] = result[field] + "\n\n" + _suffix
 
-    # ── P 4.2: DIAGNOSIS ↔ DESCRIPTION disambiguace (konzervativní) ──────────
-    # Reklasifikace se provádí POUZE když je jedno pole prázdné a druhé nese
-    # jasné signály toho typu. Na rozdíl od dřívější verze NEMAŽE puvodní pole
-    # destruktivně, když je jeho label explicitní — jen v jednoznačných
-    # případech přesune obsah. Pokud si nejsme jistí, ponecháme jak je.
+    # ── P 4.2: DIAGNOSIS ↔ DESCRIPTION disambiguace (konzervativni) ──────────
+    # Reklasifikace provadi Only when is jedno field prazdne and druhe nese
+    # jasne signaly toho typu. On rozdil od drivejsi verze NEMAZE puvodni field
+    # destruktivne, when is jeho label explicitni — only in jednoznacnych
+    # caseech presune obsah. If si nejsme jisti, ponechame jak is.
     _diag = result.get("DIAGNOSIS", "").strip()
     _desc = result.get("DESCRIPTION", "").strip()
     if _desc and not _diag:
-        # DESCRIPTION → DIAGNOSIS jen když je KRÁTKÝ a diagnostický ve stylu
-        # (čárkami oddělený výčet znaku, žádné dlouhé věty). Diagnózy hyolitu
-        # bývají telegrafické: "Shell small, conical, apical angle 8°, …".
+        # DESCRIPTION → DIAGNOSIS only when is KRATKY and diagnosticky in stylu
+        # (carkami oddeleny vycet znaku, zadne dlouhe vety). Diagnozy hyolitu
+        # byvaji telegraficke: "Shell small, conical, apical angle 8°, …".
         _short = len(_desc) < 200
         _listy = _desc.count(",") >= 2
         _no_long_sentences = not re.search(r"[.!?]\s+[A-Z][a-z]+\s+\w+\s+\w+\s+\w+", _desc)
@@ -4989,15 +6571,15 @@ def map_sections_from_block(block_text: str, rank: str = "") -> Dict[str, str]:
             result["DIAGNOSIS"] = _desc
             del result["DESCRIPTION"]
     elif _diag and not _desc:
-        # DIAGNOSIS → DESCRIPTION jen když je DLOUHÝ a narativní (4+ vět).
-        # Diagnóza je stručná; delší narativní text je popis.
+        # DIAGNOSIS → DESCRIPTION only when is DLOUHY and narativni (4+ vet).
+        # Diagnoza is strucna; delsi narativni text is popis.
         _sentences = [s for s in re.split(r"[.!?]+", _diag) if len(s.strip()) > 10]
         if len(_diag) > 500 and len(_sentences) >= 5:
             result["DESCRIPTION"] = _diag
             del result["DIAGNOSIS"]
 
-    # ── REST: text před prvním labelem, který nebyl přiřazen ─────────────────
-    # Pokud blok začíná textem PŘED prvním nalezeným labelem, saveit ho jako REST.
+    # ── REST: text before prvnim labelem, which nebyl prirazen ─────────────────
+    # If blok zacina textem Before prvnim nalezenym labelem, saveit ho as REST.
     if positions:
         _first_text_pos = positions[0][0]
         _rest_text = processed[:_first_text_pos].strip()
@@ -5005,15 +6587,15 @@ def map_sections_from_block(block_text: str, rank: str = "") -> Dict[str, str]:
             result["REST"] = _rest_text
 
     # ── Rank-aware TYPE TAXON ↔ TYPE SPECIMENS korekce ───────────────────────
-    # PRAVIDLO taxonomické nomenklaktury:
-    #   species / subspecies → mají HOLOTYP/PARATYP → TYPE SPECIMENS
-    #   genus / family / … → mají typový druh/rod  → TYPE TAXON
+    # PRAVIDLO taxonomicke nomenklaktury:
+    #   species / subspecies → maji HOLOTYP/PARATYP → TYPE SPECIMENS
+    #   genus / family / … → maji typovy druh/genus → TYPE TAXON
     #
-    # Pokud schema omylem přiřadilo špatné pole (label "type species" v bloku
-    # druhu, or "holotype" v bloku rodu), opravíme to zde.
+    # If schema omylem priradilo spatne field (label "type species" in bloku
+    # druhu, or "holotype" in bloku genusu), opravime to zde.
     if rank:
         _rank_norm = (rank or "").lower().split()[0]
-        # Přeložíme přes alias (subspecies→species, subgenus→genus…)
+        # Prelozime pres alias (subspecies→species, subgenus→genus…)
         if _rank_norm in _REQUIRED_FIELDS_BY_RANK:
             _rk = _rank_norm
         else:
@@ -5023,18 +6605,18 @@ def map_sections_from_block(block_text: str, rank: str = "") -> Dict[str, str]:
         _is_higher        = _rk in ("genus", "family", "order", "class", "phylum")
 
         if _is_species_grade:
-            # Druh/poddruh nemá TYPE TAXON — přejmenovat na TYPE SPECIMENS,
-            # pokud TYPE SPECIMENS ještě není filled.
+            # Druh/poddruh nema TYPE TAXON — prejmenovat on TYPE SPECIMENS,
+            # if TYPE SPECIMENS jeste neni filled.
             if "TYPE TAXON" in result and "TYPE SPECIMENS" not in result:
                 _tt_val = result.pop("TYPE TAXON")
-                # Bezpečnostní kontrola: TYPE TAXON u druhu typically vypadá jako
-                # „Genus epithet Autor, 1900" or „typový druh: …" — krátký text.
-                # Pokud je příliš krátký pro typ. exemplář, přeřadit jen jako NOTE.
+                # Bezpecnostni kontrola: TYPE TAXON u druhu typically vypada as
+                # „Genus epithet Autor, 1900" or „typovy druh: …" — kratky text.
+                # If is prilis kratky for typ. exemplar, preradit only as NOTE.
                 if len(_tt_val) < 15:
                     result.setdefault("REMARKS", _tt_val)
                 else:
                     result["TYPE SPECIMENS"] = _tt_val
-            # Holotype/paratype zmínky v REST → přesunout do TYPE SPECIMENS
+            # Holotype/paratype zminky in REST → presunout to TYPE SPECIMENS
             _rest_val = result.get("REST", "")
             if _rest_val and "TYPE SPECIMENS" not in result:
                 if any(kw in _rest_val.lower() for kw in TYPE_SPECIMEN_KEYWORDS):
@@ -5042,16 +6624,70 @@ def map_sections_from_block(block_text: str, rank: str = "") -> Dict[str, str]:
                     result.pop("REST", None)
 
         elif _is_higher:
-            # Rod/čeleď/… nemá TYPE SPECIMENS jako heading-label — mohlo by
-            # vzniknout jen chybou. Přejmenovat na TYPE TAXON pokud TYPE TAXON missing.
-            # POZOR: holotype/paratype zmínky v textu jsou legitimní (cit. orig. popisu)
-            # → přejmenováváme POUZE pokud se jedná o schema-label, ne inline zmínku.
+            # Rod/family/… nema TYPE SPECIMENS as heading-label — mohlo by
+            # vzniknout only chybou. Prejmenovat on TYPE TAXON if TYPE TAXON missing.
+            # POZOR: holotype/paratype zminky in textu are legitimni (cit. orig. popisu)
+            # → prejmenovavame Only if jedna o schema-label, ne inline zminku.
             if "TYPE SPECIMENS" in result and "TYPE TAXON" not in result:
                 _ts_val = result["TYPE SPECIMENS"]
                 # Heuristika: pokud hodnota neobsahuje holotype/paratype keywords,
-                # pravděpodobně jde o typ. druh/rod → přeřadit do TYPE TAXON
+                # pravdepodobne jde o typ. druh/genus → preradit to TYPE TAXON
                 if not any(kw in (_ts_val or "").lower() for kw in TYPE_SPECIMEN_KEYWORDS):
                     result["TYPE TAXON"] = result.pop("TYPE SPECIMENS")
+
+    # ── P 5: Rozklad REST na FIGURES / DESCRIPTION / SYNONYMY ────────────────
+    # Text before prvnim labelem (REST) u FR/SV/stare literatury typicky nese:
+    #   (and) odkaz on tabuli/figuru on zacatku ("Pl. 12.", "Plate 1, figs 1-12",
+    #       "Text-figure 3D", "Табл. IX", "Taft. 5") → FIGURES,
+    #   (b) za nim uvodni nezalabelovany popisny odstavec → DESCRIPTION,
+    #   (c) optionally lines "Circothecidae: Autor, year, s. X" → SYNONYMY.
+    # Without tohoto kyearu vse spadne nediferencovane to REST.
+    _rest = result.get("REST", "").strip()
+    if _rest:
+        _fig_parts: List[str] = []
+        _remaining = _rest
+        # Opakovane odlup odkaz on tabuli/figuru from zacatku REST.
+        while True:
+            _fig, _rem = _split_leading_figure_ref(_remaining)
+            if not _fig:
+                break
+            _fig_parts.append(_fig)
+            _remaining = _rem.lstrip(" .\t\u2013-—;,")
+        if _fig_parts:
+            _fig_text = " ".join(_fig_parts).strip()
+            if "FIGURES" in result:
+                result["FIGURES"] = result["FIGURES"] + "\n\n" + _fig_text
+            else:
+                result["FIGURES"] = _fig_text
+            if _remaining.strip():
+                result["REST"] = _remaining.strip()
+            else:
+                result.pop("REST", None)
+            _rest = result.get("REST", "").strip()
+
+    # Zbytkovy REST reklasifikuj: SYNONYMY ma prednost (specifictejsi signal)
+    # before DESCRIPTION. Referencni/synonymicke lines ("Druh: Autor, year, s.")
+    # pocitame only JEDNOU. Typicke for Barrande/Holm/ruske monografie.
+    _rest = result.get("REST", "").strip()
+    if _rest:
+        _ref_hits = len(_REST_REFERENCE_LINE_RE.findall(_rest))
+        _ru_strict = len(SYNONYMY_LINE_RE_RU.findall(_rest))
+        _is_reference_block = _ref_hits >= 2 or _ru_strict >= 1
+        if _is_reference_block and "SYNONYMY" not in result:
+            # REST is fakticky blok bibliografickych/synonymickych referenci.
+            result["SYNONYMY"] = _rest
+            result.pop("REST", None)
+        elif "DESCRIPTION" not in result:
+            # Souvisly narativni popis without labelu (and neni to referencni blok)
+            # → DESCRIPTION. Conservative: only delsi narativ s vetami.
+            _looks_narrative = (
+                len(_rest) > 120
+                and not _SYNONYMY_YEAR_LINE_RE.search(_rest[:40])
+                and re.search(r"[a-zà-ÿ]{3,}[.;]", _rest)
+            )
+            if _looks_narrative:
+                result["DESCRIPTION"] = _rest
+                result.pop("REST", None)
 
     return result
 
@@ -5072,18 +6708,18 @@ def annotate_raw_block(block_text: str) -> str:
     schema = load_schema()
     sec_re, label_to_field = build_section_regex(schema)
 
-    # Najít pozice rozpoznaných labels, ale POUZE pokud label stojí na
-    # začátku odstavce (po \n\n or na úplném začátku textu) — jinak by
-    # se mohl objevit štítek uprostřed věty, kde label jen náhodně padne
-    # na slovo shodné se sekčním labelem.
-    paragraphs = re.split(r"(\n{2,})", block_text)   # zachovat oddělovače
+    # Najit pozice rozpoznanych labels, but Only if label stoji on
+    # zacatku odstavce (after \n\n or on uplnem zacatku textu) — jinak by
+    #  mohl objevit stitek uprostred vety, kde label only nahodne padne
+    # on slovo shodne sekcnim labelem.
+    paragraphs = re.split(r"(\n{2,})", block_text)   # zachovat oddelovace
     out_parts: List[str] = []
     for part in paragraphs:
         if part.strip() == "" or part.startswith("\n"):
             out_parts.append(part)
             continue
-        # sec_re očekává "(?:^|\n)LABEL[:.\n]" — ^ je kotva na začátku
-        # ŘETĚZCE, takže part (samostatný odstavec) lze testovat přímo.
+        # sec_re ocekava "(?:^|\n)LABEL[:.\n]" — ^ is kotva on zacatku
+        # RETEZCE, takthat part (samostatny odstavec) lze testovat primo.
         m = sec_re.match(part)
         if m:
             label = m.group(1)
@@ -5096,9 +6732,172 @@ def annotate_raw_block(block_text: str) -> str:
     return "".join(out_parts)
 
 
+def _sha256_text(value: Any) -> str:
+    return hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()
+
+
+def _create_llm_run(candidate_id: Optional[int], task_type: str, settings: Dict,
+                    system_prompt: str, user_prompt: str, json_mode: bool) -> int:
+    now = datetime.now().isoformat(timespec="seconds")
+    with db_transaction() as con:
+        cur = con.execute("""
+            INSERT INTO llm_runs
+            (candidate_id,task_type,model,endpoint,prompt_version,
+             system_prompt_hash,user_input_hash,temperature,max_tokens,json_mode,
+             status,created_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (candidate_id, task_type or "generic",
+              str(settings.get("lmstudio_model", "")),
+              str(settings.get("lmstudio_base_url", "")),
+              APP_VERSION, _sha256_text(system_prompt), _sha256_text(user_prompt),
+              float(settings.get("llm_temperature", 0.0)),
+              int(settings.get("llm_max_tokens", 4096)), 1 if json_mode else 0,
+              "started", now))
+        return int(cur.lastrowid)
+
+
+def _finish_llm_run(run_id: int, status: str, response: str = "",
+                    error: str = "", duration_ms: int = 0) -> None:
+    with db_transaction() as con:
+        con.execute("""
+            UPDATE llm_runs
+               SET status=?,response_hash=?,error_text=?,duration_ms=?,completed_at=?
+             WHERE id=?
+        """, (status, _sha256_text(response) if response else "",
+              (error or "")[:4000], int(duration_ms),
+              datetime.now().isoformat(timespec="seconds"), run_id))
+
+
+def create_llm_field_proposals(candidate_id: int, run_id: int,
+                               fields: Dict[str, str],
+                               auto_accept: bool = False,
+                               reviewer: str = "system") -> List[int]:
+    """Stores immutable LLM suggestions separately from accepted record values."""
+    ids: List[int] = []
+    now = datetime.now().isoformat(timespec="seconds")
+    with db_transaction() as con:
+        for field_name, proposed_value in fields.items():
+            if not proposed_value or not str(proposed_value).strip():
+                continue
+            cur = con.execute("""
+                INSERT INTO llm_field_proposals
+                (run_id,candidate_id,field_name,proposed_value,status,created_at)
+                VALUES (?,?,?,?,?,?)
+            """, (run_id, candidate_id, str(field_name), str(proposed_value).strip(),
+                  "proposed", now))
+            ids.append(int(cur.lastrowid))
+    if auto_accept:
+        for proposal_id in ids:
+            accept_llm_proposal(proposal_id, reviewer=reviewer,
+                                note="Automatically accepted by existing workflow")
+    return ids
+
+
+def accept_llm_proposal(proposal_id: int, reviewer: str = "user",
+                        note: str = "") -> bool:
+    """Accepts one proposal and writes an audited value to occurrence_fields."""
+    con = db()
+    row = con.execute(
+        "SELECT * FROM llm_field_proposals WHERE id=?", (proposal_id,)).fetchone()
+    con.close()
+    if not row or row["status"] != "proposed":
+        return False
+    save_fields(int(row["candidate_id"]),
+                {str(row["field_name"]): str(row["proposed_value"])},
+                method="llm_accepted", provenance_run_id=int(row["run_id"]),
+                accepted_by=reviewer)
+    with db_transaction() as con:
+        con.execute("""
+            UPDATE llm_field_proposals
+               SET status='accepted',reviewed_at=?,reviewed_by=?,review_note=?
+             WHERE id=? AND status='proposed'
+        """, (datetime.now().isoformat(timespec="seconds"), reviewer,
+              (note or "")[:1000], proposal_id))
+    return True
+
+
+def reject_llm_proposal(proposal_id: int, reviewer: str = "user",
+                        note: str = "") -> bool:
+    with db_transaction() as con:
+        cur = con.execute("""
+            UPDATE llm_field_proposals
+               SET status='rejected',reviewed_at=?,reviewed_by=?,review_note=?
+             WHERE id=? AND status='proposed'
+        """, (datetime.now().isoformat(timespec="seconds"), reviewer,
+              (note or "")[:1000], proposal_id))
+        return cur.rowcount > 0
+
+
+def get_llm_audit(candidate_id: int) -> Dict[str, List[Dict[str, Any]]]:
+    con = db()
+    runs = [dict(r) for r in con.execute(
+        "SELECT * FROM llm_runs WHERE candidate_id=? ORDER BY id DESC",
+        (candidate_id,)).fetchall()]
+    proposals = [dict(r) for r in con.execute(
+        "SELECT * FROM llm_field_proposals WHERE candidate_id=? ORDER BY id DESC",
+        (candidate_id,)).fetchall()]
+    con.close()
+    return {"runs": runs, "proposals": proposals}
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # LM STUDIO
 # ══════════════════════════════════════════════════════════════════════════════
+
+_LM_HTTP_CONNECTIONS: Dict[str, http.client.HTTPConnection] = {}
+_LM_HTTP_LOCKS: Dict[str, threading.Lock] = {}
+_LM_HTTP_CACHE_LOCK = threading.Lock()
+
+
+def _lm_http_json(base: str, endpoint: str, payload: Optional[Dict[str, Any]],
+                  timeout: int, persistent: bool = True) -> Dict[str, Any]:
+    """JSON request with a reusable localhost HTTP connection and one safe retry."""
+    parsed = urllib.parse.urlsplit(base)
+    scheme = parsed.scheme or "http"
+    host = parsed.hostname or "localhost"
+    port = parsed.port or (443 if scheme == "https" else 80)
+    base_path = parsed.path.rstrip("/")
+    path = base_path + endpoint
+    key = f"{scheme}://{host}:{port}"
+    with _LM_HTTP_CACHE_LOCK:
+        lock = _LM_HTTP_LOCKS.setdefault(key, threading.Lock())
+    body = None if payload is None else json.dumps(payload, ensure_ascii=False,
+                                                    separators=(",", ":")).encode("utf-8")
+    headers = {"Accept":"application/json", "Connection":"keep-alive"}
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+    def _new_connection():
+        cls = http.client.HTTPSConnection if scheme == "https" else http.client.HTTPConnection
+        return cls(host, port, timeout=timeout)
+    with lock:
+        for attempt in range(2):
+            try:
+                if persistent:
+                    with _LM_HTTP_CACHE_LOCK:
+                        con = _LM_HTTP_CONNECTIONS.get(key)
+                        if con is None:
+                            con = _new_connection(); _LM_HTTP_CONNECTIONS[key] = con
+                else:
+                    con = _new_connection()
+                con.timeout = timeout
+                con.request("POST" if body is not None else "GET", path, body=body, headers=headers)
+                response = con.getresponse(); raw = response.read()
+                if response.status >= 400:
+                    raise RuntimeError(f"HTTP {response.status}: {raw.decode('utf-8',errors='replace')[:300]}")
+                if not persistent:
+                    con.close()
+                return json.loads(raw.decode("utf-8"))
+            except (http.client.HTTPException, ConnectionError, OSError, socket.timeout):
+                with _LM_HTTP_CACHE_LOCK:
+                    old = _LM_HTTP_CONNECTIONS.pop(key, None)
+                try:
+                    if old: old.close()
+                except Exception:
+                    pass
+                if attempt:
+                    raise
+    raise RuntimeError("LM Studio request failed")
+
 
 def lm_models(settings: Dict) -> List[str]:
     """
@@ -5107,9 +6906,8 @@ def lm_models(settings: Dict) -> List[str]:
     """
     base = settings.get("lmstudio_base_url", "http://localhost:1234/v1").rstrip("/")
     try:
-        req = urllib.request.Request(base + "/models", method="GET")
-        with urllib.request.urlopen(req, timeout=5) as r:
-            data = json.loads(r.read().decode())
+        data = _lm_http_json(base, "/models", None, 5,
+                             persistent=bool(settings.get("llm_persistent_http", True)))
         return [x.get("id","") for x in data.get("data",[]) if x.get("id")]
     except ConnectionRefusedError:
         raise RuntimeError(
@@ -5121,11 +6919,18 @@ def lm_models(settings: Dict) -> List[str]:
         raise RuntimeError(f"Error loading models: {exc}")
 
 
-def lm_chat(settings: Dict, system_prompt: str, user_prompt: str) -> str:
+def lm_chat(settings: Dict, system_prompt: str, user_prompt: str,
+            json_mode: bool = False, candidate_id: Optional[int] = None,
+            task_type: str = "generic",
+            response_schema: Optional[Dict[str, Any]] = None) -> str:
     """
     Calls LM Studio /chat/completions.
-    Nover creates records – only returns suggestions.
+    Never creates records – only returns suggestions.
     Vyvolá RuntimeError s akčním popisem při každém selhání.
+
+    json_mode=True požádá o strukturovaný JSON výstup (response_format), takže
+    model mnohem méně často zabalí odpověď do prózy nebo reasoning bloku.
+    Respektuje settings["llm_json_mode"] jako celkový vypínač.
     """
     if not settings.get("llm_enabled"):
         raise RuntimeError("LLM is not enabled — enable it in Settings → LM Studio.")
@@ -5133,30 +6938,52 @@ def lm_chat(settings: Dict, system_prompt: str, user_prompt: str) -> str:
     if not model:
         raise RuntimeError("No model selected — choose a model in Settings → LM Studio.")
     base = settings.get("lmstudio_base_url","http://localhost:1234/v1").rstrip("/")
+    run_id = _create_llm_run(candidate_id, task_type, settings,
+                             system_prompt, user_prompt, json_mode)
+    started = time.monotonic()
+
+    # Qwen3 and radand othersch modelu defaultne emituji <think>…</think> reasoning,
+    # which rozbiji parsovani JSON. Soft-switch /no_think ho potlaci; modely,
+    # which ho neznaji, ho berou as neskodny text in systemovem promptu.
+    sys_content = system_prompt or ""
+    if settings.get("llm_disable_thinking", True):
+        sys_content = (sys_content + "\n/no_think").strip()
+
     payload = {
         "model": model,
         "messages": [
-            {"role":"system","content":system_prompt},
+            {"role":"system","content":sys_content},
             {"role":"user","content":user_prompt},
         ],
         "temperature": float(settings.get("llm_temperature", 0.0)),
+        # max_tokens brani useknuti dlouheho JSON (typicky u cinskych prekladu)
+        "max_tokens": int(settings.get("llm_max_tokens", 4096)),
+        "stream": False,
     }
-    req = urllib.request.Request(
-        base + "/chat/completions",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type":"application/json"},
-        method="POST",
-    )
+    # JSON rezim — LM Studio (llama.cpp / MLX) podporuje OpenAI response_format.
+    if json_mode and settings.get("llm_json_mode", True):
+        if response_schema and settings.get("llm_strict_json_schema", True):
+            payload["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {"name":"paleon_response", "strict":True,
+                                "schema":response_schema}}
+        else:
+            payload["response_format"] = {"type": "json_object"}
     timeout = int(settings.get("llm_timeout", 180))
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            data = json.loads(r.read().decode())
+        data = _lm_http_json(
+            base, "/chat/completions", payload, timeout,
+            persistent=bool(settings.get("llm_persistent_http", True)))
     except ConnectionRefusedError:
+        _finish_llm_run(run_id, "failed", error="Connection refused",
+                        duration_ms=int((time.monotonic() - started) * 1000))
         raise RuntimeError(
             f"LM Studio is not running or unreachable at {base}. "
             "Spusťte LM Studio a načtěte model.")
     except urllib.error.URLError as e:
         reason = str(getattr(e, "reason", e))
+        _finish_llm_run(run_id, "failed", error=reason,
+                        duration_ms=int((time.monotonic() - started) * 1000))
         if "refused" in reason.lower():
             raise RuntimeError(
                 f"LM Studio unreachable at {base} — zkontrolujte, zda běží a "
@@ -5168,6 +6995,8 @@ def lm_chat(settings: Dict, system_prompt: str, user_prompt: str) -> str:
             body = e.read().decode("utf-8", errors="replace")[:200]
         except Exception:
             pass
+        _finish_llm_run(run_id, "failed", error=f"HTTP {e.code}: {body}",
+                        duration_ms=int((time.monotonic() - started) * 1000))
         if e.code == 404:
             raise RuntimeError(
                 f"LM Studio returned 404 — wrong base URL? ('{base}')")
@@ -5176,31 +7005,171 @@ def lm_chat(settings: Dict, system_prompt: str, user_prompt: str) -> str:
                 f"LM Studio returned {e.code} — model pravděpodobně není načten. "
                 f"Detail: {body}")
         raise RuntimeError(f"HTTP {e.code} od LM Studio: {body}")
-    except TimeoutError:
+    except (TimeoutError, socket.timeout):
+        _finish_llm_run(run_id, "failed", error="Timeout",
+                        duration_ms=int((time.monotonic() - started) * 1000))
         raise RuntimeError(
-            f"Timeout po {timeout}s — model příliš pomalý or nedostupný. "
-            "Zkuste zvýšit Timeout v Settings → LM Studio.")
+            f"Timeout after {timeout}s — the model is too slow or unavailable. "
+            "Increase Timeout in Settings → LM Studio, or check that the model is loaded and responding.")
+    except RuntimeError as exc:
+        # _lm_http_json reports HTTP status failures as RuntimeError. Persist the
+        # failed audit run instead of leaving it permanently in status='started'.
+        detail = str(exc)
+        _finish_llm_run(run_id, "failed", error=detail,
+                        duration_ms=int((time.monotonic() - started) * 1000))
+        if "HTTP 404" in detail:
+            raise RuntimeError(f"LM Studio returned 404 — check the base URL '{base}'.") from exc
+        if "HTTP 500" in detail or "HTTP 503" in detail:
+            raise RuntimeError(f"LM Studio model is unavailable: {detail}") from exc
+        raise RuntimeError(f"LM Studio request failed: {detail}") from exc
+    except (http.client.HTTPException, OSError) as exc:
+        detail = str(exc) or exc.__class__.__name__
+        _finish_llm_run(run_id, "failed", error=detail,
+                        duration_ms=int((time.monotonic() - started) * 1000))
+        raise RuntimeError(f"LM Studio connection failed: {detail}") from exc
     try:
-        return data["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError) as e:
-        raise RuntimeError(
-            f"Unexpected response format from LM Studio: {str(data)[:200]}")
+        msg = data["choices"][0]["message"]
+        content = msg.get("content")
+        if not content:
+            # Nektere modely returns prazdny content and text in reasoning_content.
+            content = msg.get("reasoning_content") or ""
+        cleaned = _strip_think(content)
+        _finish_llm_run(run_id, "completed", response=cleaned,
+                        duration_ms=int((time.monotonic() - started) * 1000))
+        return cleaned
+    except (KeyError, IndexError, TypeError) as exc:
+        detail = f"Unexpected response format from LM Studio: {str(data)[:200]}"
+        _finish_llm_run(run_id, "failed", error=detail,
+                        duration_ms=int((time.monotonic() - started) * 1000))
+        raise RuntimeError(detail) from exc
+
+
+# ── Robustni parsovani JSON from LLM vystupu ──────────────────────────────────────
+_THINK_RE = re.compile(r"<think\b[^>]*>.*?</think\s*>", re.DOTALL | re.IGNORECASE)
+
+
+def _strip_think(text: str) -> str:
+    """Odstraní <think>…</think> reasoning bloky (Qwen3 aj.) z výstupu modelu."""
+    if not text:
+        return text or ""
+    out = _THINK_RE.sub("", text)
+    # Model obcas vypise reasoning without oteviraciho tagu, but s </think> —
+    # in tom casee vezmi only text ZA poslednim </think>.
+    if "</think>" in out:
+        out = out.rsplit("</think>", 1)[1]
+    return out.strip()
+
+
+def _extract_first_json_object(s: str) -> Optional[str]:
+    """Vrátí první balancovaný {…} objekt (respektuje řetězce a escapy)."""
+    start = s.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(s)):
+        c = s[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+        else:
+            if c == '"':
+                in_str = True
+            elif c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    return s[start:i + 1]
+    # Nezavreny objekt (useknuty vystup) — vrat aspon od zacatku dal for repair.
+    return s[start:]
+
+
+def _escape_ctrl_in_strings(s: str) -> str:
+    """Escapuje syrové řídicí znaky (\\n, \\r, \\t) UVNITŘ JSON řetězců.
+
+    Řeší nejčastější prohřešek překladových modelů — reálné zalomení řádku
+    vložené doprostřed hodnoty, které json.loads odmítne.
+    """
+    out: List[str] = []
+    in_str = False
+    esc = False
+    for c in s:
+        if in_str:
+            if esc:
+                out.append(c); esc = False; continue
+            if c == "\\":
+                out.append(c); esc = True; continue
+            if c == '"':
+                in_str = False; out.append(c); continue
+            if c == "\n":
+                out.append("\\n"); continue
+            if c == "\r":
+                out.append("\\r"); continue
+            if c == "\t":
+                out.append("\\t"); continue
+            out.append(c)
+        else:
+            if c == '"':
+                in_str = True
+            out.append(c)
+    return "".join(out)
+
+
+def _repair_json(s: str) -> str:
+    """Best-effort oprava běžných LLM JSON prohřešků."""
+    # „Chytre" and plnosirkove uvozovky → ASCII (caste u CJK modelu).
+    s = (s.replace("\u201c", '"').replace("\u201d", '"')
+           .replace("\u2018", "'").replace("\u2019", "'")
+           .replace("\uff02", '"').replace("\u3002", "."))
+    # Odstranit koncove carky: ,} ,] (i s whitespace/newline mezi).
+    s = re.sub(r",(\s*[}\]])", r"\1", s)
+    return s
 
 
 def lm_parse_json(raw: str) -> Optional[Dict]:
-    """Parses JSON from LLM output, removing markdown backticks."""
-    raw = re.sub(r"^```(?:json)?\s*", "", raw.strip(), flags=re.I)
-    raw = re.sub(r"\s*```$", "", raw.strip())
+    """Robustně vytáhne JSON objekt z výstupu LLM.
+
+    Zvládá: <think> reasoning bloky (Qwen3 aj.), markdown fences, prózu
+    před/za JSON, koncové čárky, „chytré"/plnošířkové uvozovky, neescapované
+    zalomení řádku uvnitř hodnot a (částečně) useknutý výstup.
+    """
+    if not raw:
+        return None
+    text = _strip_think(raw).strip()
+    # Odstranit markdown fences.
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
+    text = re.sub(r"\s*```$", "", text.strip())
+
+    # 1) primy pokus
     try:
-        return json.loads(raw)
+        obj = json.loads(text)
+        if isinstance(obj, dict):
+            return obj
     except Exception:
-        # Zkus najít JSON uvnitř textu
-        m = re.search(r"\{.*\}", raw, re.DOTALL)
-        if m:
-            try:
-                return json.loads(m.group(0))
-            except Exception:
-                pass
+        pass
+
+    # 2) vytahnout prvni balancovany {…} objekt and postupne opravovat
+    candidate = _extract_first_json_object(text)
+    if candidate is None:
+        return None
+    for variant in (
+        candidate,
+        _repair_json(candidate),
+        _escape_ctrl_in_strings(candidate),
+        _repair_json(_escape_ctrl_in_strings(candidate)),
+    ):
+        try:
+            obj = json.loads(variant)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            continue
     return None
 
 
@@ -5216,6 +7185,29 @@ def get_candidate_fields(candidate_id: int) -> Dict[str, str]:
     ).fetchall()
     con.close()
     return {r["field_name"]: r["field_value"] for r in rows}
+
+
+
+def get_candidate_field_metadata(candidate_id: int) -> Dict[str, Dict[str, str]]:
+    """Return method/provenance metadata for field badges in the editor."""
+    con = db()
+    rows = con.execute(
+        "SELECT field_name,method,accepted_at,accepted_by FROM occurrence_fields WHERE candidate_id=?",
+        (candidate_id,)).fetchall()
+    con.close()
+    return {r["field_name"]: {"method": r["method"] or "unknown",
+                              "accepted_at": r["accepted_at"] or "",
+                              "accepted_by": r["accepted_by"] or ""} for r in rows}
+
+
+def _field_provenance_badge(metadata: Dict[str, str]) -> str:
+    method = str((metadata or {}).get("method", "unknown")).lower()
+    if "manual" in method: return "Manual"
+    if "translat" in method: return "Translated"
+    if "llm" in method: return "LLM"
+    if "xlsx" in method or "import" in method: return "Import"
+    if "regex" in method or "auto" in method: return "Regex"
+    return method.replace("_", " ").title() or "Unknown"
 
 
 def get_candidate(cid: int) -> Optional[Dict]:
@@ -5264,6 +7256,8 @@ def get_active_block_text(cand: Dict[str, Any]) -> str:
 
 
 def set_active_block_source(candidate_id: int, source: str) -> None:
+    _ux_snapshot_block(candidate_id)
+    _pc_audit("block_source_changed",candidate_id,after={"source":source})
     source = "manual" if source == "manual" else "parser"
     con = db()
     con.execute("UPDATE taxon_candidates SET active_block_source=?, block_version=COALESCE(block_version,1)+1 WHERE id=?",
@@ -5273,6 +7267,8 @@ def set_active_block_source(candidate_id: int, source: str) -> None:
 
 
 def save_manual_block(candidate_id: int, text_value: str, activate: bool = True) -> None:
+    _ux_snapshot_block(candidate_id)
+    _pc_audit("manual_block_saved",candidate_id,after={"length":len(text_value or ""),"activate":activate})
     con = db()
     user = st.session_state.get("pn_user", "") if st is not None else ""
     source = "manual" if activate else "parser"
@@ -5585,34 +7581,109 @@ def get_candidates_fields_bulk(candidate_ids: List[int]) -> Dict[int, Dict[str, 
     return result
 
 
-def save_fields(candidate_id: int, fields: Dict[str, str], method: str = "manual") -> None:
+def save_fields(candidate_id: int, fields: Dict[str, str], method: str = "manual",
+                provenance_run_id: Optional[int] = None,
+                accepted_by: Optional[str] = None,
+                update_fts: bool = True, update_terms: bool = True,
+                write_audit: bool = True) -> None:
+    """Save fields; expensive derived updates can be deferred by pipeline callers."""
+    if st is not None:
+        st.session_state["ux_save_state"] = "saving"
     con = db()
+    accepted_at = datetime.now().isoformat(timespec="seconds") if accepted_by else None
+    existing_rows = con.execute(
+        "SELECT id,field_name FROM occurrence_fields WHERE candidate_id=?", (candidate_id,)).fetchall()
+    existing = {str(r["field_name"]): int(r["id"]) for r in existing_rows}
+    updates, inserts = [], []
     for fname, fval in fields.items():
         if not fval or fval == NOT_PROVIDED:
             continue
-        existing = con.execute(
-            "SELECT id FROM occurrence_fields WHERE candidate_id=? AND field_name=?",
-            (candidate_id, fname)
-        ).fetchone()
-        if existing:
-            con.execute(
-                "UPDATE occurrence_fields SET field_value=?, method=? WHERE id=?",
-                (fval, method, existing["id"])
-            )
+        if fname in existing:
+            updates.append((fval, method, provenance_run_id, accepted_at, accepted_by,
+                            _sha256_text(fval), existing[fname]))
         else:
-            con.execute(
-                "INSERT INTO occurrence_fields (candidate_id,field_name,field_value,method) VALUES (?,?,?,?)",
-                (candidate_id, fname, fval, method)
-            )
-    con.commit()
-    con.close()
-    # Aktualizovat FTS5 index
-    _fts_update_candidate(candidate_id)
-    # term_matches_updated_after_save_fields: starší Morpho/Strat matcher po ruční editaci fields
-    try:
-        compute_and_save_term_matches_for_candidate(candidate_id)
-    except Exception as exc:
-        logging.debug(f"Term matches update failed for {candidate_id}: {exc}")
+            inserts.append((candidate_id, fname, fval, method, provenance_run_id,
+                            accepted_at, accepted_by, _sha256_text(fval)))
+    if updates:
+        con.executemany(
+            "UPDATE occurrence_fields SET field_value=?,method=?,provenance_run_id=?,"
+            "accepted_at=?,accepted_by=?,source_value_hash=? WHERE id=?", updates)
+    if inserts:
+        con.executemany(
+            "INSERT INTO occurrence_fields "
+            "(candidate_id,field_name,field_value,method,provenance_run_id,accepted_at,accepted_by,source_value_hash) "
+            "VALUES (?,?,?,?,?,?,?,?)", inserts)
+    con.commit(); con.close()
+    if update_fts:
+        _fts_update_candidate(candidate_id)
+    if update_terms:
+        try:
+            compute_and_save_term_matches_for_candidate(candidate_id)
+        except Exception as exc:
+            logging.debug("Term matches update failed for %s: %s", candidate_id, exc)
+    if write_audit:
+        _pc_audit("fields_saved", candidate_id,
+                  after={k: str(v)[:500] for k,v in fields.items()}, note=method)
+    if st is not None:
+        st.session_state["ux_save_state"] = "saved"
+        st.session_state["ux_saved_at"] = datetime.now().isoformat(timespec="seconds")
+
+
+def save_fields_batch(payloads: Dict[int, Dict[str, str]], method: str = "auto",
+                      update_fts: bool = False, update_terms: bool = False,
+                      write_audit: bool = False, only_empty: bool = True) -> int:
+    """Save fields for many candidates in one connection and one transaction."""
+    if not payloads:
+        return 0
+    ids = [int(x) for x in payloads]
+    con = db()
+    rows = []
+    for chunk in _chunked_ids(ids):
+        ph = ",".join("?" * len(chunk))
+        rows.extend(con.execute(
+            f"SELECT id,candidate_id,field_name FROM occurrence_fields WHERE candidate_id IN ({ph})", chunk).fetchall())
+    existing = {(int(r["candidate_id"]), str(r["field_name"])): int(r["id"]) for r in rows}
+    updates, inserts, changed_ids = [], [], set()
+    for cid, fields in payloads.items():
+        cid = int(cid)
+        for fname, fval in fields.items():
+            if not fval or fval == NOT_PROVIDED:
+                continue
+            key = (cid, str(fname))
+            if key in existing:
+                if only_empty:
+                    continue
+                updates.append((str(fval), method, _sha256_text(str(fval)), existing[key]))
+            else:
+                inserts.append((cid, str(fname), str(fval), method, _sha256_text(str(fval))))
+            changed_ids.add(cid)
+    if updates:
+        con.executemany("UPDATE occurrence_fields SET field_value=?,method=?,source_value_hash=? WHERE id=?", updates)
+    if inserts:
+        con.executemany(
+            "INSERT INTO occurrence_fields (candidate_id,field_name,field_value,method,source_value_hash) VALUES (?,?,?,?,?)", inserts)
+    con.commit(); con.close()
+    if update_fts:
+        _fts_update_candidates_batch(sorted(changed_ids))
+    if update_terms and changed_ids:
+        for chunk in _chunked_ids(sorted(changed_ids)):
+            compute_and_save_term_matches_batch(chunk)
+    if write_audit:
+        _pc_audit("fields_saved_batch", after={"records":len(changed_ids),"values":len(updates)+len(inserts)}, note=method)
+    return len(updates) + len(inserts)
+
+
+def finalize_candidates(candidate_ids: List[int], update_fts: bool = True,
+                        update_terms: bool = True) -> None:
+    """Run expensive derived updates once after mapping/translation is complete."""
+    ids = list(dict.fromkeys(int(x) for x in candidate_ids if x))
+    if not ids:
+        return
+    if update_fts:
+        _fts_update_candidates_batch(ids)
+    if update_terms:
+        for chunk in _chunked_ids(ids):
+            compute_and_save_term_matches_batch(chunk)
 
 
 def _get_or_create_manual_document(filename: str = "Manual records") -> int:
@@ -5720,20 +7791,22 @@ def create_manual_taxon_record(
 
 
 
-# Regex pro inline odkazu na obrázky/tabule v taxonomickém bloku.
-# Zachytí: Text-fig. 3, Pl. 1 figs. 1-8, (Figs. 3A-I, 4B), 图版I, Рис. 5.
-# Vyloučí popisky obrázku (Caption pattern: na začátku řádku + ". Velké").
-# ── Agregace odkazu na obrázky / tabule ───────────────────────────────
+# Regex for inline odkazu on obrazky/tabule in taxonomickem bloku.
+# Zachyti: Text-fig. 3, Pl. 1 figs. 1-8, (Figs. 3And-I, 4B), 图版I, Рис. 5.
+# Vylouci popisky obrazku (Caption pattern: on zacatku radku + ". Velke").
+# ── Agregace odkazu on obrazky / tabule ───────────────────────────────
 # Zachycuje: Text-fig. 3, Pl. 1, figs. 1–8, (Fig. 7E, J), 图版I
-# Popisky (Caption): „Fig. 3. Description.“ — tvrzé '. VELKÉ' za číslem → vyloučit.
+# Popisky (Caption): „Fig. 3. Description.“ — tvrze '. VELKE' za cislem → vyloucit.
 _FIG_REF_RE = re.compile(
-    r"(?:Text-figs?\.?|Figs?\.?|Pl\.?s?|Plate\s*s?|图版|Рис\.?|табл\.?)"
+    r"(?:Text-figs?\.?|Figs?\.?|Figures?\.?|Pl\.?s?|Plates?|图版|Рис\.?|табл\.?)"
     r"\s*"
     r"(?:[IVX]{1,6}|[0-9][0-9A-Za-z]?)"
+    r"(?:\s*[,;]\s*(?:Text-figs?\.?|Figs?\.?|Figures?\.?|Pl\.?s?|Plates?)\s*"
+    r"(?:[IVX]{1,6}|[0-9][0-9A-Za-z]?))*"
     r"(?:[\s,.\-–]*(?:figs?\.?\s*)?(?:[IVX]{1,6}|[0-9][0-9A-Za-z]?))*",
     re.IGNORECASE | re.UNICODE
 )
-# Caption: prefix + číslo + TECKA + MEZERA + VELKÉ PÍSMENO
+# Caption: prefix + cislo + TECKA + MEZERA + VELKE PISMENO
 _FIG_CAPTION_LINE_RE = re.compile(
     r"(?:^|\n)\s*(?:Text-fig|Fig|Plate|Pl)[s]?\.?\s*"
     r"[0-9IVX][0-9A-Za-z,\-]*"
@@ -5753,14 +7826,14 @@ def _collect_figure_refs(block_text: str) -> str:
     if not block_text:
         return ""
 
-    # Zjistit rozsahy řádku, které jsou popisky (Caption).
-    # POZOR: m.start() muže ukazovat na \n (v re.MULTILINE módu ^ vzáženě
-    # matchuje \n jako součást \s*), proto hledáme skutečný začátek
-    # klíčovho slova přeskočením úvodních whitespace znaku.
-    _NL = chr(10)  # newline bez přímého použití '\n' (ochrana heredocu)
+    # Zjistit rozsahy radku, which are popisky (Caption).
+    # POZOR: m.start() muthat ukazovat on \n (in re.MULTILINE modu ^ vzathatne
+    # matchuje \n as soucast \s*), proto hledame skutecny zacatek
+    # klicovho slova preskocenim uvodnich whitespace znaku.
+    _NL = chr(10)  # newline without primeho pouziti '\n' (ochrana heredocu)
     caption_ranges: List[tuple] = []
     for m in _FIG_CAPTION_LINE_RE.finditer(block_text):
-        # Najdi skutečnou pozici klíčového slova (přeskoč \n / mezery)
+        # Najdi skutecnou pozici klicoveho slova (preskoc \n / mezery)
         kw_pos = m.start()
         while kw_pos < m.end() and block_text[kw_pos] in (_NL, chr(13), ' ', chr(9)):
             kw_pos += 1
@@ -5787,15 +7860,15 @@ def _collect_figure_refs(block_text: str) -> str:
     return "; ".join(refs)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Content-based fallback extractory — vyplní pole i BEZ explicitního labelu
+# Content-based fallback extractory — vyplni field i Without explicitniho labelu
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Type-specimen řádky bez explicitního "Type specimens:" labelu
+# Type-specimen lines without explicitniho "Type specimens:" labelu
 _HOLOTYPE_INLINE_RE = re.compile(
     r"(?:^|\n)\s*(?:Holo|Lecto|Noo|Para|Syn)typ(?:e|us)?[sy]?\b[^\n]{0,300}",
     re.IGNORECASE | re.UNICODE)
 
-# "Type horizon and locality" a podobné kombinované fráze
+# "Type horizon and locality" and podobne kombinovane fraze
 _TYPE_HORIZON_RE = re.compile(
     r"(?:^|\n)\s*Type\s+(?:horizon|locality|stratum|level)[^\n]{0,300}",
     re.IGNORECASE | re.UNICODE)
@@ -5814,7 +7887,7 @@ _OCCURRENCE_INLINE_RE = re.compile(
     r"[^\n]{0,300}",
     re.IGNORECASE | re.UNICODE)
 
-# Stratigraphy bez labelu: kombinace jednotky + zóny/formace/stupně
+# Stratigraphy without labelu: kombinace jednotky + zony/formace/stupne
 _STRAT_INLINE_RE = re.compile(
     r"(?:^|\n)[^\n]*?"
     r"(?:Formation|Member|Biozone|Zone|Stage|Series|Cambrian|Ordovician|Silurian"
@@ -5836,7 +7909,7 @@ def _content_fallback_extract(block_text: str, already: Dict[str, str]) -> Dict[
         v = already.get(f, "") or out.get(f, "")
         return bool(v and v.strip() and v != NOT_PROVIDED)
 
-    # TYPE SPECIMENS z inline Holotype/Paratype řádku
+    # TYPE SPECIMENS from inline Holotype/Paratype radku
     if not _has("TYPE SPECIMENS"):
         _tsm = _HOLOTYPE_INLINE_RE.findall(block_text)
         if _tsm:
@@ -5855,7 +7928,7 @@ def _content_fallback_extract(block_text: str, already: Dict[str, str]) -> Dict[
                 if not _has("LOCALITY"):
                     out["LOCALITY"] = _val
 
-    # ETYMOLOGY z inline formulací
+    # ETYMOLOGY from inline formulaci
     if not _has("ETYMOLOGY"):
         _em = _ETYMOLOGY_INLINE_RE.search(block_text)
         if _em:
@@ -5871,7 +7944,7 @@ def _content_fallback_extract(block_text: str, already: Dict[str, str]) -> Dict[
             if len(_val) > 20:
                 out["OCCURRENCE"] = _val
 
-    # STRATIGRAPHY z inline geologických jednotek (jen pokud stále missing)
+    # STRATIGRAPHY from inline geologickych jednotek (only if stale missing)
     if not _has("STRATIGRAPHY") and "STRATIGRAPHY" not in out:
         _sm = _STRAT_INLINE_RE.search(block_text)
         if _sm:
@@ -5922,7 +7995,8 @@ def _detect_script(text: str) -> str:
     return "latin"
 
 
-def llm_extract_fields_cjk_ru(block_text: str, settings: Dict) -> Dict[str, str]:
+def llm_extract_fields_cjk_ru(block_text: str, settings: Dict,
+                                 candidate_id: Optional[int] = None) -> Tuple[Dict[str, str], Optional[int]]:
     """LLM-assisted field extraction for blocks dominated by CJK or Cyrillic script.
 
     Strategy (NOT treložit-nejprve):
@@ -5943,37 +8017,94 @@ def llm_extract_fields_cjk_ru(block_text: str, settings: Dict) -> Dict[str, str]
     Vrací dict {FIELD_NAME: value} or {} při chybě / LLM vypnuto.
     """
     if not settings.get("llm_enabled"):
-        return {}
+        return {}, None
     if not block_text or not block_text.strip():
-        return {}
+        return {}, None
     try:
         raw = lm_chat(
             settings,
             LLM_CJK_RU_EXTRACTION_PROMPT,
-            block_text[:6000],  # limit na 6000 znaku — blok taxonu bývá kratší
+            block_text[:6000],  # limit on 6000 znaku — blok taxonu byva kratsi
+            json_mode=True, candidate_id=candidate_id,
+            task_type="cjk_field_extraction",
         )
         parsed = lm_parse_json(raw)
         if not parsed:
-            return {}
+            return {}, None
         fields_raw = parsed.get("fields", {})
         if not isinstance(fields_raw, dict):
-            return {}
-        # Normalizace: ořez whitespace, odmítnutí prázdných hodnot
+            return {}, None
+        # Normalizace: orez whitespace, odmitnuti prazdnych hodnot
         result: Dict[str, str] = {}
         for k, v in fields_raw.items():
             k2 = str(k).strip().upper()
             v2 = str(v).strip() if v else ""
             if k2 and v2 and v2.lower() not in ("not provided", "n/a", "none", ""):
                 result[k2] = v2
-        return result
+        run_id = None
+        if candidate_id is not None:
+            audit = get_llm_audit(candidate_id)
+            run_id = audit["runs"][0]["id"] if audit["runs"] else None
+        return result, run_id
     except Exception as exc:
         logging.warning("llm_extract_fields_cjk_ru: chyba — %s", exc)
-        return {}
+        return {}, None
 
 
-# Minimální count vyplněných fields (mimo AUTHOR/TAXON), pod nímž se spustí
+# Minimalni count vyplnenych fields (mimo AUTHOR/TAXON), pod nimz spusti
 # CJK/RU LLM pass jako gap-filler.
 _CJK_RU_LLM_FIELD_THRESHOLD = 3
+
+
+def batch_llm_extract_cjk_ru(document_id: int, settings: Dict) -> Dict[str, int]:
+    """Enrich sparse CJK/Cyrillic records in bounded multi-record LM requests."""
+    if not settings.get("llm_enabled"):
+        return {"eligible":0,"batches":0,"fields":0,"errors":0}
+    con=db(); rows=con.execute(
+        "SELECT id,block_text FROM taxon_candidates WHERE document_id=? AND status IN ('pending','low_confidence') ORDER BY id",
+        (document_id,)).fetchall(); con.close()
+    ids=[int(r["id"]) for r in rows]; existing=get_candidates_fields_bulk(ids)
+    eligible=[]
+    for r in rows:
+        cid=int(r["id"]); block=str(r["block_text"] or "")
+        content=[k for k,v in existing.get(cid,{}).items() if v and k in SECTION_FIELDS]
+        if block and _is_cjk_dominant(block) and len(content) < _CJK_RU_LLM_FIELD_THRESHOLD:
+            eligible.append((cid,block))
+    max_records=max(1,int(settings.get("llm_cjk_batch_records",6)))
+    max_chars=max(2000,int(settings.get("llm_cjk_batch_chars",12000)))
+    batches=[]; current=[]; chars=0
+    for cid,block in eligible:
+        if current and (len(current)>=max_records or chars+len(block)>max_chars):
+            batches.append(current); current=[]; chars=0
+        current.append((cid,block)); chars+=len(block)
+    if current: batches.append(current)
+    payloads={}; errors=0
+    schema={"type":"object","properties":{"records":{"type":"array","items":{
+        "type":"object","properties":{"candidate_id":{"type":"integer"},"fields":{
+        "type":"object","additionalProperties":{"type":"string"}}},
+        "required":["candidate_id","fields"],"additionalProperties":False}}},
+        "required":["records"],"additionalProperties":False}
+    for bno,batch in enumerate(batches,1):
+        records=[{"candidate_id":cid,"text":block} for cid,block in batch]
+        prompt=("Extract and translate each palaeontological record into canonical English fields. "
+                "Return each candidate_id exactly once. Use only canonical PaleoN field names and do not invent data.\n\n"+
+                json.dumps({"records":records},ensure_ascii=False,separators=(",",":")))
+        try:
+            raw=lm_chat(settings,LLM_CJK_RU_EXTRACTION_PROMPT,prompt,json_mode=True,
+                        task_type=f"cjk_batch_extraction_{bno}_of_{len(batches)}",
+                        response_schema=schema)
+            obj=lm_parse_json(raw) or {}
+            for item in obj.get("records",[]):
+                cid=int(item.get("candidate_id",0)); fields=item.get("fields",{})
+                if cid in ids and isinstance(fields,dict):
+                    clean={str(k).upper():str(v).strip() for k,v in fields.items()
+                           if str(k).upper() in SECTION_FIELDS and str(v).strip()}
+                    if clean: payloads[cid]=clean
+        except Exception as exc:
+            errors+=1; logging.warning("CJK batch %s/%s failed: %s",bno,len(batches),exc)
+    n=save_fields_batch(payloads,method="llm_cjk_batch",update_fts=False,
+                        update_terms=False,write_audit=False,only_empty=True)
+    return {"eligible":len(eligible),"batches":len(batches),"fields":n,"errors":errors}
 
 
 def auto_map_candidate_fields(candidate_id: int, block_text: str) -> int:
@@ -5991,7 +8122,7 @@ def auto_map_candidate_fields(candidate_id: int, block_text: str) -> int:
     """
     if not block_text or not block_text.strip():
         return 0
-    # Načteme rank kandidáta pro rank-aware korekci TYPE TAXON↔TYPE SPECIMENS
+    # Nacteme rank candidate for rank-aware korekci TYPE TAXON↔TYPE SPECIMENS
     _rank_for_map = ""
     try:
         _con_r = db()
@@ -6007,8 +8138,8 @@ def auto_map_candidate_fields(candidate_id: int, block_text: str) -> int:
 
     existing = get_candidate_fields(candidate_id)
 
-    # ── Content-based fallback: vyplní pole bez explicitního labelu ──────────
-    # Sloučit existující + již namapovaná pole pro kontrolu "co ještě missing"
+    # ── Content-based fallback: vyplni field without explicitniho labelu ──────────
+    # Sloucit existujici + jiz namapovana field for kontrolu "co jeste missing"
     _combined = dict(existing)
     _combined.update(mapped)
     _fallback = _content_fallback_extract(block_text, _combined)
@@ -6022,17 +8153,22 @@ def auto_map_candidate_fields(candidate_id: int, block_text: str) -> int:
         if figs:
             mapped["FIGURES"] = figs
 
-    # SIZE_PARSED z SIZE pole (strukturovaný rozměr)
+    # SIZE_PARSED from SIZE field (strukturovany rozmer)
     if "SIZE" in mapped and "SIZE_PARSED" not in mapped:
         try:
             _sz = _parse_size_field(mapped["SIZE"])
             _sz_str = _size_dict_to_str(_sz)
             if _sz_str:
                 mapped["SIZE_PARSED"] = _sz_str
+            # Registracni cisla from cinske tabulky rozmeru (登记号) → CATALOG_NUMBER.
+            # Only if CATALOG_NUMBER jeste nebyl naplnen from TYPE SPECIMENS.
+            _cat_from_size = _sz.get("_catalog_numbers", "")
+            if _cat_from_size and "CATALOG_NUMBER" not in mapped:
+                mapped["CATALOG_NUMBER"] = _cat_from_size
         except Exception:
             pass
 
-    # Strukturovaný typový materiál z TYPE SPECIMENS
+    # Strukturovany typovy material from TYPE SPECIMENS
     if "TYPE SPECIMENS" in mapped:
         try:
             _ts = _parse_type_specimens(mapped["TYPE SPECIMENS"])
@@ -6046,19 +8182,20 @@ def auto_map_candidate_fields(candidate_id: int, block_text: str) -> int:
             pass
 
     # ── CJK / Cyrillic LLM gap-fill ──────────────────────────────────────────
-    # Pokud je blok dominován čínštinou or ruštinou A regex extrakce přinesla
-    # málo fields (< _CJK_RU_LLM_FIELD_THRESHOLD), spustíme specializovaný
-    # LLM pass. Tento přístup je výrazně lepší než "přeložit-nejprve", protože:
-    #   • Latinská jména taxa jsou zachována verbatim (LLM dostane instrukci).
-    #   • Jeden LLM call místo dvou (překlad + extrakce).
-    #   • LLM chápe sémantiku čínského/ruského textu nativně.
-    # LLM pass se spustí pouze pokud je LLM povoleno v nastavení.
+    # If is blok dominovan cinstinou or rustinou And regex extrakce prinesla
+    # malo fields (< _CJK_RU_LLM_FIELD_THRESHOLD), spustime specializovany
+    # LLM pass. This pristup is vyrazne lepsi nez "prelozit-nejprve", because:
+    #   • Latinska jmena taxa are zachovana verbatim (LLM dostane instrukci).
+    #   • Jeden LLM call instead of dvou (preklad + extrakce).
+    #   • LLM chape semantiku cinskeho/ruskeho textu nativne.
+    # LLM pass spusti only if is LLM povoleno in nastaveni.
     _content_fields = {
         k for k in mapped
         if k not in {"AUTHOR", "TAXON", "TAXON_NAME_VERBATIM",
                      "TAXON_RANK_AS_WRITTEN", "FIGURES", "RECORD_ID"}
     }
     _llm_sourced_keys: set = set()
+    _llm_run_id: Optional[int] = None
     if (
         _is_cjk_dominant(block_text)
         and len(_content_fields) < _CJK_RU_LLM_FIELD_THRESHOLD
@@ -6068,7 +8205,8 @@ def auto_map_candidate_fields(candidate_id: int, block_text: str) -> int:
         except Exception:
             _settings = {}
         if _settings.get("llm_enabled"):
-            _llm_fields = llm_extract_fields_cjk_ru(block_text, _settings)
+            _llm_fields, _llm_run_id = llm_extract_fields_cjk_ru(
+                block_text, _settings, candidate_id=candidate_id)
             for _lf, _lv in _llm_fields.items():
                 if _lf not in mapped and _lv:
                     mapped[_lf] = _lv
@@ -6086,7 +8224,7 @@ def auto_map_candidate_fields(candidate_id: int, block_text: str) -> int:
     for field, value in mapped.items():
         if not value or not value.strip():
             continue
-        if existing.get(field):   # jen prázdná pole
+        if existing.get(field):   # only prazdna field
             continue
         if field in _llm_sourced_keys:
             to_save_llm[field] = value
@@ -6095,24 +8233,85 @@ def auto_map_candidate_fields(candidate_id: int, block_text: str) -> int:
     if to_save_auto:
         save_fields(candidate_id, to_save_auto, method="auto")
     if to_save_llm:
-        save_fields(candidate_id, to_save_llm, method="llm")
+        if _llm_run_id is not None:
+            create_llm_field_proposals(candidate_id, _llm_run_id, to_save_llm,
+                                       auto_accept=True, reviewer="system")
+        else:
+            save_fields(candidate_id, to_save_llm, method="llm_legacy")
     return len(to_save_auto) + len(to_save_llm)
 
 
-# Pole, která se nepřekládají — jde o vlastní jména, citace, čísla
+# Field, which neprekladaji — jde o vlastni jmena, citace, cisla
 _TRANSLATION_SKIP_FIELDS = {
     "AUTHOR", "RECORD_ID", "SOURCE_DOCUMENT", "FIGURES", "REFERENCE",
     "TAXON", "TAXON_NAME_VERBATIM", "TAXON_RANK_AS_WRITTEN",
-    "NOMENCLATURAL ACTS",  # obsahuje citace zákonu a kódu – zachovat verbatim
+    "NOMENCLATURAL ACTS",  # contains citace zakonu and kodu – zachovat verbatim
 }
 
-# Languages které se nepřekládají (Documenty v angličtině or bez jazyka)
+# Languages which neprekladaji (Documenty in anglictine or without jazyka)
 _ENGLISH_LANG_CODES = {"en", "eng", "english", "en-gb", "en-us", ""}
 
-# Mapování anglických nadpisu sections → cílové DB pole.
-# Aplikuje se automaticky PO překladu (non-EN Documenty).
-# Klíče jsou lowercase verze toho, pod čím LLM sekci saveí
-# (= puvodní nadpis zdrojového textu přeložený do AJ).
+# ── Kanonicka tabulka kod → English name jazyka ─────────────────────────────
+# Jeden zdroj pravdy — pouziva in prekladovych promptech i in UI selectboxech.
+# Pokryva all jazyky relevantni for paleontologickou literaturu (19.–21. stol.)
+_LANG_NAMES: Dict[str, str] = {
+    # Slovanske
+    "cs": "Czech",      "cz": "Czech",
+    "ru": "Russian",    "rus": "Russian",
+    "pl": "Polish",     "pol": "Polish",
+    "sk": "Slovak",     "slk": "Slovak",
+    "uk": "Ukrainian",  "ukr": "Ukrainian",
+    "bg": "Bulgarian",  "bul": "Bulgarian",
+    "sr": "Serbian",    "srp": "Serbian",
+    # Germanske
+    "de": "German",     "deu": "German",
+    "sv": "Swedish",    "swe": "Swedish",
+    "da": "Danish",     "dan": "Danish",
+    "no": "Norwegian",  "nor": "Norwegian",
+    "nl": "Dutch",      "nld": "Dutch",
+    # Romanske
+    "fr": "French",     "fra": "French",
+    "it": "Italian",    "ita": "Italian",
+    "es": "Spanish",    "spa": "Spanish",
+    "pt": "Portuguese", "por": "Portuguese",
+    "ro": "Romanian",   "ron": "Romanian",
+    "la": "Latin",      "lat": "Latin",
+    # Asijske
+    "zh": "Chinese",    "zho": "Chinese",   "chi": "Chinese",
+    "ja": "Japanese",   "jpn": "Japanese",
+    "ko": "Korean",     "kor": "Korean",
+    # Ostatni
+    "hu": "Hungarian",  "hun": "Hungarian",
+    "fi": "Finnish",    "fin": "Finnish",
+    "et": "Estonian",   "est": "Estonian",
+    "lt": "Lithuanian", "lav": "Latvian",
+    "el": "Greek",      "ell": "Greek",
+    "tr": "Turkish",    "tur": "Turkish",
+    "ar": "Arabic",     "ara": "Arabic",
+}
+
+# Poradi languages in UI selectboxu (en vzdy prvni, mixed vzdy posledni)
+_LANG_OPTIONS_UI: List[str] = [
+    "en",
+    "cs", "de", "fr", "ru", "zh",      # nejcastejsi in paleontologii
+    "la", "pl", "sk", "it", "es", "hu", "sv",  # historicka literatura
+    "ro", "nl", "pt", "da", "no",      # mene caste
+    "ja", "ko", "uk", "bg",            # vzacne, but in DB existuji
+    "mixed",
+]
+
+def _lang_code_to_name(code: str) -> str:
+    """Vrátí anglický název jazyka pro zadaný kód (ISO 639-1/2).
+    Pro 'mixed', '' nebo neznámý kód vrátí 'auto-detect'."""
+    c = (code or "").strip().lower()
+    if not c or c == "mixed":
+        return "auto-detect"
+    return _LANG_NAMES.get(c, c.upper())
+
+# Mapping anglickych nadpisu sections → cilove DB field.
+# Aplikuje automaticky After prekladu (non-EN Documenty).
+# Klice are lowercase verze toho, pod cim LLM sekci savei
+# (= puvodni nadpis zdrojoveho textu prelothatny to AJ).
 _POST_TRANSLATION_FIELD_MAP: Dict[str, str] = {
     "characteristics":               "DESCRIPTION",
     "discussion and comparison":     "REMARKS",    # 讨论与比较 / 比较与讨论
@@ -6128,7 +8327,93 @@ _POST_TRANSLATION_FIELD_MAP: Dict[str, str] = {
 }
 
 
-def remap_fields_post_translation(candidate_id: int) -> int:
+def move_field_value(candidate_id: int, source_field: str, target_field: str,
+                     conflict_mode: str = "append") -> Dict[str, Any]:
+    """Move one stored field value to another canonical field atomically.
+
+    conflict_mode: append (default) or replace when the target already has text.
+    The source row is deleted only after the target value is prepared.
+    """
+    source_field = str(source_field or "").strip().upper()
+    target_field = str(target_field or "").strip().upper()
+    if source_field not in SECTION_FIELDS or target_field not in SECTION_FIELDS:
+        raise ValueError("Source and target must be canonical PaleoN fields.")
+    if source_field == target_field:
+        raise ValueError("Choose a different target field.")
+    if conflict_mode not in {"append", "replace"}:
+        raise ValueError("Unknown conflict mode.")
+    con = db()
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        src = con.execute(
+            "SELECT id,field_value FROM occurrence_fields WHERE candidate_id=? AND field_name=? ORDER BY id LIMIT 1",
+            (candidate_id, source_field)).fetchone()
+        if not src or not str(src["field_value"] or "").strip():
+            raise ValueError(f"{source_field} is empty.")
+        source_value = str(src["field_value"]).strip()
+        tgt = con.execute(
+            "SELECT id,field_value FROM occurrence_fields WHERE candidate_id=? AND field_name=? ORDER BY id LIMIT 1",
+            (candidate_id, target_field)).fetchone()
+        target_before = str(tgt["field_value"] or "").strip() if tgt else ""
+        if target_before and conflict_mode == "append":
+            target_after = target_before if source_value in target_before else target_before.rstrip() + "\n\n" + source_value
+        else:
+            target_after = source_value
+        now = datetime.now().isoformat(timespec="seconds")
+        if tgt:
+            con.execute(
+                "UPDATE occurrence_fields SET field_value=?,method=?,accepted_at=?,accepted_by=?,source_value_hash=? WHERE id=?",
+                (target_after,"manual_field_move",now,_current_username(),_sha256_text(target_after),tgt["id"]))
+        else:
+            con.execute(
+                "INSERT INTO occurrence_fields (candidate_id,field_name,field_value,method,accepted_at,accepted_by,source_value_hash) VALUES (?,?,?,?,?,?,?)",
+                (candidate_id,target_field,target_after,"manual_field_move",now,_current_username(),_sha256_text(target_after)))
+        con.execute("DELETE FROM occurrence_fields WHERE candidate_id=? AND field_name=?",(candidate_id,source_field))
+        con.commit()
+    except Exception:
+        con.rollback(); con.close(); raise
+    con.close()
+    _fts_update_candidate(candidate_id)
+    try:
+        compute_and_save_term_matches_for_candidate(candidate_id)
+    except Exception as exc:
+        logging.debug("Term refresh after field move failed for %s: %s",candidate_id,exc)
+    _pc_audit("field_moved",candidate_id,
+              before={source_field:source_value,target_field:target_before},
+              after={source_field:"",target_field:target_after},note=f"{source_field} -> {target_field}")
+    return {"source":source_field,"target":target_field,"target_value":target_after,
+            "replaced":bool(target_before and conflict_mode=="replace")}
+
+
+def render_field_move_tool(candidate_id: int, key_prefix: str = "field_move") -> None:
+    """Reusable one-step Move value to another field UI."""
+    values = get_candidate_fields(candidate_id)
+    nonempty = [f for f in SECTION_FIELDS if str(values.get(f,"") or "").strip()]
+    with st.expander("↪ Move a value to another field", expanded=False):
+        st.caption("Moves the complete value, then clears the source field. This is useful for corrections such as REMARKS → OCCURRENCE.")
+        if not nonempty:
+            st.info("No populated field is available to move.")
+            return
+        c1,c2,c3 = st.columns([2,2,2])
+        source = c1.selectbox("From field",nonempty,key=f"{key_prefix}_source_{candidate_id}")
+        targets = [f for f in SECTION_FIELDS if f != source]
+        target = c2.selectbox("To field",targets,key=f"{key_prefix}_target_{candidate_id}")
+        target_has_value = bool(str(values.get(target,"") or "").strip())
+        mode = c3.radio("If target is populated",["append","replace"],horizontal=True,
+                        key=f"{key_prefix}_mode_{candidate_id}",disabled=not target_has_value)
+        st.caption(f"Preview from **{source}**: {str(values.get(source,''))[:240]}" + ("…" if len(str(values.get(source,'')))>240 else ""))
+        if target_has_value:
+            st.warning(f"{target} already contains text. Choose whether to append the moved value or replace the target value.")
+        if st.button(f"Move {source} → {target}",type="primary",key=f"{key_prefix}_run_{candidate_id}"):
+            try:
+                result=move_field_value(candidate_id,source,target,mode if target_has_value else "replace")
+                st.success(f"Moved {result['source']} to {result['target']} and cleared {result['source']}.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Field move failed: {exc}")
+
+
+def remap_fields_post_translation(candidate_id: int, update_derived: bool = True) -> int:
     """
     After translation, re-checks all record fields and remaps those
     whose name matchesvídá _POST_TRANSLATION_FIELD_MAP.
@@ -6147,7 +8432,7 @@ def remap_fields_post_translation(candidate_id: int) -> int:
         target = _POST_TRANSLATION_FIELD_MAP.get(field.strip().lower())
         if not target or target == field:
             continue
-        # Sloučit s případnou existující hodnotou v cílovém poli
+        # Sloucit s casenou existujici hodnotou in cilovem poli
         existing = rows.get(target, "")
         if existing:
             merged = existing.rstrip() + "\n\n" + value.strip()
@@ -6157,19 +8442,240 @@ def remap_fields_post_translation(candidate_id: int) -> int:
         to_delete.append(field)
 
     if to_save:
-        save_fields(candidate_id, to_save, method="remap_post_translation")
+        save_fields(candidate_id, to_save, method="remap_post_translation",
+                    update_fts=False, update_terms=False, write_audit=update_derived)
 
     if to_delete:
         con = db()
-        for f in to_delete:
-            con.execute(
-                "DELETE FROM occurrence_fields WHERE candidate_id=? AND field_name=?",
-                (candidate_id, f),
-            )
-        con.commit()
-        con.close()
+        con.executemany(
+            "DELETE FROM occurrence_fields WHERE candidate_id=? AND field_name=?",
+            [(candidate_id, f) for f in to_delete])
+        con.commit(); con.close()
+    if update_derived and (to_save or to_delete):
+        finalize_candidates([candidate_id], update_fts=True, update_terms=True)
 
     return len(to_delete)
+
+
+def _translation_call_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
+    """Prepare settings for one translation call while honoring the configured timeout."""
+    call_settings = dict(settings)
+    # Translation previously imposed a hidden 75-second ceiling, so the value set
+    # in Settings (for example 180 s) was ignored. Keep only a safe lower bound;
+    # the Settings UI already limits the upper value to 600 seconds.
+    call_settings["llm_timeout"] = max(int(settings.get("llm_timeout", 180)), 15)
+    call_settings["llm_max_tokens"] = min(max(int(settings.get("llm_max_tokens", 4096)), 512), 2048)
+    return call_settings
+
+
+def _split_translation_paragraphs(text: str, max_chars: int = 1800) -> List[str]:
+    """Split translation input into small, fast model requests (about 700 characters)."""
+    normalized = str(text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not normalized:
+        return []
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n+", normalized) if p.strip()]
+    if len(paragraphs) == 1 and "\n" in normalized:
+        paragraphs = [p.strip() for p in normalized.split("\n") if p.strip()]
+    result: List[str] = []
+    for paragraph in paragraphs:
+        if len(paragraph) <= max_chars:
+            result.append(paragraph)
+            continue
+        # Prefer sentence boundaries for an exceptionally long paragraph.
+        sentences = [x.strip() for x in re.split(r"(?<=[.!?。！？])\s+", paragraph) if x.strip()]
+        current = ""
+        for sentence in sentences or [paragraph]:
+            if len(sentence) > max_chars:
+                if current:
+                    result.append(current); current = ""
+                result.extend(sentence[i:i + max_chars] for i in range(0, len(sentence), max_chars))
+            elif current and len(current) + 1 + len(sentence) > max_chars:
+                result.append(current); current = sentence
+            else:
+                current = sentence if not current else current + " " + sentence
+        if current:
+            result.append(current)
+    return result
+
+
+def _translation_paragraph_jobs(fields: Dict[str, str]) -> List[Tuple[str, str, int, int]]:
+    """Create one LM Studio request per paragraph, preserving field and order."""
+    jobs: List[Tuple[str, str, int, int]] = []
+    for field_name, value in fields.items():
+        paragraphs = _split_translation_paragraphs(value)
+        total = len(paragraphs)
+        jobs.extend((field_name, paragraph, index, total)
+                    for index, paragraph in enumerate(paragraphs, 1))
+    return jobs
+
+
+def _translation_glossary_dir() -> pathlib.Path:
+    return current_user_paths().root / "translation_glossaries"
+
+
+def _normalize_glossary_language(language: str) -> str:
+    code = _normalize_language_code(language or "mixed")
+    return re.sub(r"[^a-z0-9_-]+", "_", code or "mixed")[:24]
+
+
+def _translation_glossary_path(language: str = "mixed") -> pathlib.Path:
+    """Per-user, per-source-language glossary included in translation prompts."""
+    return _translation_glossary_dir() / f"{_normalize_glossary_language(language)}.txt"
+
+
+def _load_translation_glossary(language: str = "mixed", max_chars: int = 12000,
+                               source_text: str = "") -> str:
+    paths = [_translation_glossary_path(language)]
+    if _normalize_glossary_language(language) != "mixed":
+        paths.append(_translation_glossary_path("mixed"))
+    paths.append(current_user_paths().root / "translation_glossary.txt")
+    lines: List[str] = []; seen = set()
+    source_fold = (source_text or "").casefold()
+    relevant_only = bool(source_text and get_settings().get("llm_glossary_relevant_only", True))
+    for path in paths:
+        if path in seen or not path.exists(): continue
+        seen.add(path)
+        try:
+            for raw in path.read_text(encoding="utf-8",errors="replace").splitlines():
+                line = raw.strip()
+                if not line or line.startswith("#"): continue
+                if relevant_only:
+                    source_term = re.split(r"\s*(?:=|\t|->|→)\s*", line, maxsplit=1)[0].strip()
+                    if source_term and source_term.casefold() not in source_fold:
+                        continue
+                lines.append(line)
+        except OSError as exc:
+            logging.warning("Could not load translation glossary %s: %s",path,exc)
+    return "\n".join(lines)[:max_chars]
+
+
+def _glossary_instruction(language: str = "mixed", source_text: str = "") -> str:
+    glossary = _load_translation_glossary(language, source_text=source_text)
+    if not glossary: return ""
+    lang_name = _lang_code_to_name(language)
+    return (f"\n\nUse the following user glossary for {lang_name} as binding terminology. "
+            "Use the requested English equivalent exactly when its source term matches.\n"
+            "--- USER TRANSLATION GLOSSARY ---\n" + glossary +
+            "\n--- END USER TRANSLATION GLOSSARY ---")
+
+
+_GLOSSARY_ECHO_RE = re.compile(
+    r"(?is)(?:Use\s+the\s+following\s+user\s+glossary.*?binding\s+terminology\..*?)?"
+    r"(?:---+\s*)?(?:USER\s+TRANSLATION\s+GLOSSARY)?(?:\s*---+)?\s*"
+    r".*?(?:---+\s*)?END\s*USER\s*TRANSLATION\s*GLOSSARY(?:\s*---+)?",
+)
+_GLOSSARY_START_RE = re.compile(
+    r"(?is)Use\s+the\s+following\s+user\s+glossary.*?binding\s+terminology\."
+)
+_GLOSSARY_END_RE = re.compile(
+    r"(?is)(?:---+\s*)?END\s*USER\s*TRANSLATION\s*GLOSSARY(?:\s*---+)?"
+)
+
+
+def _clean_translation_output(value: str) -> str:
+    """Remove echoed prompt/glossary material from an LM translation result."""
+    text = _strip_think(str(value or "")).strip()
+    text = re.sub(r"^```(?:json|text)?\s*|\s*```$", "", text,
+                  flags=re.IGNORECASE | re.DOTALL).strip()
+    # Preferred case: the model echoed the complete bounded glossary block.
+    text = _GLOSSARY_ECHO_RE.sub("", text).strip()
+    # Defensive handling for malformed delimiters such as ENDUSERTRANSLATIONGLOSSARY.
+    start = _GLOSSARY_START_RE.search(text)
+    end = _GLOSSARY_END_RE.search(text)
+    if start and end and end.end() > start.start():
+        text = (text[:start.start()] + " " + text[end.end():]).strip()
+    elif start:
+        # If the prompt was prepended and no reliable terminator survived, keep only
+        # content after the last separator when one exists.
+        tail = text[start.start():]
+        separators = list(re.finditer(r"---+", tail))
+        if len(separators) >= 2:
+            text = (text[:start.start()] + " " + tail[separators[-1].end():]).strip()
+    text = re.sub(
+        r"(?is)^\s*(?:English\s+translation|Translation)\s*:\s*", "", text
+    ).strip()
+    return text
+
+
+_TRANSLATED_SECTION_LABEL_RE = re.compile(
+    r"(?i)(?<![A-Za-z])"
+    r"(Type\s+species|Type\s+genus|Characteristics|Diagnosis|Description|Discussion|Remarks|"
+    r"Age\s+and\s+distribution|Distribution\s+and\s+age|Occurrence|Locality|Stratigraphy|"
+    r"Material\s+examined|Type\s+material|Type\s+specimens|Etymology|Dimensions|Size|"
+    r"Plate(?:s)?|Figure(?:s)?|Figs?\.?)"
+    r"(?=\s+[A-Z0-9(\[])"
+)
+_TRANSLATED_CANONICAL_LABELS = {
+    "type species": "Type species",
+    "type genus": "Type genus",
+    "characteristics": "Characteristics",
+    "diagnosis": "Diagnosis",
+    "description": "Description",
+    "discussion": "Discussion",
+    "remarks": "Remarks",
+    "age and distribution": "Age and Distribution",
+    "distribution and age": "Age and Distribution",
+    "occurrence": "Occurrence",
+    "locality": "Locality",
+    "stratigraphy": "Stratigraphy",
+    "material examined": "Material examined",
+    "type material": "Type material",
+    "type specimens": "Type specimens",
+    "etymology": "Etymology",
+    "dimensions": "Dimensions",
+    "size": "Size",
+}
+_CLEAN_TAXON_WITH_AUTHOR_YEAR_RE = re.compile(
+    r"^\s*(?P<name>[A-Z][A-Za-zÀ-ÖØ-öø-ÿ-]+(?:\s+[a-z][A-Za-zÀ-ÖØ-öø-ÿ-]+)?"
+    r"(?:\s+\(?[A-Z][A-Za-zÀ-ÖØ-öø-ÿ.-]+(?:\s+(?:et|and|&)\s+"
+    r"[A-Z][A-Za-zÀ-ÖØ-öø-ÿ.-]+)?\)?[,]?\s+(?:1[5-9]\d{2}|20\d{2})))\b"
+)
+
+
+def _normalize_translated_treatment_text(text: str) -> str:
+    """Put inline translated treatment labels on canonical, mappable lines."""
+    value = re.sub(r"[ \t]+", " ", str(text or "")).strip()
+    if not value:
+        return ""
+
+    def replace_label(match: re.Match) -> str:
+        raw = re.sub(r"\s+", " ", match.group(1)).strip().rstrip(".")
+        key = raw.casefold()
+        # Figure references are values, not section labels. Keep them together so
+        # _collect_figure_refs can capture e.g. "Plate I, Figure 11" completely.
+        if key.startswith(("plate", "figure", "fig")):
+            return raw
+        label = _TRANSLATED_CANONICAL_LABELS.get(key, raw)
+        return f"\n{label}: "
+
+    value = _TRANSLATED_SECTION_LABEL_RE.sub(replace_label, value)
+    value = re.sub(r"\n{2,}", "\n", value).strip()
+    return value
+
+
+def _clean_candidate_taxon_name(candidate_id: int) -> Optional[str]:
+    """Remove translated field text accidentally appended after taxon author/year."""
+    con = db()
+    try:
+        row = con.execute(
+            "SELECT taxon_name FROM taxon_candidates WHERE id=?", (candidate_id,)
+        ).fetchone()
+        if not row:
+            return None
+        original = str(row["taxon_name"] or "").strip()
+        match = _CLEAN_TAXON_WITH_AUTHOR_YEAR_RE.match(original)
+        if not match:
+            return original
+        cleaned = re.sub(r"\s+", " ", match.group("name")).strip()
+        if cleaned and cleaned != original:
+            con.execute(
+                "UPDATE taxon_candidates SET taxon_name=? WHERE id=?",
+                (cleaned, candidate_id),
+            )
+            con.commit()
+        return cleaned or original
+    finally:
+        con.close()
 
 
 def auto_translate_candidate_fields(
@@ -6201,23 +8707,32 @@ def auto_translate_candidate_fields(
             raise RuntimeError("LLM is not enabled — enable it in Settings → LM Studio.")
         return 0
     if not force and not settings.get("llm_auto_translate"):
-        return 0  # auto-translate vypnut; force=True toto přeskočí
+        return 0  # auto-translate vypnut; force=True toto preskoci
 
-    # Languageová kontrola: pro force překlad povolíme i unknown jazyk (""),
-    # jen explicitní English (en/eng/…) je vždy přeskočena.
+    # Languageova kontrola: for force preklad povolime i unknown language (""),
+    # only explicitni English (en/eng/…) is vzdy preskocena.
     _lang_norm = (force_lang or doc_lang or "").strip().lower()
     _explicit_english = {"en", "eng", "english", "en-gb", "en-us"}
     if _lang_norm in _explicit_english:
-        return 0
-    # Při auto-překladu bez force: unknown jazyk přeskočit (mohlo by jít o angličtinu)
+        if force:
+            # Manual translation is an explicit user request. The document may have
+            # been uploaded with the wrong default language (EN), so use auto-detect.
+            _lang_norm = "mixed"
+            force_lang = "mixed"
+        else:
+            return 0
+    # For automatic translation an unknown language is now auto-detected instead
+    # of silently skipping the record.
     if not force and _lang_norm == "":
-        return 0
+        _lang_norm = "mixed"
+        force_lang = "mixed"
 
+    _require_llm_language_support(settings, _lang_norm)
     raw_block: str = kwargs.get("block", "") or ""
 
     existing = get_candidate_fields(candidate_id)
 
-    # Sestavit seznam fields k překladu
+    # Sestavit list fields k prekladu
     to_translate = {
         fname: fval
         for fname, fval in existing.items()
@@ -6226,108 +8741,207 @@ def auto_translate_candidate_fields(
         and len(fval.strip()) > 10
     }
 
-    # ── Fallback: nejsou namapovaná pole → přelož raw blok a auto-mapuj ──
+    # ── Fallback: nejsou namapovana field → preloz raw blok and auto-mapuj ──
     if not to_translate:
         if not raw_block or len(raw_block.strip()) < 20:
-            return 0   # nemáme ani raw blok, vzdáme to
-        # Přeložíme celý raw blok jako jeden text
+            return 0   # nemame ani raw blok, vzdame to
+        # Prelozime cely raw blok as jeden text
         _lang_for_prompt = (force_lang or doc_lang or "").strip().lower()
-        lang_name_fb = {
-            "cs": "Czech", "cz": "Czech",
-            "ru": "Russian", "rus": "Russian",
-            "de": "German", "deu": "German",
-            "fr": "French", "fra": "French",
-            "zh": "Chinese", "zho": "Chinese", "chi": "Chinese",
-            "la": "Latin", "lat": "Latin",
-            "pl": "Polish", "sv": "Swedish", "sk": "Slovak",
-            "it": "Italian", "es": "Spanish", "hu": "Hungarian",
-        }.get(_lang_for_prompt, _lang_for_prompt.upper() or "unknown")
-        fb_prompt = (
-            f"Translate the following palaeontological taxonomic text from "
-            f"{lang_name_fb} to English. Preserve all Latin taxon names, "
-            f"author names, catalogue numbers and stratigraphic unit names verbatim. "
-            f"Return ONLY the translated text, no commentary.\n\n{raw_block}"
-        )
+        _lang_name_fb = _lang_code_to_name(_lang_for_prompt)
+        if _lang_name_fb == "auto-detect":
+            fb_prompt = (
+                f"Translate the following palaeontological taxonomic text to English. "
+                f"Auto-detect the source language. "
+                f"Preserve all Latin taxon names, author names, catalogue numbers "
+                f"and stratigraphic unit names verbatim. "
+                f"Return ONLY the translated text, no commentary.\n\n{raw_block}"
+            )
+        else:
+            fb_prompt = (
+                f"Translate the following palaeontological taxonomic text from "
+                f"{_lang_name_fb} to English. "
+                f"Preserve all Latin taxon names, author names, catalogue numbers "
+                f"and stratigraphic unit names verbatim. "
+                f"Return ONLY the translated text, no commentary.\n\n{raw_block}"
+            )
         try:
-            fb_resp = lm_chat(settings, "", fb_prompt)
+            _call_settings = _translation_call_settings(settings)
+            _raw_parts = _split_translation_paragraphs(raw_block)
+            _translated_parts: List[str] = []
+            for _part_no, _paragraph in enumerate(_raw_parts, 1):
+                if _lang_name_fb == "auto-detect":
+                    _paragraph_prompt = (
+                        "Translate this palaeontological paragraph to English. Auto-detect "
+                        "the source language. Preserve Latin taxon names, author names, "
+                        "catalogue numbers and stratigraphic proper names verbatim. Return "
+                        "ONLY the translation, no commentary.\n\n" + _paragraph)
+                else:
+                    _paragraph_prompt = (
+                        f"Translate this palaeontological paragraph from {_lang_name_fb} to "
+                        "English. Preserve Latin taxon names, author names, catalogue numbers "
+                        "and stratigraphic proper names verbatim. Return ONLY the translation, "
+                        "no commentary.\n\n" + _paragraph)
+                _paragraph_prompt += _glossary_instruction(_lang_for_prompt, raw_block)
+                _raw_translation = lm_chat(
+                    _call_settings, "", _paragraph_prompt,
+                    candidate_id=candidate_id,
+                    task_type=f"raw_paragraph_translation_{_part_no}_of_{len(_raw_parts)}")
+                _translated_parts.append(_clean_translation_output(_raw_translation))
         except Exception as _e:
             if force:
                 raise
-            logging.warning("auto_translate raw-block fallback: %s", _e)
+            logging.warning("auto_translate raw-block paragraph fallback: %s", _e)
             return 0
-        translated_block = fb_resp.strip()
+        translated_block = "\n\n".join(x.strip() for x in _translated_parts if x and x.strip())
+        translated_block = _normalize_translated_treatment_text(translated_block)
         if not translated_block:
             return 0
-        # Save přeložený blok do candidate_fields jako RAW_TRANSLATION
-        save_fields(candidate_id,
-                    {"RAW_TRANSLATION": translated_block},
-                    method="auto_translated_raw")
-        # Pokusit se z přeloženého textu extrahovat pole
+        # RAW_TRANSLATION is retained as an editable provenance copy.
+        save_fields(candidate_id, {"RAW_TRANSLATION": translated_block},
+                    method="auto_translated_raw", update_fts=False, update_terms=False)
+        # Map canonical translated labels immediately.
         n_mapped = auto_map_candidate_fields(candidate_id, translated_block)
-        # Přemapovat sekce (Characteristics → DESCRIPTION atd.)
-        remap_fields_post_translation(candidate_id)
-        # Vrátit 1 (přeložili jsme blok) + count namapovaných fields
+        translated_mapping = map_sections_from_block(translated_block)
+        residual = str(translated_mapping.get("REST", "") or "").strip()
+        if residual:
+            save_fields(candidate_id, {"UNMAPPED TEXT": residual},
+                        method="auto_translated_unmapped", update_fts=False,
+                        update_terms=False)
+        _clean_candidate_taxon_name(candidate_id)
+        # Premapovat sekce (Characteristics → DESCRIPTION atd.)
+        remap_fields_post_translation(candidate_id, update_derived=False)
+        # Vratit 1 (prelozili jsme blok) + count namapovanych fields
         return 1 + n_mapped
 
-    # Sestavit user prompt s hodnotami k překladu
-    fields_block = "\n".join(
-        f"{fname}:\n{val}" for fname, val in to_translate.items()
-    )
+    # Translate small chunks as plain text. For a single short field fragment,
+    # JSON adds prompt/output overhead and can make small local models noticeably
+    # slower. Chunks are reassembled in the original order under the same field.
     _lang_for_prompt = (force_lang or doc_lang or "").strip().lower()
-    lang_name = {
-        "cs": "Czech", "cz": "Czech",
-        "ru": "Russian", "rus": "Russian",
-        "de": "German", "deu": "German",
-        "fr": "French", "fra": "French",
-        "zh": "Chinese", "zho": "Chinese", "chi": "Chinese",
-        "la": "Latin", "lat": "Latin",
-        "pl": "Polish", "pol": "Polish",
-        "sk": "Slovak", "slk": "Slovak",
-        "sv": "Swedish", "swe": "Swedish",
-        "it": "Italian", "ita": "Italian",
-        "es": "Spanish", "spa": "Spanish",
-        "hu": "Hungarian", "hun": "Hungarian",
-    }.get(_lang_for_prompt, _lang_for_prompt.upper() or "unknown")
-
-    user_prompt = (
-        f"Source language: {lang_name}\n\n"
-        f"Fields to translate:\n\n{fields_block}"
+    _lang_name = _lang_code_to_name(_lang_for_prompt)
+    _source_instruction = (
+        "Auto-detect the source language."
+        if _lang_name == "auto-detect"
+        else f"The source language is {_lang_name}."
     )
-    system_prompt = settings.get("llm_translation_prompt", LLM_TRANSLATION_PROMPT)
+    _fast_system_prompt = (
+        "Translate palaeontological text into English. Preserve Latin taxon names, "
+        "author names, years, catalogue numbers, measurements, and stratigraphic "
+        "proper names. Do not summarize or explain. Return only the translated text."
+        + _glossary_instruction(_lang_for_prompt)
+    )
+    _call_settings = _translation_call_settings(settings)
 
-    try:
-        raw = lm_chat(settings, system_prompt, user_prompt)
-        result = lm_parse_json(raw)
-    except Exception as exc:
-        logging.warning(f"Translation LLM call failed for candidate {candidate_id}: {exc}")
-        if force:
-            raise  # UI dostane přesný popis chyby (RuntimeError z lm_chat)
-        return 0
+    # Fast path: translate every populated field in ONE LM Studio request. This
+    # removes repeated HTTP/prompt-evaluation overhead. If the model returns bad
+    # JSON, the existing paragraph fallback below remains available.
+    if settings.get("llm_fast_translation", True):
+        _batch_limit = max(1500, int(settings.get("llm_translation_batch_chars", 9000)))
+        _pending = [(str(k), str(v or "").strip()) for k,v in to_translate.items() if str(v or "").strip()]
+        _batches: List[Dict[str, str]] = []
+        _current: Dict[str, str] = {}; _chars = 0
+        for _name, _value in _pending:
+            if _current and _chars + len(_value) > _batch_limit:
+                _batches.append(_current); _current = {}; _chars = 0
+            _current[_name] = _value; _chars += len(_value)
+        if _current:
+            _batches.append(_current)
+        _all_translated: Dict[str, str] = {}
+        _fast_failed = False
+        for _batch_no, _batch_fields in enumerate(_batches, 1):
+            _batch_chars = sum(len(v) for v in _batch_fields.values())
+            _batch_system = (
+                "Translate scientific palaeontological field values to English. "
+                "Return ONLY one JSON object in the form {\"fields\":{\"FIELD\":\"translation\"}}. "
+                "Preserve field names, Latin taxon names, authors, years, catalogue numbers, "
+                "measurements and stratigraphic proper names. Do not explain or summarize."
+                + _glossary_instruction(_lang_for_prompt, "\n".join(_batch_fields.values())))
+            _batch_user = _source_instruction + "\n\n" + json.dumps(
+                {"fields": _batch_fields}, ensure_ascii=False, separators=(",", ":"))
+            _batch_settings = dict(_call_settings)
+            _batch_settings["llm_max_tokens"] = min(
+                int(_batch_settings.get("llm_max_tokens", 4096)),
+                max(512, min(4096, int(_batch_chars * 0.75) + 256)))
+            try:
+                _batch_raw = lm_chat(
+                    _batch_settings, _batch_system, _batch_user, json_mode=True,
+                    candidate_id=candidate_id,
+                    task_type=f"fast_field_batch_translation_{_batch_no}_of_{len(_batches)}",
+                    response_schema={
+                        "type":"object", "properties":{"fields":{"type":"object",
+                        "additionalProperties":{"type":"string"}}},
+                        "required":["fields"], "additionalProperties":False})
+                _batch_obj = lm_parse_json(_batch_raw) or {}
+                _result = _batch_obj.get("fields", {}) if isinstance(_batch_obj, dict) else {}
+                if not isinstance(_result, dict):
+                    raise ValueError("LM Studio returned no fields object")
+                for k,v in _result.items():
+                    key = str(k).strip().upper()
+                    cleaned_value = _clean_translation_output(str(v))
+                    if key in _batch_fields and cleaned_value:
+                        _all_translated[key] = cleaned_value
+            except Exception as exc:
+                _fast_failed = True
+                logging.warning("Fast batch %s/%s failed for candidate %s; using paragraph fallback: %s",
+                                _batch_no, len(_batches), candidate_id, exc)
+                break
+        if _all_translated and not _fast_failed and len(_all_translated) == len(to_translate):
+            _to_save: Dict[str, str] = {}; _n_translated = 0
+            for fname, en_clean in _all_translated.items():
+                original = to_translate[fname]
+                combined = original if _norm_search(en_clean) == _norm_search(original) else f"{en_clean} ({original})"
+                _n_translated += int(combined != original)
+                _to_save[fname] = combined
+            save_fields(candidate_id, _to_save, method="auto_translated_fast_batch",
+                        update_fts=False, update_terms=False)
+            remap_fields_post_translation(candidate_id, update_derived=False)
+            return _n_translated
 
-    if not result or "fields" not in result:
-        if force:
-            raise RuntimeError(
-                "LLM nevrátilo platný JSON s překladem. "
-                "Zkuste jiný model or snižte teplotu na 0.")
-        return 0
+    # A small response ceiling is sufficient for a <=700-character source chunk
+    # and prevents a misbehaving model from generating a long commentary.
+    _call_settings["llm_max_tokens"] = min(int(_call_settings.get("llm_max_tokens", 2048)), 1024)
+    _jobs = _translation_paragraph_jobs(to_translate)
+    translated_chunks: Dict[str, List[str]] = {name: [] for name in to_translate}
+    for _job_no, (_field_name, _paragraph, _paragraph_no, _paragraph_total) in enumerate(_jobs, 1):
+        user_prompt = f"{_source_instruction}\n\n{_paragraph}"
+        try:
+            _translated = lm_chat(
+                _call_settings, _fast_system_prompt, user_prompt, json_mode=False,
+                candidate_id=candidate_id,
+                task_type=f"fast_chunk_translation_{_job_no}_of_{len(_jobs)}")
+        except Exception as exc:
+            logging.warning("Translation chunk %s/%s failed for candidate %s: %s",
+                            _job_no, len(_jobs), candidate_id, exc)
+            if force:
+                raise RuntimeError(
+                    f"Chunk {_paragraph_no}/{_paragraph_total} of {_field_name} failed: {exc}") from exc
+            continue
+        _translated = _clean_translation_output(str(_translated or ""))
+        if _translated:
+            translated_chunks[_field_name].append(_translated)
 
-    translated_fields = result["fields"]
+    translated_fields: Dict[str, str] = {
+        name: "\n\n".join(chunks) for name, chunks in translated_chunks.items() if chunks
+    }
+
     n_translated = 0
     to_save: Dict[str, str] = {}
 
     for fname, en_text in translated_fields.items():
-        if not en_text or not en_text.strip():
+        fname = str(fname).strip().upper()
+        if fname not in to_translate:
+            continue
+        if not isinstance(en_text, str) or not en_text.strip():
             continue
         original = to_translate.get(fname, "")
         en_clean = en_text.strip()
 
-        # Formát: přeložený anglický text (puvodní originální text)
-        # Pokud je překlad identický s originálem (LLM vrátil beze změny),
-        # nevkládat závorky — netřeba duplikovat text.
+        # Format: prelothatny English text (puvodni originalni text)
+        # If is preklad identicky s originalem (LLM vratil beze zmeny),
+        # nevkladat zavorky — netreba duplikovat text.
         if _norm_search(en_clean) == _norm_search(original):
-            combined = original   # beze změny
+            combined = original   # beze zmeny
         else:
-            # Originál do závorek — zkrátit pokud je velmi dlouhý (>400 znaku)
+            # Original to zavorek — zkratit if is velmi dlouhy (>400 znaku)
             orig_display = (
                 original[:400] + "…" if len(original) > 400 else original
             )
@@ -6337,44 +8951,45 @@ def auto_translate_candidate_fields(
         n_translated += 1
 
     if to_save:
-        save_fields(candidate_id, to_save, method="auto_translated")
+        save_fields(candidate_id, to_save, method="auto_translated", update_fts=False, update_terms=False)
 
-    # Po překladu přemapuj sekce na standardní DB pole
+    # After prekladu premapuj sekce on standardni DB field
     # (e.g. "CHARACTERISTICS" → "DESCRIPTION", "DISCUSSION AND COMPARISON" → "DISCUSSION")
-    remap_fields_post_translation(candidate_id)
+    remap_fields_post_translation(candidate_id, update_derived=False)
+    _clean_candidate_taxon_name(candidate_id)
 
     return n_translated
 
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# FEATURE 1: Parser katalogových čísel typového materiálu
+# FEATURE 1: Parser katalogovych cisel typoveho materialu
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Slovník institucí/depozitářu. Klíč = kód, hodnota = plné jméno.
+# Dictionary instituci/depozitaru. Klic = kod, value = plne name.
 _INSTITUTION_CODES: Dict[str, str] = {
-    # Ruské / sovětské
+    # Ruske / sovetske
     "ЯФАН": "Yakutian Branch AN SSSR", "ЯФАН": "Yakutian Branch AN SSSR",
     "ГИН": "Geological Institute RAS", "ПИН": "Palaeontological Institute RAS",
     "ЦНИГР": "Central Research Geological Museum",
-    # Mezinárodní
+    # Mezinagenusni
     "USNM": "Smithsonian Institution NMNH", "NHMUK": "Natural History Museum London",
     "BMNH": "British Museum Natural History", "MCZ": "Harvard MCZ",
     "AMNH": "American Museum of Natural History", "YPM": "Yale Peabody Museum",
     "NIGP": "Nanjing Institute of Geology and Palaeontology",
     "IVPP": "Institute of Vertebrate Paleontology and Paleoanthropology",
-    # České
+    # Czech
     "NM": "National Museum Prague", "NMP": "National Museum Prague",
     "CGS": "Czech Geological Survey", "CGS": "Czech Geological Survey",
-    # Polské / švédské / německé
+    # Polske / svedske / nemecke
     "ZPAL": "Institute of Paleobiology Warsaw",
     "LO": "Lund University Collections", "SGU": "Swedish Geological Survey",
     "SMF": "Senckenberg Research Institute",
-    # Obecné
+    # Obecne
     "LM": "Local Museum (unspecified)",
 }
 
-# Regex pro catalog numbers (flexibilní – podporuje RU, EN, ZH styly)
+# Regex for catalog numbers (flexibilni – podporuje RU, EN, ZH styly)
 _CATNO_RE = re.compile(
     r"""
     (?:
@@ -6432,8 +9047,8 @@ def _parse_type_specimens(text: str) -> Dict[str, str]:
     for m in _TYPE_KIND_RE.finditer(text):
         k = m.group(1).strip()
         _kl = k.lower()
-        # Normalizovat allchny jazykové varianty na kanonickou angličtinu.
-        # Klíčem je lowercase forma (regex je IGNORECASE).
+        # Normalizovat allchny jazykove varianty on kanonickou anglictinu.
+        # Klicem is lowercase forma (regex is IGNORECASE).
         _norm_map = {
             # German -typus → -type
             "holotypus": "Holotype", "lectotypus": "Lectotype",
@@ -6468,12 +9083,12 @@ def _parse_type_specimens(text: str) -> Dict[str, str]:
         inst = (m.group("inst1") or m.group("inst3") or "").strip().upper()
         coll = (m.group("coll") or "").strip().upper()
         no_core = (m.group("no1") or m.group("no2") or m.group("no3") or "").strip()
-        # Sběrová série se přidá k číslu (SNM Z 15784 → katalog "Z 15784")
+        # Sberova serie adds k cislu (SNM From 15784 → katalog "From 15784")
         no = (f"{coll} {no_core}".strip() if coll else no_core)
         if inst and inst not in seen_inst:
-            # Ověřit délku (příliš krátká písmena jsou false positives).
-            # Jednopísmenný institucionální prefix (inst3) je povolen jen
-            # když má číslo aspoň 3 cifry (viz regex) — tady stačí ≥1 znak.
+            # Overit delku (prilis kratka pismena are false positives).
+            # Jednopismenny institucionalni prefix (inst3) is povolen only
+            # when ma cislo aspon 3 cifry (viz regex) — tady staci ≥1 znak.
             if len(inst) >= 1:
                 seen_inst.add(inst)
                 institutions.append(inst)
@@ -6489,35 +9104,35 @@ def _parse_type_specimens(text: str) -> Dict[str, str]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# FEATURE 2: Parser rozměru (SIZE field)
+# FEATURE 2: Parser rozmeru (SIZE field)
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Mapování variant měřených veličin na kanonické klíče
+# Mapping variant merenych velicin on kanonicke klice
 _SIZE_PARAM_ALIASES: Dict[str, str] = {
-    # Délka
+    # Delka
     "length": "length", "lenght": "length", "l": "length",
     "длина": "length", "壳长": "length", "lon": "length",
-    # Šířka
+    # Sirka
     "width": "width", "w": "width", "ширина": "width", "壳宽": "width",
     "šířka": "width",
-    # Výška
+    # Vyska
     "height": "height", "h": "height", "высота": "height", "壳高": "height",
     "výška": "height", "haut": "height",
-    # Pruměr
+    # Prumer
     "diameter": "diameter", "diam": "diameter", "диаметр": "diameter",
-    # Apikální úhel
+    # Apikalni uhel
     "apical angle": "apical_angle", "angle": "apical_angle",
     "угол расхождения": "apical_angle", "угол": "apical_angle",
     "生长角": "apical_angle", "growth angle": "apical_angle",
     # W/H ratio
     "w/h": "wh_ratio", "w/h ratio": "wh_ratio", "ш/в": "wh_ratio",
     "отношение ш/в": "wh_ratio", "切面比率": "wh_ratio",
-    # Tloušťka stěny
+    # Tloustka steny
     "wall thickness": "wall_thickness", "thickness": "wall_thickness",
     "толщина стенки": "wall_thickness",
 }
 
-# Číselný pattern — podporuje desetinnou čárku (RU) i tečku (EN)
+# Ciselny pattern — podporuje desetinnou carku (RU) i tecku (EN)
 _NUMBER_RE = re.compile(r"\d+[.,]\d+|\d+")
 
 # Inline measurement: "length 5.2 mm", "Длина 6,75 мм", "壳长 1.9 毫米"
@@ -6530,6 +9145,95 @@ _INLINE_MEAS_RE = re.compile(
     r"\s*(?P<unit>mm|мм|毫米|cm|°|deg)?",
     re.IGNORECASE | re.UNICODE
 )
+
+# ── Cinske tabulky rozmeru (壳体度量) ─────────────────────────────────────────
+# Struktura: hlavicka s 登记号 (registracni cislo) + nazvy sloupcu, pak datove
+# lines "reg_no val1 val2 …". Typicke for cinske paleontologicke monografie
+# (Qian 1977, 1995, 2000). Sloupce are cinske nazvy merenych velicin.
+_ZH_SIZE_COL_MAP: Dict[str, str] = {
+    "壳长": "length", "壳体长": "length", "保存壳长": "length",
+    "口端宽": "aperture_width", "口宽": "aperture_width", "口径": "aperture_width",
+    "口端高": "aperture_height", "口高": "aperture_height",
+    "口端直径": "aperture_diameter", "口端直经": "aperture_diameter",
+    "顶宽": "apex_width", "顶端宽": "apex_width",
+    "切面比率": "wh_ratio", "宽高比率": "wh_ratio", "宽高比": "wh_ratio",
+    "生长角": "apical_angle", "生 长 角": "apical_angle",
+    "壳宽": "width", "壳高": "height", "壳厚": "wall_thickness",
+    "壳径": "diameter", "直径": "diameter",
+}
+# Varianty labelu registracniho cisla (vcetne OCR mezerovych artefaktu)
+_ZH_REG_LABELS = ("登记号", "登录号", "标本号", "编号")
+
+
+def _parse_chinese_size_table(text: str) -> Dict[str, Any]:
+    """Parsuje čínskou tabulku rozměrů (壳体度量) s registračními čísly.
+
+    Vrací dict:
+      {"columns": [canon,…],
+       "specimens": [(reg_no, {canon: val}),…],
+       "catalog_numbers": [reg_no,…]}
+    nebo {} pokud tabulka není nalezena.
+    """
+    if not text or not re.search(r"[\u4e00-\u9fff]", text):
+        return {}
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    # Najdi hlavicku obsahujici label registracniho cisla (mezery ignorovany).
+    header_idx = None
+    for i, l in enumerate(lines):
+        lc = l.replace(" ", "")
+        if any(rl in lc for rl in _ZH_REG_LABELS):
+            header_idx = i
+            break
+    if header_idx is None:
+        return {}
+    hdr = lines[header_idx].replace(" ", "")
+    # Zjisti poradi sloupcu podle vyskytu cinskych nazvu in hlavicce.
+    # Dedup dle pozice: varianty s mezerami (\"生 长 角\") kolabuji after replace on
+    # stejny retezec and nasly by stejnou pozici dvakrat → duplicitni sloupec.
+    _pos_seen: set = set()
+    positions: List[Tuple[int, str]] = []
+    for zh, canon in _ZH_SIZE_COL_MAP.items():
+        zc = zh.replace(" ", "")
+        idx = 0
+        while True:
+            p = hdr.find(zc, idx)
+            if p < 0:
+                break
+            if p not in _pos_seen:
+                _pos_seen.add(p)
+                positions.append((p, canon))
+            idx = p + len(zc)
+    positions.sort(key=lambda x: x[0])
+    ordered_cols = [c for _, c in positions]
+    if not ordered_cols:
+        return {}
+    # Datove lines: zacinaji registracnim cislem (3–6 cifer).
+    specimens: List[Tuple[str, Dict[str, str]]] = []
+    catalog: List[str] = []
+    for l in lines[header_idx + 1:]:
+        mreg = re.match(r"\s*(\d{3,6})\b", l)
+        if not mreg:
+            continue
+        nums = re.findall(r"\d+\.?\d*", l)
+        if len(nums) < 2:
+            continue
+        reg_no = mreg.group(1)
+        vals = nums[1:]  # without registracniho cisla
+        meas: Dict[str, str] = {}
+        for c, v in zip(ordered_cols, vals):
+            # Pripoj jednotku podle typu veliciny.
+            if c == "apical_angle":
+                meas[c] = f"{v}°"
+            elif c == "wh_ratio":
+                meas[c] = v
+            else:
+                meas[c] = f"{v} mm"
+        specimens.append((reg_no, meas))
+        if reg_no not in catalog:
+            catalog.append(reg_no)
+    if not specimens:
+        return {}
+    return {"columns": ordered_cols, "specimens": specimens, "catalog_numbers": catalog}
 
 
 def _parse_size_field(text: str) -> Dict[str, str]:
@@ -6548,8 +9252,30 @@ def _parse_size_field(text: str) -> Dict[str, str]:
 
     result: Dict[str, str] = {}
 
-    # Normalizace: desetinná čárka RU/CS → tečka (6,75 → 6.75).
-    # re.sub s backreferencí — pozor na escaping.
+    # ── Cinska tabulka rozmeru (壳体度量 s 登记号) ─────────────────────────────
+    # Zkusime nejprve specializovany parser — returns structured rozmery
+    # per-exemplar + katalogova cisla (registracni cisla 登记号).
+    _zh_tbl = _parse_chinese_size_table(text)
+    if _zh_tbl.get("specimens"):
+        # Sluc rozmery from prvniho (typoveho) exemplare to plochych klicu.
+        _first_reg, _first_meas = _zh_tbl["specimens"][0]
+        for _c, _v in _first_meas.items():
+            if _c not in result:
+                result[_c] = _v
+        # Katalogova cisla (registracni cisla) — ulozi for CATALOG_NUMBER.
+        if _zh_tbl.get("catalog_numbers"):
+            result["_catalog_numbers"] = "; ".join(_zh_tbl["catalog_numbers"])
+        # Kompaktni prehled vsech exemplaru for rucni kontrolu.
+        _spec_summ = []
+        for _reg, _meas in _zh_tbl["specimens"][:6]:
+            _mv = ", ".join(f"{k}={v}" for k, v in _meas.items())
+            _spec_summ.append(f"#{_reg}: {_mv}")
+        if _spec_summ:
+            result["table_raw"] = " | ".join(_spec_summ)
+        return result
+
+    # Normalizace: desetinna carka RU/CS → tecka (6,75 → 6.75).
+    # re.sub s backreferenci — pozor on escaping.
     normalized = re.sub(r"(\d),\s*(\d)", lambda m: m.group(1)+"."+m.group(2), text)
 
     for m in _INLINE_MEAS_RE.finditer(normalized):
@@ -6563,12 +9289,12 @@ def _parse_size_field(text: str) -> Dict[str, str]:
         if canonical not in result:
             result[canonical] = stored
 
-    # Pokus o ASCII tabulku: hledáme řádky se dvěma a více čísly
+    # Pokus o ASCII tabulku: hledame lines dvema and vice cisly
     lines = text.split("\n")
-    # Heuristika: řádky kde jsou min. 2 čísla oddělená mezerami → tabulka
+    # Heuristika: lines kde are min. 2 cisla oddelena mezerami → tabulka
     number_rows = [l for l in lines if len(_NUMBER_RE.findall(l)) >= 2]
     if len(number_rows) >= 2:
-        # Přidat jako surový řetězec pro ruční kontrolu
+        # Pridat as surovy retezec for rucni kontrolu
         if "table_raw" not in result:
             result["table_raw"] = " | ".join(r.strip() for r in number_rows[:5])
 
@@ -6579,22 +9305,23 @@ def _size_dict_to_str(d: Dict[str, str]) -> str:
     """Formats the result of _parse_size_field as a human-readable string for export."""
     if not d:
         return ""
-    parts = [f"{k}: {v}" for k, v in d.items() if k != "table_raw"]
+    _skip = {"table_raw", "_catalog_numbers"}
+    parts = [f"{k}: {v}" for k, v in d.items() if k not in _skip]
     if "table_raw" in d:
-        parts.append(f"[table: {d['table_raw'][:80]}]")
+        parts.append(f"[table: {d['table_raw'][:120]}]")
     return "; ".join(parts)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# FEATURE 4: Validace completenessi záznamu podle ranku
+# FEATURE 4: Validace completenessi zaznamu podle ranku
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Pole požadovaná pro každý rank. Hodnoty jsou (field, weight) kde weight=1 je
-# povinné a weight=0.5 je doporučené.
+# Field pozadovana for each rank. Values are (field, weight) kde weight=1 is
+# povinne and weight=0.5 is doporucene.
 _REQUIRED_FIELDS_BY_RANK: Dict[str, List[Tuple[str, float]]] = {
-    # PRAVIDLO: species/subspecies mají TYPE SPECIMENS (konkrétní exempláře)
-    #           genus a vyšší mají TYPE TAXON (typový druh / rod)
-    # Pozn.: LOCALITY pro druhy je optional (0.5) — data bývají v OCCURRENCE.
+    # PRAVIDLO: species/subspecies maji TYPE SPECIMENS (konkretni exemplare)
+    #           genus and vyssi maji TYPE TAXON (typovy druh / genus)
+    # Note:: LOCALITY for druhy is optional (0.5) — data byvaji in OCCURRENCE.
     # _completeness_check() akceptuje OCCURRENCE jako alternativu k LOCALITY.
     "species": [
         ("DIAGNOSIS",       1.0),
@@ -6605,7 +9332,7 @@ _REQUIRED_FIELDS_BY_RANK: Dict[str, List[Tuple[str, float]]] = {
         ("FIGURES",         0.5),
         ("OCCURRENCE",      0.5),
     ],
-    # Subspecies: identické požadavky jako species — TYPE SPECIMENS (ne TYPE TAXON!)
+    # Subspecies: identicke pozadavky as species — TYPE SPECIMENS (ne TYPE TAXON!)
     "subspecies": [
         ("DIAGNOSIS",       1.0),
         ("TYPE SPECIMENS",  1.0),
@@ -6616,20 +9343,20 @@ _REQUIRED_FIELDS_BY_RANK: Dict[str, List[Tuple[str, float]]] = {
         ("OCCURRENCE",      0.5),
     ],
     "genus": [
-        ("TYPE TAXON",      1.0),  # typový druh — jen pro genus a vyšší
+        ("TYPE TAXON",      1.0),  # typovy druh — only for genus and vyssi
         ("DIAGNOSIS",       1.0),
         ("DESCRIPTION",     0.5),
         ("OCCURRENCE",      0.5),
         ("INCLUDED TAXONS", 0.5),
     ],
     "family": [
-        ("TYPE TAXON",      1.0),  # typový rod
+        ("TYPE TAXON",      1.0),  # typovy genus
         ("DIAGNOSIS",       1.0),
         ("INCLUDED TAXONS", 0.5),
         ("OCCURRENCE",      0.5),
     ],
     "order": [
-        ("TYPE TAXON",      0.8),  # typová čeleď (méně povinné)
+        ("TYPE TAXON",      0.8),  # typova family (mene povinne)
         ("DIAGNOSIS",       1.0),
         ("INCLUDED TAXONS", 0.5),
         ("OCCURRENCE",      0.5),
@@ -6645,20 +9372,20 @@ _REQUIRED_FIELDS_BY_RANK: Dict[str, List[Tuple[str, float]]] = {
     ],
 }
 
-# Zástupná jména ranku pro normalizaci.
-# KLÍČOVÉ PRAVIDLO: species + subspecies → TYPE SPECIMENS (ne TYPE TAXON)
-#                   genus + vyšší → TYPE TAXON (ne TYPE SPECIMENS)
+# Zastupna jmena ranku for normalizaci.
+# KLICOVE PRAVIDLO: species + subspecies → TYPE SPECIMENS (ne TYPE TAXON)
+#                   genus + vyssi → TYPE TAXON (ne TYPE SPECIMENS)
 _RANK_ALIASES: Dict[str, str] = {
-    # species-grade (potřebují TYPE SPECIMENS)
+    # species-grade (potrebuji TYPE SPECIMENS)
     "species": "species", "druh": "species", "вид": "species", "art": "species",
     "espèce": "species", "specie": "species", "especie": "species",
-    "subspecies": "species",   # poddruh → stejné požadavky jako druh (TYPE SPECIMENS!)
+    "subspecies": "species",   # poddruh → stejne pozadavky as druh (TYPE SPECIMENS!)
     "subsp": "species", "ssp": "species", "var": "species", "variety": "species",
     "forma": "species", "form": "species",
-    # genus-grade (potřebují TYPE TAXON)
+    # genus-grade (potrebuji TYPE TAXON)
     "genus": "genus", "rod": "genus", "род": "genus", "gattung": "genus",
     "subgenus": "genus", "subgen": "genus", "podrod": "genus",
-    # family-grade (potřebují TYPE TAXON)
+    # family-grade (potrebuji TYPE TAXON)
     "family": "family", "čeleď": "family", "семейство": "family", "famille": "family",
     "familia": "family", "familie": "family",
     "subfamily": "family", "subfamilia": "family",
@@ -6695,16 +9422,16 @@ def _completeness_check(
     Score: součet vah přítomných fields / součet vah allch požadovaných fields.
     Pole se považuje za přítomné pokud exists a není NOT_PROVIDED.
     """
-    # Normalizace ranku: subspecies má explicitní klíč v _REQUIRED_FIELDS_BY_RANK,
-    # proto zkusíme nejprve přímou shodu (zachová subspecies jako subspecies,
+    # Normalizace ranku: subspecies ma explicitni klic in _REQUIRED_FIELDS_BY_RANK,
+    # proto tryime nejprve primou shodu (preserves subspecies as subspecies,
     # ne jen alias na species).
     rank_raw_norm = (rank_raw or "").lower().split()[0]
     if rank_raw_norm in _REQUIRED_FIELDS_BY_RANK:
-        rank = rank_raw_norm          # přesná shoda (subspecies, species, genus…)
+        rank = rank_raw_norm          # presna shoda (subspecies, species, genus…)
     else:
         rank = _RANK_ALIASES.get(rank_raw_norm, "")
     if not rank or rank not in _REQUIRED_FIELDS_BY_RANK:
-        return 1.0, []  # unknown rank → žádné požadavky
+        return 1.0, []  # unknown rank → zadne pozadavky
 
     required = _REQUIRED_FIELDS_BY_RANK[rank]
     total_weight = sum(w for _, w in required)
@@ -6716,8 +9443,8 @@ def _completeness_check(
     occ_filled = bool((fields.get("OCCURRENCE","") or "").strip() and
                       fields.get("OCCURRENCE","") != NOT_PROVIDED)
 
-    # TYPE SPECIMENS se považují za přítomné pokud je v MATERIAL EXAMINED
-    # zmíněn holotyp/paratyp/lektotyp — jen pro species-grade taxony
+    # TYPE SPECIMENS povazuji za pritomne if is in MATERIAL EXAMINED
+    # zminen holotyp/paratyp/lektotyp — only for species-grade taxony
     _MAT = (fields.get("MATERIAL EXAMINED","") or "").lower()
     _type_in_material = any(kw in _MAT for kw in TYPE_SPECIMEN_KEYWORDS)
 
@@ -6733,17 +9460,17 @@ def _completeness_check(
         # TYPE SPECIMENS pro species/subspecies – akceptuj holotype/paratype v MATERIAL EXAMINED
         if field == "TYPE SPECIMENS" and not filled and _species_grade and _type_in_material:
             filled_weight += weight
-            continue   # nepřidávat do missing (data jsou v MATERIAL EXAMINED)
+            continue   # nepridavat to missing (data are in MATERIAL EXAMINED)
         if filled:
             filled_weight += weight
         elif weight >= 1.0:
             missing.append(field)
 
-    # Score: povinná pole jsou základ (weight ≥ 1.0),
-    # volitelná tvoří bonus. Povinná pole určují "completeness",
-    # volitelná ji vylepšují max o 20 %.
+    # Score: povinna field are zaklad (weight ≥ 1.0),
+    # volitelna tvori bonus. Povinna field urcuji "completeness",
+    # volitelna ji vylepsuji max o 20 %.
     # POZOR: alternativy (OCCURRENCE ≡ LOCALITY, MATERIAL EXAMINED ≡ TYPE SPECIMENS)
-    # jsou zahrnuty jak v loop výše (missing list) tak i v score výpočtu níže.
+    # are zahrnuty jak in loop vyse (missing list) tak i in score vypoctu nithat.
     mandatory_w = sum(w for _, w in required if w >= 1.0)
     optional_w  = sum(w for _, w in required if w < 1.0)
 
@@ -6769,16 +9496,16 @@ def _completeness_check(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# FEATURE 5: Cross-reference synonym → propojení records v rámci Documentu
+# FEATURE 5: Cross-reference synonym → propojeni records in ramci Documentu
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Extrakce taxonových jmen ze synonymiky
+# Extrakce taxonovych jmen from synonymiky
 _SYN_TAXON_RE = re.compile(
     r"(?:^|\n)"
-    r"(?:\d{4}\s+)?"                              # volitelný rok na začátku
+    r"(?:\d{4}\s+)?"                              # optional year on zacatku
     r"(?P<name>"
     r"[A-Z][a-z]+"                                  # rod
-    r"(?:\s+[a-z][a-z\-]+)?"                      # volitelný druh
+    r"(?:\s+[a-z][a-z\-]+)?"                      # optional druh
     r")",
     re.MULTILINE | re.UNICODE
 )
@@ -6807,7 +9534,7 @@ def _link_synonyms_for_document(document_id: int) -> int:
     Vrací count nových propojení.
     """
     con = db()
-    # Všichni kandidáti Documentu s jejich poli
+    # Vsichni kandidati Documentu s jejich poli
     cands = con.execute(
         "SELECT id, taxon_name, rank_guess FROM taxon_candidates "
         "WHERE document_id=? AND status IN ('approved','pending','low_confidence')",
@@ -6818,7 +9545,7 @@ def _link_synonyms_for_document(document_id: int) -> int:
         con.close()
         return 0
 
-    # Načíst SYNONYMY pole pro každého kandidáta
+    # Load SYNONYMY field for kazdeho candidate
     cand_ids = [c["id"] for c in cands]
     syn_rows = con.execute(
         f"SELECT candidate_id, field_value FROM occurrence_fields "
@@ -6832,7 +9559,7 @@ def _link_synonyms_for_document(document_id: int) -> int:
         c["taxon_name"].lower().strip(): c["id"] for c in cands
         if c["taxon_name"]
     }
-    # Přidat i jen rodové jméno (první slovo) pro větší pokrytí
+    # Pridat i only genusove name (prvni slovo) for vetsi pokryti
     for c in cands:
         first = (c["taxon_name"] or "").split()[0].lower().strip()
         if first and first not in name_to_id:
@@ -6847,7 +9574,7 @@ def _link_synonyms_for_document(document_id: int) -> int:
         for mname in mentioned_names:
             related_id = name_to_id.get(mname)
             if related_id and related_id != cand["id"]:
-                # Save jako RELATED_RECORD_ID (pokud ještě není)
+                # Save as RELATED_RECORD_ID (if jeste neni)
                 existing = con.execute(
                     "SELECT id FROM occurrence_fields "
                     "WHERE candidate_id=? AND field_name='RELATED_RECORD_ID'",
@@ -6867,7 +9594,7 @@ def _link_synonyms_for_document(document_id: int) -> int:
 
 def build_output_row(cand: sqlite3.Row, fields: Dict[str, str], doc_row: sqlite3.Row) -> Dict[str, str]:
     """Builds a complete output row with all OUTPUT_FIELDS."""
-    # sqlite3.Row nepodporuje .get() s defaultem → převedeme na dict hned na začátku
+    # sqlite3.Row nepodporuje .get() s defaultem → prevedeme on dict hned on zacatku
     cand    = dict(cand)
     doc_row = dict(doc_row)
     row: Dict[str, str] = {f: NOT_PROVIDED for f in OUTPUT_FIELDS}
@@ -6882,17 +9609,17 @@ def build_output_row(cand: sqlite3.Row, fields: Dict[str, str], doc_row: sqlite3
     row["EXTRACTION_CONFIDENCE"] = str(round(cand["confidence"],3))
     row["SOURCE PAGES"]        = str(cand["page_start"])
 
-    # Přiřazená pole
+    # Prirazena field
     for fname, fval in fields.items():
         if fname in row:
             row[fname] = fval
 
-    # Fallback AUTHOR z nadpisu — extrahuj i rok zvlášť
+    # Fallback AUTHOR from nadpisu — extrahuj i year zvlast
     if row["AUTHOR"] == NOT_PROVIDED:
         m = AUTHOR_YEAR_RE.search(cand["heading_text"] or "")
         if m:
             row["AUTHOR"] = m.group(0)
-    # Rok publikace: pokud AUTHOR_YEAR_RE má rok, saveíme ho zvlášť
+    # Rok publikace: if AUTHOR_YEAR_RE ma year, saveime ho zvlast
     if row.get("YEAR_OF_PUBLICATION", NOT_PROVIDED) == NOT_PROVIDED:
         _hy = cand.get("heading_text") or cand.get("taxon_name") or ""
         _ym = re.search(r"\b(1[5-9]\d{2}|20[012]\d)\b", _hy)
@@ -6905,7 +9632,7 @@ def build_output_row(cand: sqlite3.Row, fields: Dict[str, str], doc_row: sqlite3
         if m:
             row["OPEN NOMENCLATURE / IDENTIFICATION QUALIFIERS"] = m.group(0)
 
-    # Feature 1: TYPE SPECIMENS → strukturované katalogové číslo
+    # Feature 1: TYPE SPECIMENS → structured katalogove cislo
     type_spec_text = row.get("TYPE SPECIMENS", "") or ""
     if type_spec_text and type_spec_text != NOT_PROVIDED:
         ts = _parse_type_specimens(type_spec_text)
@@ -6913,7 +9640,7 @@ def build_output_row(cand: sqlite3.Row, fields: Dict[str, str], doc_row: sqlite3
         if ts["institution_codes"]: row["INSTITUTION_CODE"]   = ts["institution_codes"]
         if ts["catalog_numbers"]:   row["CATALOG_NUMBER"]     = ts["catalog_numbers"]
 
-    # Feature 2: SIZE → strukturované rozměry
+    # Feature 2: SIZE → structured rozmery
     size_text = row.get("SIZE", "") or ""
     if size_text and size_text != NOT_PROVIDED:
         size_d = _parse_size_field(size_text)
@@ -6994,7 +9721,7 @@ def export_to_xlsx(
     for r in review_rows:
         ws2.append([r.get(c, "") for c in review_cols])
 
-    # Sheet 3 – Reference / literatura (volitelná, jen pokud bylo něco vybráno)
+    # Sheet 3 – Reference / literatura (volitelna, only if bylo neco vybrano)
     if references:
         ws3 = wb.create_sheet("References")
         ws3.append(["#", "Reference"])
@@ -7052,11 +9779,11 @@ def export_to_json(rows: List[Dict[str, str]]) -> bytes:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# GOLD SET — parser DOCX + evaluátor
+# GOLD SET — parser DOCX + evaluator
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Mapování gold-set labels na kanonická PaleoN pole (SECTION_FIELDS).
-# Klíče jsou lowercase bez teček — porovnáváme s label.lower().rstrip('.')
+# Mapping gold-set labels on kanonicka PaleoN field (SECTION_FIELDS).
+# Klice are lowercase without tecek — porovnavame s label.lower().rstrip('.')
 _GOLDSET_LABEL_TO_FIELD: Dict[str, str] = {
     # DIAGNOSIS
     "diagnosis": "DIAGNOSIS", "original diagnosis": "DIAGNOSIS",
@@ -7215,7 +9942,7 @@ def _infer_taxon_name_from_body(body: List[str], rank: str) -> str:
     }
     acceptable = _rank_cats.get(rank_lower, {rank_lower})
 
-    # Regex pro ořez nomenklaturních aktu a obrázkových odkazu na konci
+    # Regex for orez nomenklaturnich aktu and obrazkovych odkazu on konci
     _NOM_STRIP = re.compile(
         r"\s+(?:new\s+(?:genus|species|subspecies|combination|family)|"
         r"(?:gen|sp|fam|ord|cl|subsp|subgen)\.?\s*(?:nov|n)\.?|"
@@ -7235,8 +9962,8 @@ def _infer_taxon_name_from_body(body: List[str], rank: str) -> str:
         s = _FIG_STRIP.sub("", s).strip()
         return s
 
-    # Regex pro inline vyhledávání rank-labelu uvnitř odstavce
-    # (pro případ sloučených odstavcu jako "Class Foo 1926 Order Bar 1916")
+    # Regex for inline vyhledavani rank-labelu uvnitr odstavce
+    # (for case sloucenych odstavcu as "Class Foo 1926 Order Bar 1916")
     if acceptable:
         _labels_esc = "|".join(re.escape(lbl) for lbl in sorted(acceptable, key=len, reverse=True))
         _inline_rank_re = re.compile(
@@ -7251,7 +9978,7 @@ def _infer_taxon_name_from_body(body: List[str], rank: str) -> str:
         if not para:
             continue
 
-        # ── 1. Rank-label na začátku odstavce ────────────────────────────
+        # ── 1. Rank-label on zacatku odstavce ────────────────────────────
         rm = RANK_LABEL_RE.match(para)
         if rm:
             label_word = rm.group(1).lower()
@@ -7259,13 +9986,13 @@ def _infer_taxon_name_from_body(body: List[str], rank: str) -> str:
             if label_word in acceptable and rest:
                 return _clean(rest.split("\n")[0])
 
-            # ── 2. Rank-label uvnitř sloučeného odstavce ─────────────────
-            # (RANK_LABEL_RE chytil jiný rank na začátku → hledáme dál)
+            # ── 2. Rank-label uvnitr slouceneho odstavce ─────────────────
+            # (RANK_LABEL_RE chytil jiny rank on zacatku → hledame dal)
             if _inline_rank_re:
                 im = _inline_rank_re.search(para)
                 if im:
                     candidate = im.group(1).strip()
-                    # Ořez za dalším rank-labelem or koncem věty
+                    # Orez zand othersm rank-labelem or koncem vety
                     candidate = re.split(
                         r"\s+\b(?:Class|Subclass|Phylum|Order|Suborder|Family|Subfamily"
                         r"|Genus|Subgenus|Tribe|Superfamily|Infraorder)\b",
@@ -7275,9 +10002,9 @@ def _infer_taxon_name_from_body(body: List[str], rank: str) -> str:
                     if candidate and candidate.lower() not in TAXON_STOPWORDS:
                         return _clean(candidate)
 
-        # ── 3. Detekce druhu / poddruhu (binomium s volitelnými kvalif.) ─
+        # ── 3. Detection druhu / poddruhu (binomium s optionalmi kvalif.) ─
         elif rank_lower in ("species", "subspecies"):
-            # Zachytí: "Genus epithet", "Genus ? epithet", "Genus cf. epithet",
+            # Zachyti: "Genus epithet", "Genus ? epithet", "Genus cf. epithet",
             #           "Genus aff. epithet", "Genus ? cf. epithet", …
             sp_re = re.compile(
                 r"^([A-Z][A-Za-z\u00c0-\u024f\-]+)"    # genus (s diakritikou)
@@ -7286,14 +10013,14 @@ def _infer_taxon_name_from_body(body: List[str], rank: str) -> str:
             )
             sm = sp_re.match(para)
             if sm:
-                raw = para.split("(")[0].strip()   # ořez "(Autor, rok)"
+                raw = para.split("(")[0].strip()   # orez "(Autor, year)"
                 return _clean(raw[:150])
-            # Taky "sp." samostatně: "Cavernolites sp."
+            # Taky "sp." samostatne: "Cavernolites sp."
             sp_only = re.compile(r"^([A-Z][A-Za-z\-]+)\s+sp\.\s*$", re.I)
             if sp_only.match(para):
                 return para.strip()
-            # Poslední záchrana pro druhy: první řádek začínající velkým slovem
-            # které není label (Holotype:, Locus:, Description:, …)
+            # Posledni zachrana for druhy: prvni line zacinajici velkym slovem
+            # which neni label (Holotype:, Locus:, Description:, …)
             words = para.split()
             if (len(words) >= 1
                     and words[0][0].isupper()
@@ -7371,7 +10098,7 @@ def parse_goldset_docx(path: str) -> List[Dict[str, Any]]:
 
         rec["block_text"] = "\n".join(body)
         rec["fields"] = fields
-        # Pokud taxon_name nebyl na řádku markeru, odvodit z těla záznamu
+        # If taxon_name nebyl on radku markeru, odvodit from tela zaznamu
         if not rec.get("taxon_name"):
             rec["taxon_name"] = _infer_taxon_name_from_body(body, rec.get("rank", ""))
 
@@ -7435,12 +10162,13 @@ class GoldEvalResult:
     gold_rank: str
     matched_cand_id: Optional[int]
     matched_name: Optional[str]
-    detected: bool            # byl taxon vubec detekován?
-    name_score: float         # fuzzy shoda jména (0–1)
-    block_contains_gold: bool # blok PaleoN obsahuje klíčový text gold setu?
-    block_too_short: bool     # blok kratší než gold (missing konec)
-    block_too_long: bool      # blok delší než gold o >40 % (pohltil cizí text)
-    field_results: Dict[str, bool]  # pole → správně namapováno?
+    detected: bool            # byl taxon vubec detekovan?
+    name_score: float         # fuzzy shoda jmena (0–1)
+    block_contains_gold: bool # blok PaleoN contains klicovy text gold setu?
+    block_too_short: bool     # blok kratsi nez gold (missing konec)
+    block_too_long: bool      # blok delsi nez gold o >40 % (pohltil cizi text)
+    block_similarity: float   # token Dice similarity of gold and detected blocks
+    field_results: Dict[str, bool]  # field → spravne namapovano?
 
 
 def evaluate_goldset(goldset_doc_id: int, linked_doc_id: int) -> List[GoldEvalResult]:
@@ -7478,7 +10206,7 @@ def evaluate_goldset(goldset_doc_id: int, linked_doc_id: int) -> List[GoldEvalRe
         """Fuzzy match: compare normalised first words (genus) + the full string."""
         gn = _norm_search(gold)
         cn = _norm_search(cand)
-        # První token (rod) musí sedět přesně
+        # Prvni token (genus) must sedet presne
         g_first = gn.split()[0] if gn.split() else ""
         c_first = cn.split()[0] if cn.split() else ""
         if g_first and c_first and g_first not in cn and c_first not in gn:
@@ -7491,31 +10219,36 @@ def evaluate_goldset(goldset_doc_id: int, linked_doc_id: int) -> List[GoldEvalRe
             return False
         gw = set(_norm_search(gold_val).split())
         pw = set(_norm_search(paleon_val).split())
-        # Odfiltrovat stop slova (krátká, číslice)
+        # Odfiltrovat stop slova (kratka, cislice)
         gw = {w for w in gw if len(w) > 3}
         if not gw:
             return len(_norm_search(gold_val)) > 0 and _norm_search(gold_val)[:30] in _norm_search(paleon_val)
         return len(gw & pw) / len(gw) >= 0.30
 
     results = []
+    used_candidate_ids: set = set()
     for gr in gold_records:
         gold_name = gr["taxon_name"]
         expected = json.loads(gr["expected_fields_json"] or "{}")
         gold_block = gr["block_text"] or ""
-        # Klíčová věta gold setu (první neprázdný odstavec těla)
+        # Klicova veta gold setu (prvni neprazdny odstavec tela)
         gold_first_para = next(
             (l.strip() for l in gold_block.split("\n") if len(l.strip()) > 30), "")
 
-        # Najít nejlépe pasujícího kandidáta
+        # Najit nejlepe pasujiciho candidate
         best_cand = None
         best_score = 0.0
         for c in cands:
+            if c["id"] in used_candidate_ids:
+                continue
             sc = _name_score(gold_name, c["taxon_name"] or "")
             if sc > best_score:
                 best_score = sc
                 best_cand = c
 
         detected = best_score >= 0.55
+        if detected and best_cand is not None:
+            used_candidate_ids.add(best_cand["id"])
 
         if not detected:
             results.append(GoldEvalResult(
@@ -7523,6 +10256,7 @@ def evaluate_goldset(goldset_doc_id: int, linked_doc_id: int) -> List[GoldEvalRe
                 matched_cand_id=None, matched_name=None,
                 detected=False, name_score=best_score,
                 block_contains_gold=False, block_too_short=False, block_too_long=False,
+                block_similarity=0.0,
                 field_results={k: False for k in expected}))
             continue
 
@@ -7535,7 +10269,7 @@ def evaluate_goldset(goldset_doc_id: int, linked_doc_id: int) -> List[GoldEvalRe
         block_contains = (
             _norm_search(gold_first_para[:80]) in _norm_search(paleon_block)
             if gold_first_para else True)
-        # Délkové porovnání jen pokud gold blok není prázdný
+        # Delkove porovnani only if gold blok neni prazdny
         gold_len = len(gold_block)
         pal_len  = len(paleon_block)
         block_short = gold_len > 100 and pal_len < gold_len * 0.6
@@ -7551,9 +10285,17 @@ def evaluate_goldset(goldset_doc_id: int, linked_doc_id: int) -> List[GoldEvalRe
         }
         con2.close()
 
+        gold_tokens = set(_norm_search(gold_block).split())
+        paleon_tokens = set(_norm_search(paleon_block).split())
+        block_similarity = (
+            2.0 * len(gold_tokens & paleon_tokens) / (len(gold_tokens) + len(paleon_tokens))
+            if gold_tokens and paleon_tokens else 0.0)
+
         field_results = {}
         for gold_label, gold_val in expected.items():
-            paleon_field = _GOLDSET_LABEL_TO_FIELD.get(gold_label.lower().rstrip("."), "")
+            paleon_field = (
+                gold_label if gold_label in SECTION_FIELDS
+                else _GOLDSET_LABEL_TO_FIELD.get(gold_label.lower().rstrip("."), ""))
             if not paleon_field:
                 field_results[gold_label] = False
                 continue
@@ -7566,13 +10308,116 @@ def evaluate_goldset(goldset_doc_id: int, linked_doc_id: int) -> List[GoldEvalRe
             detected=True, name_score=round(best_score, 3),
             block_contains_gold=block_contains,
             block_too_short=block_short, block_too_long=block_long,
+            block_similarity=round(block_similarity, 3),
             field_results=field_results))
 
     return results
 
 
+@dataclass
+class BenchmarkMetrics:
+    gold_records: int
+    detected_candidates: int
+    true_positives: int
+    false_positives: int
+    false_negatives: int
+    precision: float
+    recall: float
+    f1: float
+    boundary_accuracy: float
+    mean_block_similarity: float
+    field_micro_accuracy: float
+    field_macro_accuracy: float
+    per_field_accuracy: Dict[str, float] = field(default_factory=dict)
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "gold_records": self.gold_records,
+            "detected_candidates": self.detected_candidates,
+            "true_positives": self.true_positives,
+            "false_positives": self.false_positives,
+            "false_negatives": self.false_negatives,
+            "precision": self.precision,
+            "recall": self.recall,
+            "f1": self.f1,
+            "boundary_accuracy": self.boundary_accuracy,
+            "mean_block_similarity": self.mean_block_similarity,
+            "field_micro_accuracy": self.field_micro_accuracy,
+            "field_macro_accuracy": self.field_macro_accuracy,
+            "per_field_accuracy": self.per_field_accuracy,
+        }
+
+
+def calculate_benchmark_metrics(results: List[GoldEvalResult],
+                                linked_doc_id: int) -> BenchmarkMetrics:
+    """Calculates detection, boundary and field metrics with one-to-one matches."""
+    con = db()
+    detected_candidates = con.execute(
+        "SELECT COUNT(*) FROM taxon_candidates WHERE document_id=? "
+        "AND status NOT IN ('rejected')", (linked_doc_id,)).fetchone()[0]
+    con.close()
+    tp = sum(1 for r in results if r.detected)
+    fn = max(0, len(results) - tp)
+    fp = max(0, int(detected_candidates) - tp)
+    precision = tp / (tp + fp) if tp + fp else 0.0
+    recall = tp / (tp + fn) if tp + fn else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+    detected = [r for r in results if r.detected]
+    boundary_ok = [r for r in detected
+                   if r.block_contains_gold and not r.block_too_short and not r.block_too_long]
+    boundary_accuracy = len(boundary_ok) / len(detected) if detected else 0.0
+    mean_similarity = (sum(r.block_similarity for r in detected) / len(detected)
+                       if detected else 0.0)
+    field_values = [ok for r in results for ok in r.field_results.values()]
+    field_micro = sum(field_values) / len(field_values) if field_values else 0.0
+    labels = sorted({label for r in results for label in r.field_results})
+    per_field = {}
+    for label in labels:
+        values = [r.field_results[label] for r in results if label in r.field_results]
+        per_field[label] = sum(values) / len(values) if values else 0.0
+    field_macro = sum(per_field.values()) / len(per_field) if per_field else 0.0
+    return BenchmarkMetrics(
+        gold_records=len(results), detected_candidates=int(detected_candidates),
+        true_positives=tp, false_positives=fp, false_negatives=fn,
+        precision=round(precision, 4), recall=round(recall, 4), f1=round(f1, 4),
+        boundary_accuracy=round(boundary_accuracy, 4),
+        mean_block_similarity=round(mean_similarity, 4),
+        field_micro_accuracy=round(field_micro, 4),
+        field_macro_accuracy=round(field_macro, 4),
+        per_field_accuracy={k: round(v, 4) for k, v in per_field.items()})
+
+
+def save_benchmark_run(goldset_doc_id: int, linked_doc_id: int,
+                       metrics: BenchmarkMetrics) -> int:
+    """Persists one reproducible benchmark snapshot."""
+    with db_transaction() as con:
+        cur = con.execute(
+            "INSERT INTO benchmark_runs "
+            "(goldset_doc_id,linked_document_id,parser_version,metrics_json,created_at) "
+            "VALUES (?,?,?,?,?)",
+            (goldset_doc_id, linked_doc_id, APP_VERSION,
+             json.dumps(metrics.as_dict(), ensure_ascii=False),
+             datetime.now().isoformat(timespec="seconds")))
+        return int(cur.lastrowid)
+
+
+def get_benchmark_history(goldset_doc_id: int, limit: int = 25) -> List[Dict[str, Any]]:
+    con = db()
+    rows = con.execute(
+        "SELECT * FROM benchmark_runs WHERE goldset_doc_id=? "
+        "ORDER BY created_at DESC,id DESC LIMIT ?", (goldset_doc_id, int(limit))).fetchall()
+    con.close()
+    output = []
+    for row in rows:
+        item = dict(row)
+        item["metrics"] = json.loads(item.pop("metrics_json") or "{}")
+        output.append(item)
+    return output
+
+
 def export_goldset_report_xlsx(results: List[GoldEvalResult],
-                                goldset_name: str, doc_name: str) -> bytes:
+                                goldset_name: str, doc_name: str,
+                                metrics: Optional[BenchmarkMetrics] = None) -> bytes:
     """Export benchmark reportu jako XLSX."""
     try:
         import openpyxl
@@ -7590,30 +10435,34 @@ def export_goldset_report_xlsx(results: List[GoldEvalResult],
     YEL   = PatternFill("solid", fgColor="FFEB9C")
 
     # Souhrn
-    n_total   = len(results)
-    n_det     = sum(1 for r in results if r.detected)
-    n_fp      = 0  # přesnost nelze spočítat bez znalosti allch kandidátu bez gold
-    recall    = n_det / n_total if n_total else 0
-    n_short   = sum(1 for r in results if r.block_too_short)
-    n_long    = sum(1 for r in results if r.block_too_long)
+    n_total = len(results)
+    n_det = sum(1 for r in results if r.detected)
+    n_short = sum(1 for r in results if r.block_too_short)
+    n_long = sum(1 for r in results if r.block_too_long)
     n_no_cont = sum(1 for r in results if r.detected and not r.block_contains_gold)
-
     all_gold_fields = []
     for r in results:
         for k in r.field_results:
             if k not in all_gold_fields:
                 all_gold_fields.append(k)
-    field_acc = {}
-    for f in all_gold_fields:
-        vals = [r.field_results[f] for r in results if f in r.field_results]
-        field_acc[f] = sum(vals)/len(vals) if vals else 0
+    field_acc = metrics.per_field_accuracy if metrics else {}
+    if not field_acc:
+        for f in all_gold_fields:
+            vals = [r.field_results[f] for r in results if f in r.field_results]
+            field_acc[f] = sum(vals) / len(vals) if vals else 0.0
 
     summary = [
         ("Gold set file", goldset_name),
         ("Indexed document", doc_name),
         ("Gold set records", n_total),
         ("Detected", n_det),
-        ("Recall", f"{recall:.1%}"),
+        ("Precision", f"{metrics.precision:.1%}" if metrics else "n/a"),
+        ("Recall", f"{metrics.recall:.1%}" if metrics else "n/a"),
+        ("F1", f"{metrics.f1:.1%}" if metrics else "n/a"),
+        ("Boundary accuracy", f"{metrics.boundary_accuracy:.1%}" if metrics else "n/a"),
+        ("Mean block similarity", f"{metrics.mean_block_similarity:.1%}" if metrics else "n/a"),
+        ("Field micro accuracy", f"{metrics.field_micro_accuracy:.1%}" if metrics else "n/a"),
+        ("Field macro accuracy", f"{metrics.field_macro_accuracy:.1%}" if metrics else "n/a"),
         ("Boundary too short (block too short)", n_short),
         ("Boundary too long (block too long)", n_long),
         ("Block does not contain the key gold-set text", n_no_cont),
@@ -7629,7 +10478,7 @@ def export_goldset_report_xlsx(results: List[GoldEvalResult],
     # Detail table
     headers = ["#", "Gold taxon", "Rank", "Detected",
                "Name match", "Matched candidate",
-               "Blok OK", "Too short", "Too long"] + all_gold_fields
+               "Blok OK", "Too short", "Too long", "Block similarity"] + all_gold_fields
     ws.append(headers)
     hdr_row = ws.max_row
     for col, h in enumerate(headers, 1):
@@ -7646,25 +10495,26 @@ def export_goldset_report_xlsx(results: List[GoldEvalResult],
             "✅" if r.block_contains_gold else ("—" if not r.detected else "❌"),
             "⚠️" if r.block_too_short else "",
             "⚠️" if r.block_too_long else "",
+            r.block_similarity,
         ]
         for f in all_gold_fields:
             ok = r.field_results.get(f)
             row.append("✅" if ok is True else ("❌" if ok is False else "—"))
         ws.append(row)
         dr = ws.max_row
-        # Barva řádku dle detekce
+        # Barva radku dle detection
         fill = GREEN if r.detected and r.block_contains_gold else (RED if not r.detected else YEL)
         for col in range(1, 5):
             ws.cell(dr, col).fill = fill
         # Barva fields
-        for ci, f in enumerate(all_gold_fields, 10):
+        for ci, f in enumerate(all_gold_fields, 11):
             ok = r.field_results.get(f)
             if ok is True:
                 ws.cell(dr, ci).fill = GREEN
             elif ok is False:
                 ws.cell(dr, ci).fill = RED
 
-    # Šířky sloupcu
+    # Sirky sloupcu
     for col_i in range(1, ws.max_column + 1):
         ws.column_dimensions[get_column_letter(col_i)].width = 18
 
@@ -7774,7 +10624,7 @@ def export_to_pdf(rows: List[Dict[str, str]]) -> bytes:
     for i, row in enumerate(rows, 1):
         taxon = _safe(row.get("TAXON_NAME_VERBATIM", "?"), 120)
 
-        # Barevný nadpis taxonu
+        # Barevny nadpis taxonu
         pdf.set_fill_color(31, 78, 121)
         pdf.set_text_color(255, 255, 255)
         pdf.set_font("Helvetica", "B", 11)
@@ -7782,7 +10632,7 @@ def export_to_pdf(rows: List[Dict[str, str]]) -> bytes:
         pdf.set_text_color(0, 0, 0)
         pdf.ln(1)
 
-        # Datová pole
+        # Datova field
         pdf.set_font("Helvetica", "", 9)
         for field, label in SHOW:
             val = row.get(field, "")
@@ -7793,7 +10643,7 @@ def export_to_pdf(rows: List[Dict[str, str]]) -> bytes:
             pdf.set_font("Helvetica", "B", 8)
             pdf.cell(35, 4, label_safe + ":", new_x="RIGHT", new_y="TOP")
             pdf.set_font("Helvetica", "", 8)
-            # multi_cell musí začínat na správné x pozici
+            # multi_cell must zacinat on correct x pozici
             x_after_label = pdf.get_x()
             pdf.multi_cell(pdf.epw - 35, 4, val_safe)
             pdf.ln(0.5)
@@ -7839,48 +10689,50 @@ def _export_to_html_print(rows: List[Dict[str, str]]) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# NASTAVENÍ – persistentní saveení + session state
+# NASTAVENI – persistentni saveeni + session state
 # ══════════════════════════════════════════════════════════════════════════════
 
 def save_settings_to_disc(s: Dict[str, Any]) -> None:
     """Saves settings (excluding prompts) to a JSON file."""
-    BASE_DIR.mkdir(parents=True, exist_ok=True)
-    # Prompty ukládáme separátně; tady ukládáme jen numeriku/bool/string
+    paths = current_user_paths()
+    # Prompty ukladame separatne; tady ukladame only numeriku/bool/string
     exclude = {"llm_validation_prompt", "llm_boundary_prompt", "llm_field_prompt"}
     data = {k: v for k, v in s.items() if k not in exclude}
-    SETTINGS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    paths.settings.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def load_settings_from_disc() -> Dict[str, Any]:
     """Loads settings from disc; fills in missing keys from DEFAULT_SETTINGS."""
     base = DEFAULT_SETTINGS.copy()
-    if SETTINGS_FILE.exists():
+    settings_file = current_user_paths().settings
+    if settings_file.exists():
         try:
-            loaded = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+            loaded = json.loads(settings_file.read_text(encoding="utf-8"))
             base.update(loaded)
         except Exception:
             pass
-    # Vždy načti prompty zvlášť
+    # Vzdy nacti prompty zvlast
     base.update(load_prompts())
     return base
 
 
 def save_prompts(s: Dict[str, Any]) -> None:
     """Saves LLM prompts to a separate JSON file."""
-    BASE_DIR.mkdir(parents=True, exist_ok=True)
+    prompts_file = current_user_paths().prompts
     data = {
         "llm_validation_prompt": s.get("llm_validation_prompt", LLM_VALIDATION_PROMPT),
         "llm_boundary_prompt":   s.get("llm_boundary_prompt",   LLM_BOUNDARY_PROMPT),
         "llm_field_prompt":      s.get("llm_field_prompt",      LLM_FIELD_PROMPT),
     }
-    PROMPTS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    prompts_file.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def load_prompts() -> Dict[str, str]:
     """Loads saved prompts or returns defaults."""
-    if PROMPTS_FILE.exists():
+    prompts_file = current_user_paths().prompts
+    if prompts_file.exists():
         try:
-            d = json.loads(PROMPTS_FILE.read_text(encoding="utf-8"))
+            d = json.loads(prompts_file.read_text(encoding="utf-8"))
             return {
                 "llm_validation_prompt": d.get("llm_validation_prompt", LLM_VALIDATION_PROMPT),
                 "llm_boundary_prompt":   d.get("llm_boundary_prompt",   LLM_BOUNDARY_PROMPT),
@@ -7899,6 +10751,131 @@ def get_settings() -> Dict[str, Any]:
     if "paleon_settings" not in st.session_state:
         st.session_state["paleon_settings"] = load_settings_from_disc()
     return st.session_state["paleon_settings"]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BUILT-IN REGRESSION TESTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+_PARSER_REGRESSION_CASES = [
+    ("Nophrotheca sophia n. sp.", "Nophrotheca sophia n. sp.", "Species"),
+    ("Gracilitheca Sysoev, 1968", "Gracilitheca Sysoev, 1968", "Genus"),
+    ("Circothecidae Missarzhevsky, 1969", "Circothecidae", "Family"),
+    ("Orthothecida", "Orthothecida", "Order"),
+]
+
+_PARSER_NEGATIVE_CASES = [
+    "Estimated length",
+    "Material examined",
+    "Systematic palaeontology",
+    "Downloaded by University",
+]
+
+
+def run_parser_regression_suite() -> Dict[str, Any]:
+    """Runs deterministic heading and false-positive checks."""
+    failures: List[Dict[str, Any]] = []
+    for text, expected_name, expected_rank in _PARSER_REGRESSION_CASES:
+        name, rank, pattern = _match_name(text)
+        if name != expected_name or rank != expected_rank:
+            failures.append({
+                "case": text, "expected": f"{expected_name} / {expected_rank}",
+                "actual": f"{name} / {rank}", "pattern": pattern})
+    for text in _PARSER_NEGATIVE_CASES:
+        name, rank, pattern = _match_name(text)
+        if name is not None and not _is_ordinary_sentence(text):
+            failures.append({
+                "case": text, "expected": "no candidate",
+                "actual": f"{name} / {rank}", "pattern": pattern})
+    total = len(_PARSER_REGRESSION_CASES) + len(_PARSER_NEGATIVE_CASES)
+    return {"ok": not failures, "total": total,
+            "passed": total - len(failures), "failures": failures}
+
+
+def run_internal_health_checks() -> Dict[str, Any]:
+    """Runs non-destructive parser, schema, regex, and DB health checks."""
+    checks: Dict[str, Any] = {}
+    parser = run_parser_regression_suite()
+    checks["parser"] = parser
+    try:
+        schema = load_schema()
+        section_regex, mapping = build_section_regex(schema)
+        checks["schema"] = {
+            "ok": not schema.empty and bool(mapping) and section_regex is not None,
+            "rows": len(schema), "mapped_labels": len(mapping)}
+    except Exception as exc:
+        checks["schema"] = {"ok": False, "error": str(exc)}
+    try:
+        checks["database"] = database_integrity_report()
+    except Exception as exc:
+        checks["database"] = {"ok": False, "error": str(exc)}
+    checks["ok"] = all(bool(value.get("ok")) for value in checks.values()
+                       if isinstance(value, dict))
+    return checks
+
+
+def render_internal_health_panel() -> None:
+    """Renders the test/health panel; logic lives in run_internal_health_checks."""
+    st.subheader("🧪 Internal health checks")
+    st.caption("Non-destructive regression checks for parser, schema regexes and database integrity.")
+    if st.button("▶ Run health checks", key="run_internal_health_checks"):
+        with st.spinner("Running internal checks…"):
+            st.session_state["internal_health_result"] = run_internal_health_checks()
+    health = st.session_state.get("internal_health_result")
+    if health:
+        if health.get("ok"):
+            st.success("All internal checks passed.")
+        else:
+            st.error("One or more internal checks failed.")
+        st.json(health)
+    st.divider()
+
+
+def render_last_index_results() -> None:
+    """Displays and consumes the previous indexing summary after a rerun."""
+    last_results = st.session_state.pop("last_index_results", None)
+    if not last_results:
+        return
+    ok_count = sum(1 for row in last_results if "✓ OK" in row.get("Stav", ""))
+    ocr_count = sum(1 for row in last_results if "⚠" in row.get("Stav", ""))
+    error_count = sum(1 for row in last_results if "✗" in row.get("Stav", ""))
+    st.success(
+        f"✅ **Indexing complete** — {ok_count} OK"
+        + (f", {ocr_count}× ⚠️ little text" if ocr_count else "")
+        + (f", {error_count}× ✗ error" if error_count else ""))
+    st.dataframe(pd.DataFrame(last_results), use_container_width=True, hide_index=True)
+
+
+def render_llm_audit_panel(candidate_id: int) -> None:
+    """Shows model/prompt/input hashes and proposal review state."""
+    audit = get_llm_audit(candidate_id)
+    with st.expander("🤖 LLM provenance & proposals", expanded=False):
+        if not audit["runs"]:
+            st.caption("No audited LLM calls for this candidate.")
+            return
+        runs_df = pd.DataFrame(audit["runs"])
+        show_cols = [c for c in ["id", "task_type", "model", "status", "duration_ms",
+                                      "created_at", "system_prompt_hash",
+                                      "user_input_hash", "response_hash"]
+                     if c in runs_df.columns]
+        st.dataframe(runs_df[show_cols], use_container_width=True, hide_index=True)
+        pending = [p for p in audit["proposals"] if p["status"] == "proposed"]
+        for proposal in pending:
+            st.markdown(f"**{proposal['field_name']}**")
+            st.text_area("Proposed value", proposal["proposed_value"],
+                         key=f"llm_prop_text_{proposal['id']}", disabled=True)
+            c1, c2 = st.columns(2)
+            if c1.button("✅ Accept", key=f"llm_prop_accept_{proposal['id']}"):
+                accept_llm_proposal(proposal["id"], reviewer=_current_username())
+                st.rerun()
+            if c2.button("❌ Reject", key=f"llm_prop_reject_{proposal['id']}"):
+                reject_llm_proposal(proposal["id"], reviewer=_current_username())
+                st.rerun()
+        if audit["proposals"]:
+            props_df = pd.DataFrame(audit["proposals"])
+            st.dataframe(props_df[["id", "run_id", "field_name", "status",
+                                   "reviewed_by", "reviewed_at"]],
+                         use_container_width=True, hide_index=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -8042,8 +11019,8 @@ h1, h2, h3 { margin-top: 0.3rem !important; margin-bottom: 0.3rem !important; pa
 </style>
 """
 
-# ── Tmavý režim — forcovaný CSS override (Streamlit vlastní theme picker
-#    neřešíme, přepisujeme přímo barvy přes data-testid selektory) ──────────
+# ── Tmavy rezim — forcovany CSS override (Streamlit vlastni theme picker
+#    neresime, prepisujeme primo barvy pres data-testid selektory) ──────────
 _CSS_DARK = """
 <style>
 :root {
@@ -8082,9 +11059,86 @@ h1, h2, h3, h4, h5, h6 { color: var(--pn-text) !important; }
     color: var(--pn-text) !important;
     border-color: var(--pn-border) !important;
 }
-[data-baseweb="popover"] { background-color: var(--pn-bg-tertiary) !important; }
-[role="listbox"] { background-color: var(--pn-bg-tertiary) !important; }
-[role="option"] { color: var(--pn-text) !important; }
+/* BaseWeb / Streamlit controls: keep every layer dark, including focus and dropdown portals. */
+.stTextInput > div > div,
+.stTextArea > div > div,
+.stNumberInput > div > div,
+.stDateInput > div > div,
+.stSelectbox [data-baseweb="select"],
+.stMultiSelect [data-baseweb="select"],
+[data-baseweb="input"],
+[data-baseweb="textarea"],
+[data-baseweb="select"] > div,
+[data-baseweb="base-input"] {
+    background-color: var(--pn-bg-tertiary) !important;
+    color: var(--pn-text) !important;
+    border-color: var(--pn-border) !important;
+}
+input, textarea,
+input:disabled, textarea:disabled,
+[aria-disabled="true"] {
+    color: var(--pn-text) !important;
+    -webkit-text-fill-color: var(--pn-text) !important;
+    opacity: 1 !important;
+}
+input::placeholder, textarea::placeholder {
+    color: var(--pn-text-muted) !important;
+    opacity: 1 !important;
+}
+.stTextInput input:focus, .stTextArea textarea:focus, .stNumberInput input:focus,
+.stDateInput input:focus,
+.stSelectbox [data-baseweb="select"] > div:focus-within,
+.stMultiSelect [data-baseweb="select"] > div:focus-within,
+[data-baseweb="input"]:focus-within,
+[data-baseweb="textarea"]:focus-within {
+    border-color: var(--pn-accent) !important;
+    box-shadow: 0 0 0 1px var(--pn-accent) !important;
+    outline: none !important;
+}
+[data-baseweb="popover"],
+[data-baseweb="popover"] > div,
+[role="listbox"],
+[data-baseweb="menu"] {
+    background-color: var(--pn-bg-tertiary) !important;
+    color: var(--pn-text) !important;
+    border-color: var(--pn-border) !important;
+}
+[role="option"], [role="option"] *, [data-baseweb="menu"] li {
+    color: var(--pn-text) !important;
+    background-color: var(--pn-bg-tertiary) !important;
+}
+[role="option"]:hover, [role="option"][aria-selected="true"],
+[data-baseweb="menu"] li:hover {
+    background-color: #313542 !important;
+    color: #ffffff !important;
+}
+/* Multiselect tags and their close icons. */
+.stMultiSelect [data-baseweb="tag"],
+[data-baseweb="tag"] {
+    background-color: #263d63 !important;
+    color: #eef6ff !important;
+    border: 1px solid #456da8 !important;
+}
+[data-baseweb="tag"] * { color: #eef6ff !important; }
+/* Radio, checkbox and toggle surfaces. */
+[data-testid="stRadio"] label,
+[data-testid="stCheckbox"] label,
+[data-testid="stToggle"] label { color: var(--pn-text) !important; }
+[data-baseweb="radio"] > div:first-child,
+[data-baseweb="checkbox"] > div:first-child {
+    background-color: var(--pn-bg-tertiary) !important;
+    border-color: #697181 !important;
+}
+/* Number-input step buttons and select arrows must not retain a light fill. */
+.stNumberInput button,
+[data-baseweb="select"] svg,
+[data-testid="stNumberInputStepDown"],
+[data-testid="stNumberInputStepUp"] {
+    background-color: var(--pn-bg-secondary) !important;
+    color: var(--pn-text) !important;
+    fill: var(--pn-text) !important;
+    border-color: var(--pn-border) !important;
+}
 
 /* Buttons */
 .stButton button, .stDownloadButton button {
@@ -8180,6 +11234,94 @@ code, pre { background-color: var(--pn-bg-tertiary) !important; color: #e6e6e6 !
     background: transparent !important;
     color: var(--pn-text-muted) !important;
 }
+/* Library upload area: Streamlit/BaseWeb can otherwise paint a light idle layer
+   that disappears only on hover. Cover idle, hover, focus and active states. */
+[data-testid="stFileUploaderDropzone"],
+[data-testid="stFileUploaderDropzone"] > div,
+[data-testid="stFileUploaderDropzone"] > section,
+[data-testid="stFileUploaderDropzone"] section,
+[data-testid="stFileUploaderDropzone"] button,
+[data-testid="stFileUploaderDropzone"] button:hover,
+[data-testid="stFileUploaderDropzone"] button:focus,
+[data-testid="stFileUploaderDropzone"] button:active {
+    background: var(--pn-bg-tertiary) !important;
+    background-color: var(--pn-bg-tertiary) !important;
+    color: var(--pn-text) !important;
+    border-color: var(--pn-border) !important;
+    box-shadow: none !important;
+}
+[data-testid="stExpander"] > details,
+[data-testid="stExpander"] > details > summary,
+[data-testid="stExpander"] > details > summary:hover,
+[data-testid="stExpander"] > details > summary:focus {
+    background-color: var(--pn-bg-secondary) !important;
+    color: var(--pn-text) !important;
+}
+.stButton button,
+.stButton button:hover,
+.stButton button:focus,
+.stButton button:active,
+.stDownloadButton button,
+.stDownloadButton button:hover,
+.stDownloadButton button:focus,
+.stDownloadButton button:active,
+[data-testid="stFormSubmitButton"] button,
+[data-testid="stFormSubmitButton"] button:hover,
+[data-testid="stFormSubmitButton"] button:focus,
+[data-testid="stFormSubmitButton"] button:active {
+    background-color: var(--pn-bg-tertiary) !important;
+    color: var(--pn-text) !important;
+    border-color: var(--pn-border) !important;
+    -webkit-text-fill-color: var(--pn-text) !important;
+}
+.stButton button[kind="primary"],
+.stButton button[kind="primary"]:hover,
+.stButton button[kind="primary"]:focus,
+.stButton button[kind="primary"]:active,
+[data-testid="stFormSubmitButton"] button[kind="primary"] {
+    background-color: #bfdbfe !important;
+    color: #14324a !important;
+    -webkit-text-fill-color: #14324a !important;
+    border-color: #93c5fd !important;
+}
+/* Calm, consistent action palette: pale blue for ordinary and primary actions. */
+.stButton button,
+.stDownloadButton button,
+[data-testid="stFormSubmitButton"] button {
+    background-color: #dbeafe !important;
+    color: #17324d !important;
+    -webkit-text-fill-color: #17324d !important;
+    border: 1px solid #93c5fd !important;
+}
+.stButton button:hover,
+.stDownloadButton button:hover,
+[data-testid="stFormSubmitButton"] button:hover {
+    background-color: #bfdbfe !important;
+    border-color: #60a5fa !important;
+    color: #102a43 !important;
+    -webkit-text-fill-color: #102a43 !important;
+}
+/* Red is reserved for explicit destructive confirmations. */
+.pn-destructive-confirm .stButton button,
+div[data-testid="stVerticalBlock"]:has(.pn-destructive-marker) .stButton button {
+    background-color: #fee2e2 !important;
+    border-color: #fca5a5 !important;
+    color: #991b1b !important;
+    -webkit-text-fill-color: #991b1b !important;
+}
+
+/* Query builder preview: high contrast even against global Streamlit span colors. */
+.pn-query-preview,
+.pn-query-preview span,
+.pn-query-preview b {
+    color: #ffffff !important;
+    -webkit-text-fill-color: #ffffff !important;
+    opacity: 1 !important;
+}
+.pn-query-preview > span:first-child {
+    color: #93c5fd !important;
+    -webkit-text-fill-color: #93c5fd !important;
+}
 
 /* ── DataFrame / data editor inner dark styling ─────────────────────────── */
 /* Container wrappers */
@@ -8242,6 +11384,93 @@ def inject_css(theme: str = "light") -> None:
     st.markdown(_CSS, unsafe_allow_html=True)
     if theme == "dark":
         st.markdown(_CSS_DARK, unsafe_allow_html=True)
+    # Final override must be injected after every theme block. Modern Streamlit
+    # uses data-testid attributes rather than the older kind= attribute.
+    st.markdown("""
+    <style>
+    button[data-testid="stBaseButton-secondary"],
+    button[data-testid="stBaseButton-primary"],
+    button[data-testid="stBaseButton-tertiary"],
+    div[data-testid="stButton"] > button,
+    div[data-testid="stDownloadButton"] > button,
+    div[data-testid="stFormSubmitButton"] > button,
+    div[data-testid="stFileUploaderDropzone"] button {
+        background: #dbeafe !important;
+        background-color: #dbeafe !important;
+        border: 1px solid #93c5fd !important;
+        color: #17324d !important;
+        -webkit-text-fill-color: #17324d !important;
+        box-shadow: none !important;
+    }
+    button[data-testid="stBaseButton-secondary"]:hover,
+    button[data-testid="stBaseButton-primary"]:hover,
+    button[data-testid="stBaseButton-tertiary"]:hover,
+    div[data-testid="stButton"] > button:hover,
+    div[data-testid="stDownloadButton"] > button:hover,
+    div[data-testid="stFormSubmitButton"] > button:hover {
+        background: #bfdbfe !important;
+        background-color: #bfdbfe !important;
+        border-color: #60a5fa !important;
+        color: #102a43 !important;
+        -webkit-text-fill-color: #102a43 !important;
+    }
+    button[data-testid="stBaseButton-secondary"]:disabled,
+    button[data-testid="stBaseButton-primary"]:disabled,
+    div[data-testid="stButton"] > button:disabled {
+        background: #e5eef8 !important;
+        color: #6b7f93 !important;
+        -webkit-text-fill-color: #6b7f93 !important;
+        border-color: #cbd5e1 !important;
+        opacity: .78 !important;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+    if theme == "dark":
+        # Dark-mode-only button palette: still blue, but subdued enough for
+        # dark surfaces. This block is injected last so the light palette above
+        # remains unchanged and cannot override these values.
+        st.markdown("""
+        <style>
+        button[data-testid="stBaseButton-secondary"],
+        button[data-testid="stBaseButton-primary"],
+        button[data-testid="stBaseButton-tertiary"],
+        div[data-testid="stButton"] > button,
+        div[data-testid="stDownloadButton"] > button,
+        div[data-testid="stFormSubmitButton"] > button,
+        div[data-testid="stFileUploaderDropzone"] button {
+            background: #284a73 !important;
+            background-color: #284a73 !important;
+            border-color: #416f9f !important;
+            color: #edf6ff !important;
+            -webkit-text-fill-color: #edf6ff !important;
+            box-shadow: none !important;
+        }
+        button[data-testid="stBaseButton-secondary"]:hover,
+        button[data-testid="stBaseButton-primary"]:hover,
+        button[data-testid="stBaseButton-tertiary"]:hover,
+        div[data-testid="stButton"] > button:hover,
+        div[data-testid="stDownloadButton"] > button:hover,
+        div[data-testid="stFormSubmitButton"] > button:hover {
+            background: #345f8f !important;
+            background-color: #345f8f !important;
+            border-color: #5b8fc2 !important;
+            color: #ffffff !important;
+            -webkit-text-fill-color: #ffffff !important;
+        }
+        button[data-testid="stBaseButton-secondary"]:disabled,
+        button[data-testid="stBaseButton-primary"]:disabled,
+        button[data-testid="stBaseButton-tertiary"]:disabled,
+        div[data-testid="stButton"] > button:disabled,
+        div[data-testid="stFormSubmitButton"] > button:disabled {
+            background: #26384d !important;
+            background-color: #26384d !important;
+            border-color: #3c526a !important;
+            color: #91a4b8 !important;
+            -webkit-text-fill-color: #91a4b8 !important;
+            opacity: .82 !important;
+        }
+        </style>
+        """, unsafe_allow_html=True)
 
 
 def _badge_html(status: str) -> str:
@@ -8298,7 +11527,7 @@ def _count_filled_fields(candidate_id: int) -> Tuple[int, int]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# KLÁVESOVÉ ZKRATKY  (A = schválit, R = odmítnout)
+# KLAVESOVE ZKRATKY (And = schvalit, R = odmitnout)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _inject_keyboard_shortcuts(scope_id: str, approve_marker: str, reject_marker: str) -> None:
@@ -8348,7 +11577,7 @@ def _inject_keyboard_shortcuts(scope_id: str, approve_marker: str, reject_marker
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# NÁHLED SKUTEČNÉ PDF STRÁNKY  (Library → Prohlížeč pages)
+# NAHLED SKUTECNE PDF Pages (Library → Prohlithatc pages)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _render_pdf_page_image_impl(path_str: str, page_number: int, mtime: float,
@@ -8381,8 +11610,8 @@ def _render_pdf_page_image_impl(path_str: str, page_number: int, mtime: float,
         return None
 
 
-# Cachujeme render jen pokud běžíme pod Streamlitem (st.cache_data vyžaduje
-# aktivní runtime) — mimo Streamlit (e.g. při syntax-checku) použijeme
+# Cachujeme render only if bezime pod Streamlitem (st.cache_data vyzaduje
+# aktivni runtime) — mimo Streamlit (e.g. when syntax-checku) pouzijeme
 # funkci bez cache.
 if st is not None:
     _render_pdf_page_image = st.cache_data(show_spinner=False)(_render_pdf_page_image_impl)
@@ -8414,7 +11643,7 @@ def _show_pdf_page_inline(
         st.caption(t("pdf_preview_requires_pymupdf"))
         return
 
-    # Cache path lookupu v session_state — zamezí opakovaným DB dotazum
+    # Cache path lookupu in session_state — zamezi opakovanym DB dotazum
     _cache_key = f"pdf_doc_info_{document_id}"
     if _cache_key not in st.session_state:
         con = db()
@@ -8436,7 +11665,7 @@ def _show_pdf_page_inline(
 
     doc_path = pathlib.Path(doc_row["path"])
     if not doc_path.exists():
-        # Zkusit relativní cesta z uploads
+        # Zkusit relativni cesta from uploads
         alt = _upath("../uploads") / doc_path.name
         if alt.exists():
             doc_path = alt
@@ -8462,11 +11691,11 @@ def _show_pdf_page_inline(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# FUZZY DETEKCE DUPLICITNÍCH TAXONŮ NAPŘÍČ DocumentY
+# FUZZY Detection DUPLICITNICH TAXONU NAPRIC DocumentY
 # ══════════════════════════════════════════════════════════════════════════════
 
 # ══════════════════════════════════════════════════════════════════════════════
-# BOD 3: FTS5 — fulltext search (263× rychlejší než LIKE %query%)
+# BOD 3: FTS5 — fulltext search (263× rychlejsi nez LIKE %query%)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _fts_sanitize(query: str) -> str:
@@ -8506,6 +11735,45 @@ def fts_search(query: str, limit: int = 500) -> List[int]:
         return [r[0] for r in rows]
     except Exception:
         return []
+
+
+def _chunked_ids(values: List[int], size: int = 800) -> List[List[int]]:
+    clean = list(dict.fromkeys(int(x) for x in values if x is not None))
+    return [clean[i:i+size] for i in range(0, len(clean), size)]
+
+
+def _fts_update_candidates_batch(candidate_ids: List[int]) -> int:
+    """Refresh many FTS rows with bounded SQL variable counts and one transaction."""
+    ids = list(dict.fromkeys(int(x) for x in candidate_ids if x))
+    if not ids:
+        return 0
+    candidates: Dict[int, sqlite3.Row] = {}
+    fields: Dict[int, List[str]] = {}
+    con = db()
+    for chunk in _chunked_ids(ids):
+        ph = ",".join("?" * len(chunk))
+        for row in con.execute(
+                f"SELECT id,taxon_name,block_text FROM taxon_candidates WHERE id IN ({ph})",chunk).fetchall():
+            candidates[int(row["id"])] = row
+        for row in con.execute(
+                f"SELECT candidate_id,field_name,field_value FROM occurrence_fields "
+                f"WHERE candidate_id IN ({ph}) AND field_value != ''",chunk).fetchall():
+            if row["field_value"] and row["field_value"] != NOT_PROVIDED:
+                fields.setdefault(int(row["candidate_id"]),[]).append(
+                    f"{row['field_name']}: {row['field_value']}")
+    rows=[]
+    for cid in ids:
+        cand=candidates.get(cid)
+        if not cand: continue
+        rows.append((cid,(cand["taxon_name"] or "").strip(),
+                     (cand["block_text"] or "")[:50000],
+                     " ".join(fields.get(cid,[]))[:20000]))
+    for chunk in _chunked_ids([r[0] for r in rows]):
+        ph=",".join("?"*len(chunk)); con.execute(f"DELETE FROM fts_candidates WHERE rowid IN ({ph})",chunk)
+    if rows:
+        con.executemany("INSERT INTO fts_candidates(rowid,taxon_name,block_text,all_fields) VALUES (?,?,?,?)",rows)
+    con.commit();con.close()
+    return len(rows)
 
 
 def _fts_update_candidate(candidate_id: int) -> None:
@@ -8680,7 +11948,7 @@ def link_as_synonym(candidate_id: int, related_id: int) -> None:
             "WHERE candidate_id=? AND field_name='RELATED_RECORD_ID'",
             (cid,)).fetchone()
         if existing:
-            # Přidat k existujícím (odděleno středníkem)
+            # Pridat k existujicim (oddeleno strednikem)
             cur_val = con.execute(
                 "SELECT field_value FROM occurrence_fields WHERE id=?",
                 (existing["id"],)).fetchone()["field_value"] or ""
@@ -8700,7 +11968,7 @@ def link_as_synonym(candidate_id: int, related_id: int) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# OCR-TYPO DETEKCE V AUTORSKÝCH JMÉNECH  (pole AUTHOR)
+# OCR-TYPO Detection In AUTORSKYCH JMENECH (field AUTHOR)
 # ══════════════════════════════════════════════════════════════════════════════
 
 _AUTHOR_TOKEN_RE = re.compile(r"[A-ZÀ-ÖØ-Þ][a-zà-öø-ÿ'’\-]{2,}")
@@ -8780,7 +12048,7 @@ def find_author_ocr_typos(threshold: float = 0.82, min_len: int = 4) -> List[Dic
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# UKONČENÍ APLIKACE
+# UKONCENI APLIKACE
 # ══════════════════════════════════════════════════════════════════════════════
 
 
@@ -8812,20 +12080,20 @@ def _terminate_application() -> None:
 
     try:
         if _platform.system() == "Windows":
-            # /T = ukončit i potomky, /F = vynutit. Cílíme na rodičovský
-            # proces (cmd/PowerShell), což na Windows zavře celé okno.
+            # /T = ukoncit i potomky, /F = vynutit. Cilime on genusicovsky
+            # proces (cmd/PowerShell), coz on Windows zavre cele okno.
             _os.system(f"taskkill /F /T /PID {parent_pid} >NUL 2>&1")
         else:
-            # macOS / Linux — poslat SIGTERM nadřazenému shellu; pokud
-            # terminál ukončuje okno spolu se shellem, zavře se i okno.
+            # macOS / Linux — poslat SIGTERM nadrazenemu shellu; if
+            # terminal ukoncuje okno spolu shellem, zavre i okno.
             try:
                 _os.kill(parent_pid, _signal.SIGTERM)
             except Exception:
                 pass
     except Exception:
-        pass  # nadřazený proces se nepodařilo ukončit — pokračujeme aspoň vlastním ukončením
+        pass  # nadrazeny proces nepodarilo ukoncit — pokracujeme aspon vlastnim ukoncenim
 
-    # Vlastní proces ukončit vždy, i kdyby se předchozí krok nezdařil.
+    # Vlastni proces ukoncit vzdy, i kdyby predchozi kyear nezdaril.
     _os._exit(0)
 
 
@@ -8833,12 +12101,127 @@ def _terminate_application() -> None:
 # SIDEBAR
 # ══════════════════════════════════════════════════════════════════════════════
 
+_LM_WORKFLOW_MODES: Dict[str, Dict[str, Any]] = {
+    "Conservative translation": {
+        "llm_fast_translation": True,
+        "llm_strict_json_schema": True,
+        "llm_json_mode": True,
+        "llm_disable_thinking": True,
+        "llm_verify_language_support": True,
+        "llm_translation_batch_chars": 7000,
+    },
+    "Fast translation": {
+        "llm_fast_translation": True,
+        "llm_strict_json_schema": True,
+        "llm_json_mode": True,
+        "llm_disable_thinking": True,
+        "llm_verify_language_support": False,
+        "llm_translation_batch_chars": 12000,
+    },
+    "Field mapping": {
+        "llm_fast_translation": False,
+        "llm_strict_json_schema": True,
+        "llm_json_mode": True,
+        "llm_disable_thinking": True,
+        "llm_verify_language_support": False,
+    },
+    "Candidate validation": {
+        "llm_fast_translation": False,
+        "llm_strict_json_schema": True,
+        "llm_json_mode": True,
+        "llm_disable_thinking": True,
+        "llm_verify_language_support": False,
+    },
+    "Custom": {},
+}
+
+
+def _apply_lm_workflow_mode(settings: Dict[str, Any], mode: str) -> None:
+    """Apply a named LM Studio workflow profile to mutable settings."""
+    settings["llm_workflow_mode"] = mode
+    for key, value in _LM_WORKFLOW_MODES.get(mode, {}).items():
+        settings[key] = value
+
+
+def _save_sidebar_settings_if_changed(settings: Dict[str, Any], before: str) -> bool:
+    """Persist sidebar settings immediately when a widget changed them."""
+    after = json.dumps(settings, ensure_ascii=False, sort_keys=True, default=str)
+    if after == before:
+        return False
+    st.session_state["paleon_settings"] = settings
+    save_settings_to_disc(settings)
+    save_prompts(settings)
+    return True
+
+
+def _translation_changes(before: Dict[str, str], after: Dict[str, str]) -> Dict[str, Dict[str, str]]:
+    """Return exact before/after values changed by one translation operation."""
+    keys = sorted(set(before) | set(after))
+    return {
+        key: {"before": str(before.get(key, "") or ""), "after": str(after.get(key, "") or "")}
+        for key in keys
+        if str(before.get(key, "") or "") != str(after.get(key, "") or "")
+    }
+
+
+def _render_translation_workspace(candidate_id: int) -> None:
+    """Show, edit, save, or revert the latest translated field values."""
+    payload = st.session_state.get(f"translation_workspace_{candidate_id}")
+    if not payload or not payload.get("changes"):
+        return
+    changes: Dict[str, Dict[str, str]] = payload["changes"]
+    st.markdown("#### Latest translation — exact changes")
+    st.caption(
+        f"Model: {payload.get('model') or '?'} · Source language: "
+        f"{payload.get('language') or 'auto'} · {len(changes)} changed field(s). "
+        "Edit the English value below, then save individual fields or all changes."
+    )
+    edited: Dict[str, str] = {}
+    for field_name, values in changes.items():
+        with st.expander(f"{field_name} · translated", expanded=True):
+            left, right = st.columns(2)
+            left.text_area(
+                "Original",
+                value=values["before"],
+                height=150,
+                disabled=True,
+                key=f"tr_original_{candidate_id}_{field_name}",
+            )
+            edited[field_name] = right.text_area(
+                "English translation — editable",
+                value=values["after"],
+                height=150,
+                key=f"tr_edited_{candidate_id}_{field_name}",
+            )
+            c1, c2 = st.columns(2)
+            if c1.button("Save this field", key=f"tr_save_{candidate_id}_{field_name}"):
+                save_fields(candidate_id, {field_name: edited[field_name]}, method="translation_reviewed")
+                payload["changes"][field_name]["after"] = edited[field_name]
+                st.session_state[f"translation_workspace_{candidate_id}"] = payload
+                st.success(f"Saved {field_name}.")
+            if c2.button("Restore original", key=f"tr_restore_{candidate_id}_{field_name}"):
+                save_fields(candidate_id, {field_name: values["before"]}, method="translation_reverted")
+                payload["changes"][field_name]["after"] = values["before"]
+                st.session_state[f"translation_workspace_{candidate_id}"] = payload
+                st.rerun()
+    a1, a2 = st.columns(2)
+    if a1.button("Save all edited translations", type="primary", key=f"tr_save_all_{candidate_id}"):
+        save_fields(candidate_id, edited, method="translation_reviewed")
+        for field_name, value in edited.items():
+            payload["changes"][field_name]["after"] = value
+        st.session_state[f"translation_workspace_{candidate_id}"] = payload
+        st.success(f"Saved {len(edited)} translated field(s).")
+    if a2.button("Clear translation comparison", key=f"tr_clear_{candidate_id}"):
+        st.session_state.pop(f"translation_workspace_{candidate_id}", None)
+        st.rerun()
+
+
 def sidebar_ui():
     st.sidebar.title(f"🦕 {APP_NAME}")
     st.sidebar.caption(f"v{APP_VERSION}")
     s = get_settings()
 
-    # ── Aktuální uživatel + přepínač ─────────────────────────────────────
+    # ── Aktualni user + prepinac ─────────────────────────────────────
     _cur_user = st.session_state.get("pn_user", "")
     _ucol1, _ucol2 = st.sidebar.columns([3, 1])
     _ucol1.markdown(
@@ -8847,6 +12230,27 @@ def sidebar_ui():
         unsafe_allow_html=True)
     if _ucol2.button("⇄", key="sb_switch_user", help="Switch user"):
         st.session_state.pop("pn_user", None)
+        st.rerun()
+    st.sidebar.divider()
+
+    # ── Interface mode ────────────────────────────────────────────────────
+    _modes = ["Basic", "Curator", "Expert"]
+    _current_mode = s.get("ui_mode", "Basic")
+    if _current_mode not in _modes:
+        _current_mode = "Basic"
+    _new_mode = st.sidebar.selectbox(
+        "Workspace mode", _modes, index=_modes.index(_current_mode), key="sb_ui_mode",
+        help="Basic: daily workflow. Curator: block and dictionary tools. Expert: diagnostics, prompts and maintenance.")
+    if _new_mode != s.get("ui_mode"):
+        s["ui_mode"] = _new_mode
+        st.session_state["paleon_settings"] = s
+        save_settings_to_disc(s)
+        st.rerun()
+    st.sidebar.caption({"Basic":"Daily review, editing and export.",
+                        "Curator":"Adds block editing, dictionaries and curation tools.",
+                        "Expert":"Shows all diagnostics and maintenance tools."}[_new_mode])
+    if st.sidebar.button("❓ Start guide", key="pc_start_guide", use_container_width=True):
+        st.session_state["pc_show_onboarding"] = True
         st.rerun()
     st.sidebar.divider()
 
@@ -8865,7 +12269,7 @@ def sidebar_ui():
         st.rerun()
     st.sidebar.divider()
 
-    # ── Rychlé statistiky ────────────────────────────────────────────────────
+    # ── Rychle statistiky ────────────────────────────────────────────────────
     con = db()
     n_docs   = con.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
     n_pend   = con.execute("SELECT COUNT(*) FROM taxon_candidates WHERE status='pending'").fetchone()[0]
@@ -8881,90 +12285,143 @@ def sidebar_ui():
     sc4.metric(t("low_conf"), n_low)
     st.sidebar.divider()
 
-    # ── LM Studio — kompaktní status + detail v expanderu ───────────────────
-    _lm_detected = st.session_state.get("lm_studio_detected", False)
-    _lm_enabled  = s.get("llm_enabled", False)
-    _lm_model    = s.get("lmstudio_model", "") or ""
-    _lm_models   = st.session_state.get("lm_models", [])
+    # ── LM Studio — clear daily controls, advanced details collapsed ───────
+    _lm_before = json.dumps(s, ensure_ascii=False, sort_keys=True, default=str)
+    _lm_detected = bool(st.session_state.get("lm_studio_detected", False))
+    _lm_enabled = bool(s.get("llm_enabled", False))
+    _lm_model = str(s.get("lmstudio_model", "") or "")
+    _lm_models = list(st.session_state.get("lm_models", []))
 
-    if _lm_detected and _lm_enabled:
-        _chip_label = f"🤖 LM Studio · {_lm_model[:35] or '?'}"
-        st.sidebar.success(_chip_label)
+    st.sidebar.markdown("### 🤖 LM Studio")
+    if _lm_detected and _lm_enabled and _lm_model:
+        st.sidebar.success(f"● Connected · {_lm_model[:38]}")
+    elif _lm_detected and _lm_enabled:
+        st.sidebar.warning("● Server connected · select a model")
     elif _lm_detected:
-        st.sidebar.info("🔌 LM Studio available — LLM is disabled")
+        st.sidebar.info("● Server available · assistant disabled")
     else:
-        st.sidebar.caption("⚫ LM Studio not found")
+        st.sidebar.caption("● LM Studio not detected")
 
-    with st.sidebar.expander("⚙️ LM Studio — settings", expanded=False):
-        s["llm_enabled"] = st.toggle(
-            "Enable LLM", value=_lm_enabled,
-            help="Enables the LLM assistant (translation, extraction, validation).")
-        s["lmstudio_base_url"] = st.text_input(
-            "Base URL", value=s.get("lmstudio_base_url","http://localhost:1234/v1"),
-            label_visibility="collapsed",
-            placeholder="http://localhost:1234/v1")
+    new_enabled = st.sidebar.toggle(
+        "Enable LM Studio assistant", value=_lm_enabled, key="sb_llm_enabled",
+        help="Enables translation, field mapping, and candidate validation.")
+    s["llm_enabled"] = new_enabled
 
-        if s["llm_enabled"]:
-            m_col, r_col = st.columns([3, 1])
-            if r_col.button("🔄", key="sb_refresh", help="Reload models from LM Studio"):
-                try:
-                    _fresh = lm_models(s)
-                    if _fresh:
-                        st.session_state["lm_models"] = _fresh
-                        st.session_state["lm_studio_detected"] = True
-                        st.toast(tt(f"✅ {len(_fresh)} models", f"✅ {len(_fresh)} models"), icon="✅")
-                    else:
-                        st.toast("Server is running, but no models were found", icon="⚠️")
-                except RuntimeError as _e:
-                    st.toast(str(_e)[:80], icon="❌")
-                st.rerun()
-
-            if _lm_models:
-                _cur = s.get("lmstudio_model","")
-                _idx = _lm_models.index(_cur) if _cur in _lm_models else 0
-                s["lmstudio_model"] = m_col.selectbox(
-                    "Model", _lm_models, index=_idx, key="sb_model",
-                    label_visibility="collapsed")
-            else:
-                s["lmstudio_model"] = m_col.text_input(
-                    "Model ID", value=_lm_model, key="sb_model_txt",
-                    label_visibility="collapsed", placeholder="model-id")
-
-            _t1, _t2 = st.columns([1, 1])
-            _t1.markdown("<div style='padding-top:8px'>Temperature</div>",
-                         unsafe_allow_html=True)
-            s["llm_temperature"] = _t2.number_input(
-                "Temperature", 0.0, 1.0, float(s.get("llm_temperature", 0.0)), 0.05,
-                key="sb_temp", label_visibility="collapsed")
-            s["llm_timeout"] = st.number_input(
-                "Timeout (s)", 30, 600, int(s.get("llm_timeout", 180)),
-                key="sb_timeout")
-
-            st.divider()
-            if st.button(t("redetect_lmstudio"), key="sb_redetect"):
-                # Vymazat cache detekce → příštím rerunu proběhne znovu
-                for _k in ["lm_studio_detected", "lm_models"]:
-                    st.session_state.pop(_k, None)
-                st.rerun()
-
-            s["llm_auto_translate"] = st.toggle(
-                "🌐 Translate during indexing (non-EN)",
-                value=s.get("llm_auto_translate", False),
-                key="sb_auto_translate",
-                help="Starsi volba — v Knihovne je nyni toggle primo u uploadu.")
+    if new_enabled:
+        mc1, mc2 = st.sidebar.columns([4, 1])
+        if _lm_models:
+            current_index = _lm_models.index(_lm_model) if _lm_model in _lm_models else 0
+            s["lmstudio_model"] = mc1.selectbox(
+                "Model", _lm_models, index=current_index, key="sb_model_daily")
         else:
-            st.caption(t("llm_disabled_caption"))
+            s["lmstudio_model"] = mc1.text_input(
+                "Model", value=_lm_model, key="sb_model_daily_text", placeholder="model-id")
+        if mc2.button("↻", key="sb_model_refresh", help="Test connection and refresh models"):
+            try:
+                fresh = lm_models(s)
+                st.session_state["lm_models"] = fresh
+                st.session_state["lm_studio_detected"] = True
+                if fresh and s.get("lmstudio_model") not in fresh:
+                    s["lmstudio_model"] = fresh[0]
+                st.toast(f"LM Studio connected · {len(fresh)} model(s)", icon="✅")
+            except RuntimeError as exc:
+                st.session_state["lm_studio_detected"] = False
+                st.toast(str(exc)[:120], icon="❌")
+            st.rerun()
 
-    st.sidebar.divider()
-    if st.sidebar.button(t("save_settings"), key="sb_save",
-                         help="Saves to paleon_data/settings.json"):
-        save_settings_to_disc(s)
-        save_prompts(s)
-        st.sidebar.success("✓")
+        modes = list(_LM_WORKFLOW_MODES)
+        current_mode = str(s.get("llm_workflow_mode", modes[0]))
+        if current_mode not in modes:
+            current_mode = modes[0]
+        selected_mode = st.sidebar.selectbox(
+            "Workflow", modes, index=modes.index(current_mode), key="sb_lm_workflow",
+            help="Conservative translation prioritizes fidelity; Fast translation uses larger batches; other modes focus the assistant on mapping or validation.")
+        if selected_mode != current_mode:
+            _apply_lm_workflow_mode(s, selected_mode)
+        mode_notes = {
+            "Conservative translation": "Maximum fidelity, strict schema, terminology and completeness checks.",
+            "Fast translation": "Larger batches for quicker orientation; still structured.",
+            "Field mapping": "Assigns verbatim passages to canonical dossier fields.",
+            "Candidate validation": "Suggests keep/reject/review; does not create records.",
+            "Custom": "Uses the exact values in Advanced settings.",
+        }
+        st.sidebar.caption(mode_notes[selected_mode])
 
+        s["llm_auto_translate"] = st.sidebar.toggle(
+            "Default translation after upload",
+            value=bool(s.get("llm_auto_translate", False)),
+            key="sb_default_upload_translation",
+            help="Only sets the default. Every upload still has its own translation switch.")
+
+        # Translate one selected document without opening Library controls.
+        _doc_con = db()
+        _doc_rows = _doc_con.execute(
+            "SELECT id,filename,lang FROM documents ORDER BY created_at DESC,id DESC LIMIT 100"
+        ).fetchall()
+        _doc_con.close()
+        if _doc_rows:
+            doc_labels = {
+                f"{row['filename']} · {str(row['lang'] or 'mixed').upper()}": int(row["id"])
+                for row in _doc_rows
+            }
+            selected_doc_label = st.sidebar.selectbox(
+                "Current document", list(doc_labels), key="sb_translate_document")
+            if st.sidebar.button(
+                    "🌐 Translate current document", key="sb_translate_current_document",
+                    use_container_width=True):
+                selected_doc_id = doc_labels[selected_doc_label]
+                selected_row = next(row for row in _doc_rows if int(row["id"]) == selected_doc_id)
+                with st.sidebar.status("Translating document…", expanded=True) as status:
+                    result = _translate_pipeline_for_doc(
+                        selected_doc_id, str(selected_row["lang"] or "mixed"), s)
+                    if result.get("n_errors"):
+                        status.update(label="Translation completed with errors", state="error")
+                        st.sidebar.error("; ".join(result.get("error_messages", [])[:3]))
+                    else:
+                        status.update(label="Document translation completed", state="complete")
+                        st.sidebar.success(
+                            f"Translated {result.get('n_translated', 0)} field(s); "
+                            f"remapped {result.get('n_remapped', 0)} section(s).")
+
+        with st.sidebar.expander("Advanced LM Studio settings", expanded=False):
+            s["lmstudio_base_url"] = st.text_input(
+                "Server URL", value=s.get("lmstudio_base_url", "http://localhost:1234/v1"),
+                key="sb_lm_url")
+            st.caption("Translation always uses temperature 0 for deterministic scientific output.")
+            s["llm_temperature"] = st.number_input(
+                "Creativity for non-translation tasks", 0.0, 1.0,
+                float(s.get("llm_temperature", 0.0)), 0.05, key="sb_nontranslation_temp")
+            s["llm_timeout"] = st.number_input(
+                "Timeout (seconds)", 30, 600, int(s.get("llm_timeout", 180)), key="sb_lm_timeout")
+            s["llm_max_tokens"] = st.number_input(
+                "Maximum response tokens", 256, 32768,
+                int(s.get("llm_max_tokens", 4096)), 256, key="sb_lm_tokens")
+            s["llm_persistent_http"] = st.toggle(
+                "Persistent HTTP connection", value=bool(s.get("llm_persistent_http", True)),
+                key="sb_lm_persistent")
+            s["llm_strict_json_schema"] = st.toggle(
+                "Strict JSON Schema", value=bool(s.get("llm_strict_json_schema", True)),
+                key="sb_lm_schema")
+            s["llm_json_mode"] = st.toggle(
+                "JSON mode", value=bool(s.get("llm_json_mode", True)), key="sb_lm_json")
+            s["llm_disable_thinking"] = st.toggle(
+                "Disable model thinking", value=bool(s.get("llm_disable_thinking", True)),
+                key="sb_lm_no_think")
+            s["llm_verify_language_support"] = st.toggle(
+                "Verify source-language support", value=bool(s.get("llm_verify_language_support", True)),
+                key="sb_lm_language_probe")
+            s["llm_glossary_relevant_only"] = st.toggle(
+                "Send only relevant glossary entries",
+                value=bool(s.get("llm_glossary_relevant_only", True)), key="sb_lm_glossary")
+            if selected_mode != "Custom":
+                st.caption("Changing advanced values switches the workflow to Custom on the next interaction.")
+
+    if _save_sidebar_settings_if_changed(s, _lm_before):
+        st.sidebar.caption("✓ LM Studio settings saved automatically")
     st.session_state["paleon_settings"] = s
+    st.sidebar.divider()
 
-    # ── Ukončit aplikaci ─────────────────────────────────────────────────────
+    # ── Ukoncit aplikaci ─────────────────────────────────────────────────────
     st.sidebar.divider()
     if st.sidebar.button(t("close_app"), key="sb_close_app"):
         st.session_state["sb_confirm_close"] = True
@@ -8990,15 +12447,15 @@ def _delete_document(doc_id: int) -> None:
     con.execute("DELETE FROM pages WHERE document_id=?", (doc_id,))
     con.execute("DELETE FROM documents WHERE id=?", (doc_id,))
     con.commit(); con.close()
-    # Document (a případně i jeho id, pokud SQLite rowid znovu přidělí)
-    # už neexists — uklidit i cache text units, ať nezustávají viset.
+    # Document (and optionally i jeho id, if SQLite rowid znovu prisplits)
+    # uz neexists — uklidit i cache text units, at nezustavaji viset.
     invalidate_text_units_cache(doc_id)
 
 
 def _reindex_document(doc_id: int, path: pathlib.Path, s: Dict) -> Dict:
     pages = extract_pages_from_file(path, s)
     char_count = sum(len(p.text) for p in pages)
-    # Auto-OCR: pokud je nativní text chudý a Tesseract je k dispozici, opakuj s OCR
+    # Auto-OCR: if is nativni text chudy and Tesseract is k dispozici, opakuj s OCR
     avg_ch = (char_count // len(pages)) if pages else 0
     if avg_ch < int(s.get("pdf_min_chars", 80)) and _HAS_ANY_OCR():
         _ocr_s = dict(s); _ocr_s["ocr_enabled"] = True
@@ -9015,18 +12472,132 @@ def _reindex_document(doc_id: int, path: pathlib.Path, s: Dict) -> Dict:
             (doc_id, pg.page_number, pg.text, pg.method, pg.ocr_note, pg.layout_note))
     con.execute("UPDATE documents SET page_count=?, char_count=? WHERE id=?",
                 (len(pages), char_count, doc_id))
-    # Obsah stránek se změnil → zneplatnit cache text units (jinak by
-    # extract_block_for_candidate dál vracelo bloky ze STARÉHO textu).
+    # Obsah stranek zmenil → zneplatnit cache text units (jinak by
+    # extract_block_for_candidate dal vracelo bloky from STAREHO textu).
     _bump_pages_version(doc_id, con=con)
     con.commit(); con.close()
     invalidate_text_units_cache(doc_id)
     return detect_candidates(doc_id, pages, s)
 
 
-def tab_library():
-    st.header(t("library_header"))
+def _translate_pipeline_for_doc(
+    doc_id: int,
+    doc_lang: str,
+    s: Dict,
+    *,
+    bar=None,           # st.progress widget for records (or None)
+    overall=None,       # st.progress widget for globalni progress
+    overall_base: float = 0.0,   # start slotu v overall (0–1)
+    overall_size: float = 1.0,   # velikost slotu v overall
+) -> Dict[str, Any]:
+    """
+    Spustí překladový + remapping průchod pro všechny pending/low-confidence
+    kandidáty daného dokumentu.
 
-    # ── Přepínač pro prohlížení jiných uživatelu (read-only) ────────────
+    Vrací: {"n_translated": int, "n_errors": int, "n_remapped": int, "skipped": bool}
+    """
+    result: Dict[str, Any] = {
+        "n_translated": 0, "n_errors": 0, "n_remapped": 0,
+        "skipped": False, "error_messages": []}
+
+    _lang_norm = (doc_lang or "").strip().lower()
+    # This function is called only by explicit Translate actions. If the stored
+    # language is EN (often the upload default), force auto-detection instead of
+    # silently returning without an LLM call.
+    effective_lang = "mixed" if _lang_norm in _ENGLISH_LANG_CODES else (doc_lang or "mixed")
+
+    if not s.get("llm_enabled"):
+        result["n_errors"] = 1
+        result["error_messages"].append("LLM is disabled in Settings.")
+        return result
+    if not str(s.get("lmstudio_model", "")).strip():
+        result["n_errors"] = 1
+        result["error_messages"].append("No LM Studio model is selected.")
+        return result
+
+    con_tr = db()
+    tr_cands = con_tr.execute(
+        "SELECT id, block_text FROM taxon_candidates "
+        "WHERE document_id=? AND status IN ('pending','low_confidence')",
+        (doc_id,)).fetchall()
+    con_tr.close()
+
+    if not tr_cands:
+        return result
+
+    n_cands = len(tr_cands)
+
+    # Translate record by record. A document-wide skip was incorrect: a single
+    # CJK/RU record with LLM fields previously prevented all remaining records
+    # from being translated.
+    skip = False
+
+    result["skipped"] = skip
+    need_tr = not skip
+
+    for tci, tc in enumerate(tr_cands):
+        cid  = tc["id"]
+        blk  = tc["block_text"] or ""
+        rlbl = f"{tci+1}/{n_cands}"
+        frac = (tci + 1) / n_cands
+
+        if bar is not None:
+            _ph = "🌐" if need_tr else "♻️"
+            bar.progress(int(frac * 100), f"{_ph} record {rlbl}…")
+        if overall is not None:
+            _gp = overall_base + overall_size * frac
+            overall.progress(
+                min(int(_gp * 100), 99),
+                f"{'🌐' if need_tr else '♻️'} record {rlbl}")
+
+        try:
+            if need_tr:
+                if bar is not None:
+                    bar.progress(
+                        int(tci / n_cands * 100),
+                        f"🌐 translating {rlbl}…")
+                _n = auto_translate_candidate_fields(
+                    cid, effective_lang, s,
+                    force=True, force_lang=effective_lang, block=blk)
+                result["n_translated"] += _n
+                if _n:
+                    result["n_errors"] = 0   # reset after uspechu
+            if bar is not None:
+                bar.progress(
+                    int(tci / n_cands * 100),
+                    f"♻️ remapping {rlbl}…")
+            result["n_remapped"] += remap_fields_post_translation(cid)
+
+        except RuntimeError as rte:
+            result["n_errors"] += 1
+            _err_text = f"Record #{cid} ({rlbl}): {rte}"
+            result["error_messages"].append(_err_text)
+            if st is not None:
+                st.warning(f"⚠️ Translation error — {_err_text}")
+            if result["n_errors"] >= 3:
+                if st is not None:
+                    st.error(
+                        "❌ 3 LLM errors in a row — translation disabled for "
+                        "remaining records of this document.")
+                need_tr = False
+        except Exception as te:
+            result["n_errors"] += 1
+            _err_text = f"Record #{cid} ({rlbl}): {type(te).__name__}: {te}"
+            result["error_messages"].append(_err_text)
+            logging.exception("_translate_pipeline_for_doc cand %s", cid)
+            if st is not None:
+                st.warning(f"⚠️ Translation error — {_err_text}")
+
+        if bar is not None:
+            bar.progress(int(frac * 100), f"✓ {rlbl}")
+
+    return result
+
+
+def tab_library():
+    st.markdown(f"### {t('library_header')}", unsafe_allow_html=False)
+
+    # ── Prepinac for prohlithatni jinych uzivatelu (read-only) ────────────
     _all_u = _get_all_users()
     _cur   = st.session_state.get("pn_user", "")
     if len(_all_u) > 1:
@@ -9098,9 +12669,9 @@ def tab_library():
             st.session_state["paleon_settings"] = s
             st.caption("OCR: " + ("✅ " + ", ".join(filter(None, ["easyocr" if HAS_EASYOCR else "", "fitz" if HAS_FITZ else "", "tesseract" if HAS_TESSERACT else ""])) if _HAS_ANY_OCR() else t("ocr_no_engine")))
 
-    # ── Upload (podpora více fileu najednou) ────────────────────────────────
+    # ── Upload (podpora vice fileu najednou) ────────────────────────────────
     with st.expander(t("upload_new"), expanded=True):
-        # ── Dynamic key pro file_uploader: změna klíče = skutečné vymazání fronty
+        # ── Dynamic key for file_uploader: zmena klice = skutecne vymazani fronty
         if "uploader_key_counter" not in st.session_state:
             st.session_state["uploader_key_counter"] = 0
         _up_key = f"uploader_{st.session_state['uploader_key_counter']}"
@@ -9112,9 +12683,13 @@ def tab_library():
             key=_up_key, label_visibility="collapsed",
             accept_multiple_files=True)
         lang_opt = u2.selectbox(
-            "Language", ["en","cs","de","fr","ru","zh","mixed"],
+            "Language", _LANG_OPTIONS_UI,
             key="lang_sel", label_visibility="collapsed",
-            help="The language will be used for all uploaded files.")
+            help=(
+                "Language of the uploaded documents (used for translation prompt). "
+                "Choose 'mixed' if the PDF contains multiple languages — "
+                "the LLM will auto-detect each field's language."
+            ))
         ocr_force = u3.toggle(
             "🔍 OCR", value=s.get("ocr_enabled", True),
             key="up_ocr_force",
@@ -9122,21 +12697,21 @@ def tab_library():
             disabled=not _HAS_ANY_OCR())
         n_files = len(uploaded_files) if uploaded_files else 0
 
-        # ── Toggle: přeložit po indexaci ─────────────────────────────────────
-        # Zobrazit kdykoli je LLM dostupné (bez ohledu na jazyk / stav uploaderu).
-        # Streamlit zachová hodnotu přes reruns díky klíči widgetu.
+        # ── Toggle: prelozit after indexaci ─────────────────────────────────────
+        # Zobrazit kdykoli is LLM dostupne (without ohledu on language / stav uploaderu).
+        # Streamlit preserves hodnotu pres reruns diky klici widgetu.
         _do_translate_after = False
         if s.get("llm_enabled"):
             _do_translate_after = st.toggle(
                 "🌐 Translate and map fields after indexing",
-                value=False,
+                value=bool(s.get("llm_auto_translate", False)),
                 key="lib_translate_after",
                 help=(
-                    "Po kazdem nahranem Documentu:\n1. Prelozi nalezena fields do anglictiny (preskoci, pokud jsou jiz EN or byly extrahovany primym LLM pasem pro CJK/rustinu).\n2. Premapuje sekce jako 'Characteristics' -> DESCRIPTION, 'Age and Distribution' -> OCCURRENCE atd.\n\nVyzaduje: LM Studio s nactenym modelem."
+                    "After every uploaded document:\n1. Translate detected fields into English unless they are already English or were extracted by the direct CJK/Russian LLM pass.\n2. Remap sections such as 'Characteristics' to DESCRIPTION and 'Age and Distribution' to OCCURRENCE.\n\nRequires LM Studio with a loaded model."
                 ),
             )
 
-        # ── Manuální indexace: filey se indexují až po stisku tlačítka ──────
+        # ── Manualni indexace: filey indexuji az after stisku tlacitka ──────
         _up_hash = hash(tuple(sorted(f.name + str(f.size) for f in uploaded_files))) if uploaded_files else 0
         _up_hash_key = "lib_last_upload_hash"
         _already_done = st.session_state.get(_up_hash_key) == _up_hash and _up_hash != 0
@@ -9145,7 +12720,7 @@ def tab_library():
         if uploaded_files and not _already_done:
             _btn_col, _clr_col = st.columns([3, 1])
             _do_upload_btn = _btn_col.button(
-                f"⬆️ Upload and index ({n_files} file{'u' if n_files != 1 else ''})",
+                f"⬆️ Upload and index ({n_files} file{'s' if n_files != 1 else ''})",
                 key="lib_do_upload_btn", type="primary",
                 help="Click to start indexing all queued files.")
             if _clr_col.button("🗑️ Clear queue", key="lib_clear_queue",
@@ -9158,57 +12733,76 @@ def tab_library():
             do_up = False
 
         if uploaded_files and do_up:
-            # Lokální kopie settings s OCR přepsaným dle inline přepínače
+            # Translation preflight happens before indexing. A model-language
+            # incompatibility must never turn into a silent indexing-only run.
+            if _do_translate_after:
+                try:
+                    _require_llm_language_support(s, lang_opt)
+                except RuntimeError as exc:
+                    _set_completion_gate(
+                        "Translation was not started",
+                        f"Indexing was paused before processing because the selected LLM did not pass the {str(lang_opt).upper()} language check. {exc}",
+                        details={"source_language":lang_opt,"model":s.get("lmstudio_model","")},
+                        level="warning")
+                    st.rerun()
+            # Local copy of settings with the inline OCR choice.
             _up_s = dict(s)
             _up_s["ocr_enabled"] = ocr_force
-            overall = st.progress(0, tt(f"Zpracovavam 0/{n_files} files…", f"Processing 0/{n_files} files…"))
+            # ── Dve urovne prubehu: globalni (soubory) + detailni (records/faze) ──
+            overall   = st.progress(0, f"Processing 0/{n_files} files…")
+            _det_prog = st.empty()   # progress bar prekladu/remapovani (per-file)
+            _det_info = st.empty()   # textovy popis aktualni faze
             results = []
             for fi, uploaded in enumerate(uploaded_files):
+                _fn = uploaded.name
+                _file_frac_base = fi / n_files   # zacatek slotu tohoto souboru (0–1)
                 overall.progress(
-                    int(fi / n_files * 100),
-                    f"📄 {uploaded.name} ({fi+1}/{n_files})…")
+                    int(_file_frac_base * 100),
+                    f"📄 {_fn} — indexing… ({fi+1}/{n_files})")
+                _det_info.caption(f"📖 Extracting pages from **{_fn}**…")
+                doc_id = None
+                dest = None
                 try:
-                    dest = UPLOADS_DIR / uploaded.name
-                    dest.write_bytes(uploaded.getbuffer())
-                    pages = extract_pages_from_file(dest, _up_s)
-                    char_count = sum(len(p.text) for p in pages)
-                    # Auto-OCR: pokud je málo textu a OCR nebylo zapnuto, zkus znovu
+                    _det_info.caption(f"🔬 Extracting and detecting — **{_fn}**…")
+                    core_result = index_document_bytes(
+                        uploaded.name, bytes(uploaded.getbuffer()), lang_opt, _up_s)
+                    if not core_result.ok:
+                        raise RuntimeError(core_result.message)
+                    doc_id = int(core_result.document_id)
+                    dest = core_result.stored_path
+                    pages = core_result.pages
+                    char_count = core_result.char_count
+                    diag = core_result.diagnostics
+                    safe_original_name = str(core_result.details.get("safe_filename", uploaded.name))
+                    # Optional second OCR pass remains explicit and observable.
                     avg_ch_pre = (char_count // len(pages)) if pages else 0
                     if avg_ch_pre < int(_up_s.get("pdf_min_chars", 80)) and not ocr_force and _HAS_ANY_OCR():
-                        _ocr_s = dict(_up_s); _ocr_s["ocr_enabled"] = True
-                        pages = extract_pages_from_file(dest, _ocr_s)
-                        char_count = sum(len(p.text) for p in pages)
-                    con = db()
-                    cur = con.execute(
-                        "INSERT INTO documents (filename,path,lang,page_count,char_count,notes,created_at) "
-                        "VALUES (?,?,?,?,?,'',?)",
-                        (uploaded.name, str(dest), lang_opt, len(pages), char_count,
-                         datetime.now().isoformat()))
-                    doc_id = cur.lastrowid
-                    for pg in pages:
-                        con.execute(
-                            "INSERT INTO pages (document_id,page_number,text,method,ocr_note,layout_note) "
-                            "VALUES (?,?,?,?,?,?)",
-                            (doc_id, pg.page_number, pg.text, pg.method, pg.ocr_note, pg.layout_note))
-                    con.commit(); con.close()
-                    diag = detect_candidates(doc_id, pages, s)
+                        _det_info.caption(f"🔍 Low text density detected for **{_fn}** — re-index with OCR is recommended.")
                     avg_ch = (char_count // len(pages)) if pages else 0
                     ocr_warn = "⚠️ little text — consider OCR" if avg_ch < 60 else ""
 
-                    # ── Post-indexační pipeline: remap + volitelný překlad ────
-                    # Spouští se vždy (remap), překlad jen pokud toggle zapnut
-                    # a jazyk Documentu není English.
-                    _n_tr_total = 0
+                    # ── Post-indexacni pipeline: remap + optional preklad ────
+                    # Remap sekci bezi vzdy. Preklad only if toggle zapnut
+                    # and language document neni anglictina.
+                    _n_tr_total    = 0
+                    _n_tr_errors   = 0
                     _n_remap_total = 0
-                    _lang_is_en = lang_opt.lower() in {"en", "eng", "english"}
-                    _need_translate = (
-                        _do_translate_after
-                        and s.get("llm_enabled")
-                        and not _lang_is_en
-                    )
+                    _skip_translate = False
+                    # Poznámka: _lang_is_en se záměrně NEKONTROLUJE — pokud uživatel
+                    # nahraje dokument s výchozím "en" ale ve skutečnosti jde o jiný
+                    # jazyk, auto_translate_candidate_fields(force=True) to sám převede
+                    # na "mixed" (auto-detect). Podmínka zde by překlad zbytečně blokovala.
+                    _translation_requested = bool(_do_translate_after)
+                    _need_translate = bool(_translation_requested and s.get("llm_enabled"))
+                    _translation_failure_messages: List[str] = []
                     _n_found = diag.get("Accepted", 0) + diag.get("Low-confidence", 0)
 
                     if _n_found > 0:
+                        _cjk_stats = (batch_llm_extract_cjk_ru(doc_id, s)
+                                      if _need_translate else {"eligible":0,"batches":0,"fields":0,"errors":0})
+                        if _cjk_stats.get("fields"):
+                            diag["CJK/RU LLM fields"] = _cjk_stats["fields"]
+                            diag["CJK/RU LLM batches"] = _cjk_stats["batches"]
                         _con_tr = db()
                         _tr_cands = _con_tr.execute(
                             "SELECT id, block_text FROM taxon_candidates "
@@ -9217,50 +12811,126 @@ def tab_library():
                         _con_tr.close()
 
                         if _tr_cands:
-                            # Pokud indexace spustila llm_extract_fields_cjk_ru,
-                            # pole jsou JIŽ v angličtině (method='llm').
-                            # Překlad by byl redundantní → přeskočit celý Document.
-                            _con_chk = db()
-                            _doc_llm_fields = _con_chk.execute(
-                                "SELECT COUNT(*) FROM occurrence_fields of "
-                                "JOIN taxon_candidates tc ON of.candidate_id=tc.id "
-                                "WHERE tc.document_id=? AND of.method='llm'",
-                                (doc_id,)).fetchone()[0]
-                            _con_chk.close()
-                            _skip_translate = _need_translate and bool(_doc_llm_fields)
+                            _n_cands = len(_tr_cands)
 
-                            _tr_prog = st.progress(0, "Processing records…")
+                            # ── Oprava _skip_translate ─────────────────────────────
+                            # Puvodni logika preskocila preklad kdykoli existovala LLM field,
+                            # but to is correct Only for CJK/RU, kde llm_extract_fields_cjk_ru
+                            # dela kombinovanou extrakci+preklad in jednom pruchodu.
+                            # For evropske jazyky (cs/de/fr/pl…) LLM field vznikaji jinymi
+                            # metodami and preklad Must probehnout normalne.
+                            # Never skip the whole document because one CJK/RU record
+                            # already contains LLM fields. auto_translate_candidate_fields()
+                            # compares each translated value with its original, so records
+                            # already in English remain unchanged while untranslated records
+                            # are still processed.
+                            _skip_translate = False
+
+                            # ── Urcit ikonu and popis faze ────────────────────────────
+                            if _need_translate and not _skip_translate:
+                                set_document_processing(doc_id, "translating", "llm_translation")
+                                _phase_icon = "🌐"
+                                _phase_lbl  = f"Translating {lang_opt.upper()} → EN"
+                            elif _need_translate and _skip_translate:
+                                _phase_icon = "⏭️"
+                                _phase_lbl  = "Fields already EN (LLM extraction) — remap only"
+                            else:
+                                _phase_icon = "♻️"
+                                _phase_lbl  = "Remapping sections"
+
+                            _det_info.caption(
+                                f"{_phase_icon} **{_fn}** — {_phase_lbl} "
+                                f"· {_n_cands} records · file {fi+1}/{n_files}")
+                            _tr_bar = _det_prog.progress(
+                                0, f"{_phase_icon} 0 / {_n_cands}…")
+
                             for _tci, _tc in enumerate(_tr_cands):
-                                _cid = _tc["id"]
-                                _blk = _tc["block_text"] or ""
+                                _cid  = _tc["id"]
+                                _blk  = _tc["block_text"] or ""
+                                _rlbl = f"{_tci+1}/{_n_cands}"
+
+                                # Globalni progress: preklad is druha polovina slotu souboru.
+                                # 1. polovina = indexace (hotova), 2. polovina = preklad/remap.
+                                _glob_frac = _file_frac_base + (
+                                    0.5 + 0.5 * (_tci + 1) / _n_cands) / n_files
+                                overall.progress(
+                                    min(int(_glob_frac * 100), 99),
+                                    f"{_phase_icon} {_fn} — record {_rlbl} ({fi+1}/{n_files})")
+
                                 try:
                                     if _need_translate and not _skip_translate:
+                                        _tr_bar.progress(
+                                            int(_tci / _n_cands * 100),
+                                            f"🌐 translating record {_rlbl}…")
                                         _n = auto_translate_candidate_fields(
                                             _cid, lang_opt, s,
                                             force=True, force_lang=lang_opt,
                                             block=_blk)
                                         _n_tr_total += _n
-                                    # Remapování (vždy): Characteristics→DESCRIPTION…
-                                    _n_remap_total += remap_fields_post_translation(_cid)
+                                        if _n:
+                                            _n_tr_errors = 0  # reset chyboveho pocitadla after uspechu
+                                    # Remap sekce (vzdy, i without prekladu)
+                                    _tr_bar.progress(
+                                        int(_tci / _n_cands * 100),
+                                        f"♻️ remapping record {_rlbl}…")
+                                    _n_remap_total += remap_fields_post_translation(_cid, update_derived=False)
+
+                                except RuntimeError as _rte:
+                                    # LLM chyba — zobrazit in UI and after 3 chybach zastavit preklad
+                                    _n_tr_errors += 1
+                                    st.warning(
+                                        f"⚠️ Translation error — record #{_cid} "
+                                        f"({_rlbl}): {_rte}")
+                                    _translation_failure_messages.append(str(_rte))
+                                    if _n_tr_errors >= 3:
+                                        st.error(
+                                            f"❌ Translation stopped after 3 consecutive LLM errors for **{_fn}**. "
+                                            f"The final result will report this as a failed translation task.")
+                                        _need_translate = False
                                 except Exception as _te:
                                     logging.warning(
                                         "Post-index pipeline cand %s: %s", _cid, _te)
-                                _tr_prog.progress(
-                                    int((_tci + 1) / len(_tr_cands) * 100),
-                                    f"Records {_tci+1}/{len(_tr_cands)}…")
-                            _tr_prog.empty()
 
+                                _tr_bar.progress(
+                                    int((_tci + 1) / _n_cands * 100),
+                                    f"✓ record {_rlbl}")
+
+                            # Finalize derived indexes once for the whole document,
+                            # after all mapping, translation and remapping writes.
+                            finalize_candidates([int(r["id"]) for r in _tr_cands],
+                                                update_fts=True, update_terms=True)
+                            _det_prog.empty()
+                            _det_info.empty()
+
+                    set_document_processing(doc_id, "ready", "complete")
                     results.append({
                         "File": uploaded.name, "ID": doc_id,
                         "Pages": len(pages), "Zn./str.": avg_ch,
                         "✅ Pending": diag["Accepted"],
                         "🔵 Low-conf": diag["Low-confidence"],
                         "❌ Rejected": diag["Rejected"],
-                        "🌐 Translated": _n_tr_total or ("—" if not _need_translate else 0),
+                        "🌐 Translation": (
+                            f"✓ {_n_tr_total} fields"
+                            if _translation_requested and _n_tr_total > 0 and not _n_tr_errors
+                            else (f"⚠ failed ({_n_tr_errors} errors)" if _translation_requested and _n_tr_errors
+                                  else ("✓ no changes needed" if _translation_requested else "not requested"))
+                        ),
+                        "⚠️ Translation errors": _n_tr_errors if _n_tr_errors else "",
                         "♻️ Remap": _n_remap_total or 0,
                         "Stav": ocr_warn if ocr_warn else "✓ OK",
                     })
                 except Exception as exc:
+                    logging.exception("Document indexing failed for %r", uploaded.name)
+                    if doc_id is not None:
+                        try:
+                            set_document_processing(doc_id, "failed", "indexing", str(exc))
+                        except Exception:
+                            logging.exception("Could not persist failed state for document %s", doc_id)
+                    elif dest is not None and dest.exists():
+                        try:
+                            dest.unlink()
+                        except OSError:
+                            logging.warning("Could not remove failed upload %s", dest)
                     results.append({
                         "File": uploaded.name, "ID": "—",
                         "Pages": "—", "Chars./page.": "—", "✅ Pending": "—",
@@ -9268,35 +12938,42 @@ def tab_library():
                         "Stav": f"✗ Error: {exc}",
                     })
 
-            overall.progress(100, "Hotovo ✓")
+            _det_prog.empty()
+            _det_info.empty()
+            overall.progress(100, "✅ Done!")
             ok_count = sum(1 for r in results if "✓ OK" in r.get("Stav",""))
             ocr_warn_count = sum(1 for r in results if "⚠" in r.get("Stav",""))
-            # Zobrazit výsledky PŘED rerununem (toast přežije rerun, success ne)
+            # Zobrazit vysledky Before rerununem (toast prezije rerun, success ne)
             _toast_msg = f"✅ Indexed {ok_count}/{n_files} documents"
             if ocr_warn_count:
                 _toast_msg += f" · ⚠️ {ocr_warn_count}× little text (consider OCR)"
             st.toast(_toast_msg, icon="✅")
-            st.session_state["last_index_results"] = results  # pro zobrazení po rerunu
+            st.session_state["last_index_results"] = results
+            _translation_was_requested = bool(_do_translate_after)
+            _translation_failures = sum(int(r.get("⚠️ Translation errors") or 0) for r in results)
+            _translated_fields = 0
+            for r in results:
+                m = re.search(r"✓\s+(\d+)\s+fields", str(r.get("🌐 Translation", "")))
+                if m: _translated_fields += int(m.group(1))
+            _summary = f"Indexed {ok_count} of {n_files} document(s)."
+            if _translation_was_requested:
+                if _translation_failures:
+                    _summary += f" Translation failed with {_translation_failures} error(s); no failure was hidden."
+                else:
+                    _summary += f" Translation completed: {_translated_fields} field(s) translated."
+            _set_completion_gate(
+                "Indexing and translation result" if _translation_was_requested else "Indexing completed",
+                _summary + " Review the task details before continuing.",
+                details=results,
+                level="warning" if (not ok_count or _translation_failures) else "success")
             st.session_state[_up_hash_key] = _up_hash
             st.session_state["uploader_key_counter"] += 1
             st.rerun()
 
-    # ── Zobrazit výsledky posledního indexování (po rerunu) ──────────────────
-    _last_results = st.session_state.pop("last_index_results", None)
-    if _last_results:
-        ok_c = sum(1 for r in _last_results if "✓ OK" in r.get("Stav",""))
-        ocr_c = sum(1 for r in _last_results if "⚠" in r.get("Stav",""))
-        err_c = sum(1 for r in _last_results if "✗" in r.get("Stav",""))
-        st.success(
-            f"✅ **Indexing complete** — {ok_c} OK"
-            + (f", {ocr_c}× ⚠️ little text" if ocr_c else "")
-            + (f", {err_c}× ✗ chyba" if err_c else ""))
-        st.dataframe(pd.DataFrame(_last_results), use_container_width=True, hide_index=True)
+    render_last_index_results()
 
-    # ── Celkový souhrn ───────────────────────────────────────────────────────
-    con = db()
-    docs = [dict(r) for r in con.execute("SELECT * FROM documents ORDER BY created_at DESC").fetchall()]
-    con.close()
+    # ── Celkovy souhrn ───────────────────────────────────────────────────────
+    docs = DocumentRepository.list_recent(limit=10000)
     if not docs:
         st.info(t("no_docs"))
         return
@@ -9314,7 +12991,7 @@ def tab_library():
     m2.metric("📃 Pages",       total_pages)
     m3.metric("🔍 Candidates",   tot_c)
     m4.metric("✅ Approved",   tot_ap)
-    m5.metric("📝 Pole",        tot_fi)
+    m5.metric("📝 Fields",        tot_fi)
     st.divider()
 
     # ── Tabulka documents s checkboxy ─────────────────────────────────────────
@@ -9345,6 +13022,7 @@ def tab_library():
         "🔵": status_by_doc.get(d["id"], {}).get("low_confidence", 0),
         "❌": status_by_doc.get(d["id"], {}).get("rejected", 0),
         "Language": d["lang"],
+        "Processing": d.get("processing_status", "ready") or "ready",
         "Uploaded": (d["created_at"] or "")[:16],
     } for d in docs])
 
@@ -9354,7 +13032,7 @@ def tab_library():
         st.session_state.pop("library_table", None)
         st.session_state["_lib_select_all_prev"] = select_all
     lib_search = sa_col2.text_input(
-        "🔍 Hledat Document", key="lib_search", placeholder="filter by name…",
+        "🔍 Search documents", key="lib_search", placeholder="filter by name…",
         label_visibility="collapsed")
 
     df_show = df_docs.drop(columns=["_id"])
@@ -9375,6 +13053,7 @@ def tab_library():
             "🔵":      st.column_config.NumberColumn("🔵", width=45, disabled=True),
             "❌":      st.column_config.NumberColumn("❌", width=45, disabled=True),
             "Language":  st.column_config.TextColumn("Language", width=60, disabled=True),
+            "Processing": st.column_config.TextColumn("Processing", width=95, disabled=True),
             "Uploaded":st.column_config.TextColumn("Uploaded", width=140, disabled=True),
         },
         hide_index=True,
@@ -9390,10 +13069,10 @@ def tab_library():
     ]
     n_sel = len(selected_ids)
 
-    # ── Hromadné akce ────────────────────────────────────────────────────────
+    # ── Hromadne akce ────────────────────────────────────────────────────────
     if n_sel:
         st.markdown(tt(f"**Selected: {n_sel} document(s)**", f"**Selected: {n_sel} document(s)**"))
-        ba1, ba2, ba3, ba4 = st.columns(4)
+        ba1, ba2, ba3, ba4, ba5 = st.columns(5)
 
         if ba1.button(f"🔄 Re-indexovat ({n_sel})", key="lib_batch_reindex"):
             prog = st.progress(0, "Re-indexuji…")
@@ -9412,7 +13091,79 @@ def tab_library():
             st.success(tt(f"Re-indexed {len(results)} documents.", f"Re-indexed {len(results)} documents."))
             st.rerun()
 
-        if ba2.button(f"♻️ Reset detekce ({n_sel})", key="lib_batch_reset"):
+        _batch_tr_ok = s.get("llm_enabled", False)
+        if ba2.button(
+            f"🌐 Re-index + Translate ({n_sel})",
+            key="lib_batch_reindex_tr",
+            disabled=not _batch_tr_ok,
+            help=(
+                "Re-indexuje dokumenty a přeloží všechna nalezená pole do angličtiny. "
+                "Vyžaduje LM Studio s načteným modelem."
+                if _batch_tr_ok else
+                "⚠️ LLM is disabled — enable it in Settings → LM Studio."
+            ),
+        ):
+            _overall = st.progress(0, f"Re-index + Translate 0/{n_sel}…")
+            _det_bar = st.empty()
+            _det_inf = st.empty()
+            _bt_results = []
+            for _bi, _did in enumerate(selected_ids):
+                _base_frac = _bi / n_sel
+                _overall.progress(
+                    int(_base_frac * 100),
+                    f"📄 Re-indexuji {_bi+1}/{n_sel}…")
+                _con_b = db()
+                _row_b = _con_b.execute(
+                    "SELECT path, lang, filename FROM documents WHERE id=?",
+                    (_did,)).fetchone()
+                _con_b.close()
+                if not _row_b:
+                    continue
+                _path_b = pathlib.Path(_row_b["path"])
+                _lang_b = _row_b["lang"] or "en"
+                _fn_b   = _row_b["filename"]
+                if not _path_b.exists():
+                    _bt_results.append({"File": _fn_b, "Stav": "✗ file not found"})
+                    continue
+                try:
+                    _diag_b = _reindex_document(_did, _path_b, s)
+                    _n_found_b = _diag_b.get("Accepted", 0) + _diag_b.get("Low-confidence", 0)
+                    _tr_bar_b = _det_bar.progress(0, f"🌐 {_fn_b} — preparing…")
+                    _det_inf.caption(
+                        f"🌐 **{_fn_b}** — {_lang_code_to_name(_lang_b)} → EN "
+                        f"· {_n_found_b} candidates · doc {_bi+1}/{n_sel}")
+                    _tr_result_b = _translate_pipeline_for_doc(
+                        _did, _lang_b, s,
+                        bar=_tr_bar_b,
+                        overall=_overall,
+                        overall_base=_base_frac + 0.5 / n_sel,
+                        overall_size=0.5 / n_sel,
+                    )
+                    _det_bar.empty()
+                    _bt_results.append({
+                        "File": _fn_b,
+                        "✅": _diag_b["Accepted"],
+                        "🔵": _diag_b["Low-confidence"],
+                        "🌐 Translated": (
+                            _tr_result_b["n_translated"]
+                            if not _tr_result_b["skipped"]
+                            else "⏭️ LLM"
+                        ),
+                        "⚠️ Err": _tr_result_b["n_errors"] or "",
+                        "Detail": (_tr_result_b.get("error_messages") or [""])[0],
+                        "Stav": "✓ OK" if _tr_result_b["n_translated"] else "⚠ no translation",
+                    })
+                except Exception as _be:
+                    _bt_results.append({"File": _fn_b, "Stav": f"✗ {_be}"})
+            _det_bar.empty()
+            _det_inf.empty()
+            _overall.progress(100, "✅ Done!")
+            st.success(f"Re-indexed + translated {len(_bt_results)} documents.")
+            st.dataframe(
+                pd.DataFrame(_bt_results), use_container_width=True, hide_index=True)
+            st.rerun()
+
+        if ba3.button(f"♻️ Reset detekce ({n_sel})", key="lib_batch_reset"):
             prog = st.progress(0, "Resetuji detekci…")
             for i, did in enumerate(selected_ids):
                 prog.progress(int(i/n_sel*100), f"{i+1}/{n_sel}…")
@@ -9430,7 +13181,7 @@ def tab_library():
             st.success(tt(f"Detection reset for {n_sel} documents.", f"Detection reset for {n_sel} documents."))
             st.rerun()
 
-        if ba3.button(f"📄 Export TXT ({n_sel})", key="lib_batch_export_txt"):
+        if ba4.button(f"📄 Export TXT ({n_sel})", key="lib_batch_export_txt"):
             con = db()
             lines = []
             for did in selected_ids:
@@ -9450,11 +13201,11 @@ def tab_library():
                 file_name=f"paleon_library_export_{datetime.now().strftime('%Y%m%d_%H%M')}.txt",
                 mime="text/plain", key="lib_dl_batch_txt")
 
-        if ba4.button(f"🗑️ Delete ({n_sel})", key="lib_batch_delbtn"):
+        if ba5.button(f"🗑️ Delete ({n_sel})", key="lib_batch_delbtn"):
             st.session_state["lib_confirm_batch_del"] = True
 
         if st.session_state.get("lib_confirm_batch_del"):
-            st.warning(tt(f"⚠️ Opravdu smazat {n_sel} selected documents and all their data?", f"⚠️ Really delete {n_sel} selected documents and all their data?"))
+            st.warning(f"⚠️ Really delete {n_sel} selected documents and all their data?")
             yc, nc = st.columns(2)
             if yc.button("✅ Yes, delete all", key="lib_batch_del_yes", type="primary"):
                 for did in selected_ids:
@@ -9466,7 +13217,7 @@ def tab_library():
                 st.session_state.pop("lib_confirm_batch_del", None)
                 st.rerun()
 
-    # ── Hromadné OCR ────────────────────────────────────────────────────────
+    # ── Hromadne OCR ────────────────────────────────────────────────────────
     _ocr_col1, _ocr_col2, _ocr_col3 = st.columns([2, 2, 3])
     _ocr_low = [d for d in docs if (d.get("char_count") or 0) // max(d.get("page_count") or 1, 1) < int(s.get("pdf_min_chars", 80))]
     _engine_str = ", ".join(filter(None, [
@@ -9530,13 +13281,14 @@ def tab_library():
         f"Uploaded: `{(doc['created_at'] or '')[:16]}`  |  "
         f"File: `{doc['path']}`")
 
-    # Language Documentu a poznámka
-    lang_options = ["en","cs","de","fr","ru","zh","mixed"]
+    # Language Documentu and note
     lc, nc = st.columns([1,3])
-    cur_lang = doc["lang"] if doc["lang"] in lang_options else "en"
+    cur_lang = doc["lang"] if doc["lang"] in _LANG_OPTIONS_UI else "en"
     new_lang = lc.selectbox(
-        "🌐 Language", lang_options, index=lang_options.index(cur_lang),
-        key=f"doclang_{did}")
+        "🌐 Language", _LANG_OPTIONS_UI,
+        index=_LANG_OPTIONS_UI.index(cur_lang),
+        key=f"doclang_{did}",
+        help="Document language used as the source language when translating fields.")
     if new_lang != doc["lang"]:
         con = db(); con.execute("UPDATE documents SET lang=? WHERE id=?", (new_lang, did))
         con.commit(); con.close()
@@ -9586,7 +13338,7 @@ def tab_library():
             con.commit(); con.close()
             st.success(t("metadata_saved"))
             st.rerun()
-        # Formátovaná citace
+        # Formatovana citace
         _cite_parts = []
         if doc.get("pub_authors"): _cite_parts.append(doc["pub_authors"])
         if doc.get("pub_year"):    _cite_parts.append(f"({doc['pub_year']})")
@@ -9614,7 +13366,7 @@ def tab_library():
                         help="Tesseract OCR — lower accuracy")
             _oq4.metric("⚠️ Short pages", _ocr["n_empty"],
                         help="< 100 characters — possibly empty or badly extracted")
-            # Vizuální bar OCR vs nativní
+            # Vizualni bar OCR vs nativni
             _native_pct = int(_ocr["n_native"] / max(_ocr["n_pages"],1) * 100)
             _ocr_pct    = int(_ocr["n_ocr"]    / max(_ocr["n_pages"],1) * 100)
             _unk_pct    = 100 - _native_pct - _ocr_pct
@@ -9643,7 +13395,7 @@ def tab_library():
                     "The average amount of text per page is very short. Consider re-indexing using OCR or another method of text extraction.")
 
     st.divider()
-    a1, a2, a3, a4, a5 = st.columns(5)
+    a1, a2, a3, a4, a5, a6 = st.columns(6)
 
     if a1.button("🔄 Re-index", key=f"reindex_{did}",
                  help="Rung again text extraction and detection (global settings OCR applie)."):
@@ -9659,7 +13411,57 @@ def tab_library():
         else:
             st.error(f"File not found: {doc['path']}")
 
-    if a2.button("🔍 OCR", key=f"ocr_{did}",
+    _doc_lang_ri = (doc.get("lang") or "en").strip().lower()
+    _ri_tr_enabled = bool(s.get("llm_enabled", False))
+    if a2.button(
+        "🌐 Re-index + Translate",
+        key=f"reindex_tr_{did}",
+        disabled=not _ri_tr_enabled,
+        help=(
+            (f"Re-indexes the document and translates fields "
+             f"{_lang_code_to_name(_doc_lang_ri) if _doc_lang_ri not in _ENGLISH_LANG_CODES else 'auto-detect'} → EN.")
+            if _ri_tr_enabled else "⚠️ LLM is disabled in Settings."
+        ),
+    ):
+        path = pathlib.Path(doc["path"])
+        if path.exists():
+            _ri_overall = st.progress(0, "Re-indexing…")
+            with st.spinner("Re-indexuji…"):
+                _ri_diag = _reindex_document(did, path, s)
+            _ri_n_found = _ri_diag.get("Accepted", 0) + _ri_diag.get("Low-confidence", 0)
+            _ri_overall.progress(50, f"🌐 Translating {_ri_n_found} candidates…")
+            _ri_bar = st.progress(0, "🌐 Preparing…")
+            _ri_tr = _translate_pipeline_for_doc(
+                did, _doc_lang_ri, s,
+                bar=_ri_bar,
+                overall=_ri_overall,
+                overall_base=0.5,
+                overall_size=0.5,
+            )
+            _ri_bar.empty()
+            _ri_overall.progress(100, "✅ Done!")
+            _ri_msg = (
+                f"✅ Re-indexed + translated — "
+                f"{_ri_diag['Accepted']} pending, {_ri_diag['Low-confidence']} low-conf"
+            )
+            if _ri_tr["skipped"]:
+                _ri_msg += " · ⏭️ fields already in EN (LLM extraction)"
+            elif _ri_tr["n_translated"]:
+                _ri_msg += f" · 🌐 {_ri_tr['n_translated']} fields translated"
+            if _ri_tr["n_errors"]:
+                _ri_msg += f" · ⚠️ {_ri_tr['n_errors']} LLM errors"
+            if _ri_tr["n_translated"]:
+                st.success(_ri_msg)
+            else:
+                st.warning(_ri_msg + " · No field was translated.")
+            for _msg in _ri_tr.get("error_messages", [])[:5]:
+                st.error(_msg)
+            if not _ri_tr.get("error_messages") and not _ri_tr["n_translated"]:
+                st.info("LM Studio returned no changed translations. Check the selected model and the source language/block content.")
+        else:
+            st.error(f"File not found: {doc['path']}")
+
+    if a3.button("🔍 OCR", key=f"ocr_{did}",
                  disabled=not _HAS_ANY_OCR(),
                  type="primary",
                  help="Forces Tesseract OCR on all pages and re-indexes."
@@ -9668,7 +13470,7 @@ def tab_library():
         if path.exists():
             _ocr_s = dict(s)
             _ocr_s["ocr_enabled"] = True
-            _ocr_s["pdf_min_chars"] = 99999  # vynuť OCR na každé stránce
+            _ocr_s["pdf_min_chars"] = 99999  # vynut OCR on kazde page
             with st.spinner(t("ocr_running")):
                 diag = _reindex_document(did, path, _ocr_s)
             st.success(f"OCR hotovo: {diag['Accepted']} pending, {diag['Low-confidence']} low-conf.")
@@ -9676,7 +13478,7 @@ def tab_library():
         else:
             st.error(f"File not found: {doc['path']}")
 
-    if a3.button("♻️ Reset det.", key=f"resetdet_{did}",
+    if a4.button("♻️ Reset det.", key=f"resetdet_{did}",
                  help="Deletes candidates, preserves text - run again the detection."):
         con = db()
         pgs = con.execute(
@@ -9694,7 +13496,7 @@ def tab_library():
         else:
             st.warning(t("no_pages_reindex"))
 
-    if a4.button("📄 TXT pages", key=f"exptxt_{did}"):
+    if a5.button("📄 TXT pages", key=f"exptxt_{did}"):
         con = db()
         pgs = con.execute(
             "SELECT page_number, text, method, layout_note FROM pages "
@@ -9711,19 +13513,19 @@ def tab_library():
             file_name=f"{pathlib.Path(doc['filename']).stem}_pages.txt",
             mime="text/plain", key=f"dl_pages_{did}")
 
-    if a5.button("🗑️ Delete", key=f"delbtn_{did}"):
+    if a6.button("🗑️ Delete", key=f"delbtn_{did}"):
         st.session_state[f"confirm_del_{did}"] = True
     if st.session_state.get(f"confirm_del_{did}"):
-        st.warning(tt(f"⚠️ Opravdu smazat **{doc['filename']}** and all data?", f"⚠️ Really delete **{doc['filename']}** and all data?"))
+        st.warning(f"⚠️ Really delete **{doc['filename']}** and all data?")
         yc, nc = st.columns(2)
-        if yc.button("✅ Yes, smazat", key=f"delyes_{did}", type="primary"):
+        if yc.button("✅ Yes, delete", key=f"delyes_{did}", type="primary"):
             _delete_document(did)
             st.session_state.pop(f"confirm_del_{did}", None)
             st.rerun()
         if nc.button("❌ Cancel", key=f"delno_{did}"):
             st.session_state.pop(f"confirm_del_{did}", None); st.rerun()
 
-    # Prohlížeč pages
+    # Prohlithatc pages
     with st.expander(t("page_viewer")):
         con = db()
         pgs = con.execute(
@@ -9785,7 +13587,7 @@ def tab_library():
                                  height=280, key=f"pgtext_{did}_{sel_page}",
                                  disabled=True)
 
-    # Statistiky / dashboard napříč knihovnou
+    # Statistiky / dashboard napric knihovnou
     _library_stats_dashboard()
 
 
@@ -9825,7 +13627,7 @@ def _get_document_ocr_stats(document_id: int) -> Dict[str, Any]:
     avg_chars = int(sum(p["text_len"] for p in pages) / max(len(pages), 1))
     ocr_ratio = n_ocr / max(len(pages), 1)
     low_q = [p["page_number"] for p in pages
-             if 0 < p["text_len"] < 200]  # neprázdné, ale velmi krátké
+             if 0 < p["text_len"] < 200]  # neprazdne, but velmi kratke
 
     return {
         "n_pages":          len(pages),
@@ -9891,7 +13693,7 @@ def _library_stats_dashboard() -> None:
             st.bar_chart(df_strat.set_index("period")["count"])
         else:
             st.caption(
-                "Zatim zadne spocitane stratigraficke terminy. Scalculated se automaticky when a record is approved, or prepocitejte v tab ⏳🔬 Morpho/Strat.")
+                "No stratigraphic terms have been computed yet. They are calculated after approval or through Recompute.")
 
         st.markdown(t("timeline_docs_candidates"))
         if upload_rows or cand_rows:
@@ -9943,21 +13745,18 @@ def compute_and_save_term_matches_batch(candidate_ids: List[int]) -> int:
     ph = ",".join("?" * len(candidate_ids))
     con = db()
     cand_rows = con.execute(
-        f"SELECT id, block_text FROM taxon_candidates WHERE id IN ({ph})",
-        candidate_ids).fetchall()
+        f"SELECT id, block_text FROM taxon_candidates WHERE id IN ({ph})", candidate_ids).fetchall()
     field_rows = con.execute(
         f"SELECT candidate_id, field_name, field_value FROM occurrence_fields "
-        f"WHERE candidate_id IN ({ph})",
-        candidate_ids).fetchall()
-    con.close()
+        f"WHERE candidate_id IN ({ph})", candidate_ids).fetchall()
 
     block_by_cand: Dict[int, str] = {r["id"]: r["block_text"] or "" for r in cand_rows}
     fields_by_cand: Dict[int, Dict[str, str]] = {}
     for fr in field_rows:
-        fields_by_cand.setdefault(fr["candidate_id"], {})[fr["field_name"]] = \
+        fields_by_cand.setdefault(fr["candidate_id"], {})[fr["field_name"]] =\
             fr["field_value"] or ""
 
-    # Prewarm cached regexes (žádná re.compile() v cyklu)
+    # Prewarm cached regexes (zadna re.compile() in cyklu)
     get_term_regex("morphology")
     get_term_regex("stratigraphy")
 
@@ -9970,87 +13769,42 @@ def compute_and_save_term_matches_batch(candidate_ids: List[int]) -> int:
                 all_rows.append((cid, ttype, m["term"], m["canonical"],
                                  m["category"], m["source_field"]))
 
-    con2 = db()
-    con2.execute(f"DELETE FROM term_matches WHERE candidate_id IN ({ph})",
-                 candidate_ids)
+    con.execute(f"DELETE FROM term_matches WHERE candidate_id IN ({ph})", candidate_ids)
     if all_rows:
-        con2.executemany(
+        con.executemany(
             "INSERT INTO term_matches "
             "(candidate_id, term_type, term, canonical, category, source_field) "
             "VALUES (?,?,?,?,?,?)",
             all_rows)
-    con2.commit()
-    con2.close()
+    con.commit(); con.close()
     return len(candidate_ids)
 
 
 def _batch_update_status(ids: List[int], new_status: str) -> int:
-    """
-    Batch-changes the status of candidates. On approval:
-      - extracts/fills block_text (jen pokud missing)
-      - regex-mapuje pole (jen pokud kandidát nemá žádná)
-      - přepočítá term_matches DÁVKOVĚ = 4 DB dotazy celkem
+    """Extremely fast status update.
 
-    Pro 192 kandidátu nahrazuje ~1 000 sekvenčních DB dotazu za ~10.
+    Approval is intentionally status-only: block extraction, field mapping, FTS and
+    morphology/stratigraphy matching are deferred to their explicit tools. This keeps
+    approval time nearly constant even for thousands of candidates.
     """
     if not ids:
         return 0
-
-    ph = ",".join("?" * len(ids))
-    con = db()
-    con.execute(f"UPDATE taxon_candidates SET status=? WHERE id IN ({ph})",
-                [new_status] + ids)
-
-    approved_ids: List[int] = []
-
-    if new_status == "approved":
-        # 1. Načíst allchny kandidáty najednou
-        need_rows = con.execute(
-            f"SELECT id, document_id, page_start, block_text "
-            f"FROM taxon_candidates WHERE id IN ({ph})",
-            ids).fetchall()
-
-        # 2. Zjistit kteří už mají pole (1 dotaz místo N)
-        existing_field_cids: set = set(
-            r[0] for r in con.execute(
-                f"SELECT DISTINCT candidate_id FROM occurrence_fields "
-                f"WHERE candidate_id IN ({ph})",
-                ids).fetchall())
-
-        # 3. Zpracovat bloky + připravit hromadný INSERT fields
-        field_inserts: List[tuple] = []
-        for r in need_rows:
-            cid   = r["id"]
-            block = r["block_text"] or ""
-            approved_ids.append(cid)
-
-            if not block:
-                block = extract_block_for_candidate(
-                    cid, r["document_id"], r["page_start"])
-                if block:
-                    con.execute(
-                        "UPDATE taxon_candidates SET block_text=? WHERE id=?",
-                        (block, cid))
-
-            if block and cid not in existing_field_cids:
-                for fname, fval in (map_sections_from_block(block) or {}).items():
-                    if fval:
-                        field_inserts.append((cid, fname, fval, "regex_auto"))
-
-        # 4. Hromadný INSERT fields (executemany = 1 operace)
-        if field_inserts:
-            con.executemany(
-                "INSERT OR IGNORE INTO occurrence_fields "
-                "(candidate_id, field_name, field_value, method) VALUES (?,?,?,?)",
-                field_inserts)
-
-    con.commit()
-    con.close()
-
-    # Term matching se záměrně NEPROVÁDÍ zde — bylo příčinou zmrazení UI.
-    # Provede se odloženě přes "Přepočítat termíny" v tab ⏳🔬 Morpho/Strat.
-
-    return len(ids)
+    clean_ids = list(dict.fromkeys(int(x) for x in ids))
+    _ux_snapshot_statuses(clean_ids)
+    ph = ",".join("?" * len(clean_ids))
+    started = time.monotonic()
+    with db_transaction(immediate=True) as con:
+        con.execute(f"UPDATE taxon_candidates SET status=? WHERE id IN ({ph})",
+                    [new_status] + clean_ids)
+    # Avoid serialising thousands of IDs into the audit row.
+    _pc_audit("status_batch", before={"count": len(clean_ids)},
+              after={"status": new_status, "duration_ms": int((time.monotonic()-started)*1000)},
+              entity_type="candidate_batch", entity_id=f"{len(clean_ids)} records")
+    if st is not None:
+        st.session_state["last_fast_approval"] = {
+            "count": len(clean_ids), "status": new_status,
+            "duration_ms": int((time.monotonic()-started)*1000)}
+    return len(clean_ids)
 
 
 
@@ -10074,7 +13828,7 @@ def _save_table_edits(edited_df: pd.DataFrame, original_df: pd.DataFrame) -> int
             con.execute(f"UPDATE taxon_candidates SET {set_clause} WHERE id=?",
                         list(updates.values()) + [cid])
             changed += 1
-            # Extrahuj blok a auto-mapuj pole při schválení
+            # Extrahuj blok and auto-mapuj field when schvaleni
             if updates.get("status") == "approved":
                 approved_ids.append(cid)
                 r = con.execute(
@@ -10144,7 +13898,8 @@ def _batch_llm_validate(ids: List[int], s: Dict, progress_cb=None) -> Dict[str, 
             prompt = (f"Candidate: {cand['heading_text']}\n"
                       f"Rank: {cand['rank_guess']}\n"
                       f"Context:\n{cand['context_after'][:600]}")
-            raw = lm_chat(s, s.get("llm_validation_prompt", LLM_VALIDATION_PROMPT), prompt)
+            raw = lm_chat(s, s.get("llm_validation_prompt", LLM_VALIDATION_PROMPT), prompt,
+                          json_mode=True)
             result = lm_parse_json(raw)
             if result:
                 action = result.get("action","needs_review")
@@ -10241,6 +13996,7 @@ def _batch_approve_threshold(min_conf: float) -> Tuple[int, int]:
 
 def tab_review():
     st.markdown(f"### {t('review_header')}", unsafe_allow_html=False)
+    st.caption("⚡ Fast approval is enabled: status changes are committed immediately. Field mapping and morphology/stratigraphy enrichment run only through their explicit tools.")
     s = get_settings()
 
     con = db()
@@ -10261,6 +14017,9 @@ def tab_review():
 
     # ── Filtry ────────────────────────────────────────────────────────────────
     with st.expander(t("filters_expander"), expanded=True):
+        st.button("Clear all", key="rev_clear_all",
+                  on_click=_clear_session_keys,
+                  args=("rev_status", "rev_conf", "rev_rank", "rev_search"))
         fc1, fc2, fc3, fc4 = st.columns([2,1,1,2])
         filter_status = fc1.multiselect(
             "Status", STATUS_OPTIONS,
@@ -10270,7 +14029,7 @@ def tab_review():
         filter_text = fc4.text_input("🔍 Search in title", key="rev_search",
                                      placeholder="e.g. Examplius")
 
-    # ── Načti a filtruj ───────────────────────────────────────────────────────
+    # ── Nacti and filtruj ───────────────────────────────────────────────────────
     con = db()
     if all_docs_mode:
         all_rows = con.execute(
@@ -10297,8 +14056,8 @@ def tab_review():
         return
 
     # ── Smart Sort ───────────────────────────────────────────────────────────
-    # Vypočítáme suspicion score pro každého kandidáta a seřadíme:
-    # legitimní hyoliti (nízká podezřelost) nahoru, FP dolu.
+    # Vypocitame suspicion score for kazdeho candidate and seradime:
+    # legitimni hyoliti (nizka podezrelost) nahoru, FP dolu.
     sort_col, threshold_col = st.columns([2, 3])
     _sort_opts_cs = ["Smart (legitimate first)", "Score ↓", "Page ↑"]
     _sort_opts_en = ["Smart (legitimate first)", "Confidence ↓", "Page ↑"]
@@ -10326,7 +14085,7 @@ def tab_review():
             key="rev_threshold", label_visibility="collapsed",
             format="%.2f")
         s["review_batch_threshold"] = thr
-        # Spočítat z DB přímo kolik kandidátu by bylo approved
+        # Spocitat from DB primo kolik kandidatu by bylo approved
         con_t = db()
         n_above = con_t.execute(
             "SELECT COUNT(*) FROM taxon_candidates "
@@ -10334,13 +14093,13 @@ def tab_review():
             (thr,)).fetchone()[0]
         con_t.close()
         if tc2.button(f"✅ ≥{thr:.2f}", key="rev_threshold_btn", type="primary",
-                      help=f"Approves {n_above} candidates across VSEMI Documenty s conf ≥ {thr:.2f}"):
+                      help=f"Approves {n_above} candidates across all documents with confidence ≥ {thr:.2f}"):
             approved_n, _ = _batch_approve_threshold(thr)
             st.success(tt(f"Approved {approved_n} candidates across the library (conf ≥ {thr:.2f}).", f"Approved {approved_n} candidates library-wide (conf ≥ {thr:.2f})."))
             st.rerun()
         tc3.caption(f"→ {n_above} candidates across all docs.")
 
-    # ── Souhrn (kompaktní jeden řádek) ──────────────────────────────────────
+    # ── Souhrn (kompaktni jeden line) ──────────────────────────────────────
     _comp_data = []
     if filtered:
         _cids = [r["id"] for r in filtered]
@@ -10372,11 +14131,11 @@ def tab_review():
         f"⚠️ suspicious: <b>{_n_sus}</b> &nbsp;│&nbsp; "
         f"avg completeness: <b>{_avg_comp*100:.0f}%</b> &nbsp;│&nbsp; {_dok_info}"
         f"</div>", unsafe_allow_html=True)
-    # ── Batch překlad celého Documentu ───────────────────────────────────
+    # ── Batch preklad celeho Documentu ───────────────────────────────────
     if s.get("llm_enabled"):
         with st.expander(t("batch_translate_expander"), expanded=False):
             st.caption(
-                "Prelozi allchna vyplnena fields schvalenych/pending records z selectedho Documentu do anglictiny pomoci LLM.")
+                "Translates all filled fields in approved or pending records from the selected document into English using the LLM.")
             _bt_con = db()
             _bt_docs = _bt_con.execute(
                 "SELECT DISTINCT d.id, d.filename, d.lang "
@@ -10405,7 +14164,7 @@ def tab_review():
                     key="batch_tr_run", type="primary"):
                     _bt_con2 = db()
                     _bt_cands = _bt_con2.execute(
-                        "SELECT id FROM taxon_candidates "
+                        "SELECT id, block_text FROM taxon_candidates "
                         "WHERE document_id=? AND status IN "
                         "('approved','pending')",
                         (_bt_doc["id"],)).fetchall()
@@ -10416,22 +14175,24 @@ def tab_review():
                     _bt_tr    = 0
                     for _bt_c in _bt_cands:
                         _bt_n = auto_translate_candidate_fields(
-                            _bt_c["id"], _bt_lang, s, force=True)
+                            _bt_c["id"], _bt_lang, s, force=True,
+                            block=(_bt_c["block_text"] or ""))
                         _bt_tr   += _bt_n
                         _bt_done += 1
                         _bt_prog.progress(
                             int(_bt_done / max(_bt_total, 1) * 100),
                             f"{_bt_done}/{_bt_total} ({_bt_tr} fields)…")
                     _bt_prog.empty()
-                    st.success(
-                        f"Done: translated {_bt_tr} fields "
-                        f"v {_bt_done} records.")
+                    _set_completion_gate(
+                        "Translation completed",
+                        f"Translated {_bt_tr} field(s) in {_bt_done} record(s) from {_bt_fname}.",
+                        details={"document":_bt_fname,"records":_bt_done,"fields_translated":_bt_tr})
                     st.rerun()
 
 
-    # ── Klávesové zkratky (A/R) ───────────────────────────────────────────────
+    # ── Klavesove zkratky (And/R) ───────────────────────────────────────────────
     _inject_keyboard_shortcuts("review", "Approve (A)", "Reject (R)")
-    # ── Přehled napříč Documenty (jen v režimu "Allchny Documenty") ───────────
+    # ── Prehled napric Documenty (only in rezimu "Allchny Documenty") ───────────
     if all_docs_mode:
         st.markdown(f"<div style='font-size:0.82rem;margin:3px 0;opacity:0.8'>{tt('Overview by document:', 'Overview by document:')}</div>", unsafe_allow_html=True)
 
@@ -10441,15 +14202,15 @@ def tab_review():
             by_doc.setdefault(r["document_id"], []).append(r)
             doc_names[r["document_id"]] = r["filename"]
 
-        # Tlačítko schválit napříč VŠEMI filtrovanými Documenty najednou
+        # Tlacitko schvalit napric VSEMI filtrovanymi Documenty najednou
         gc1, gc2 = st.columns([1,3])
         if gc1.button(f"✅ Approve all across all ({len(filtered)})",
                       type="primary", key="rev_approve_all_global"):
             with st.spinner(tt(f"Approving {len(filtered)} candidates…", f"Approving {len(filtered)} candidates…")):
                 n = _batch_update_status([r["id"] for r in filtered], "approved")
-            st.toast(tt(f"✅ Approved {n} candidates across {len(by_doc)} Documenty.", f"✅ Approved {n} candidates across {len(by_doc)} documents."), icon="✅")
+            st.toast(f"✅ Approved {n} candidates across {len(by_doc)} documents.", icon="✅")
             st.rerun()
-        gc2.caption("Approves allchny kandidaty zobrazene v prehledu below, ve allch documents.")
+        gc2.caption("Approves all candidates shown in the overview across all documents.")
 
         for did, rows in sorted(by_doc.items(), key=lambda kv: doc_names[kv[0]]):
             dc1, dc2, dc3 = st.columns([3,1,1])
@@ -10464,7 +14225,7 @@ def tab_review():
                 st.toast(tt(f"❌ Rejected {n} · {doc_names[did]}", f"❌ Rejected {n} · {doc_names[did]}"), icon="❌")
                 st.rerun()
 
-    # ── Hromadné akce na filtrovaných ───────────────────────────────────────
+    # ── Hromadne akce on filtrovanych ───────────────────────────────────────
     st.markdown(f"<div style='margin-top:4px;font-size:0.8rem;opacity:0.7'>{tt('Bulk action on filtered:', 'Bulk actions on filtered:')}</div>", unsafe_allow_html=True)
     ba1,ba2,ba3,ba4,ba5 = st.columns(5)
     if ba1.button("✅ Approve all", help="Schvali all filtered"):
@@ -10479,7 +14240,7 @@ def tab_review():
     if ba3.button("❌ Reject", help="Reject all filtered"):
         n = _batch_update_status([r["id"] for r in filtered], "rejected")
         st.toast(tt(f"❌ Rejected {n}", f"❌ Rejected {n}"), icon="❌"); st.rerun()
-    if ba4.button("🔄 Auto-map", help="Auto-mapuje sekce pro schvalene z filtru"):
+    if ba4.button("🔄 Auto-map", help="Auto-maps sections for approved records in the current filter"):
         ids = [r["id"] for r in filtered if r["status"]=="approved"]
         if ids:
             with st.spinner(tt(f"Auto-mapuji {len(ids)} records…", f"Auto-mapping {len(ids)} records…")):
@@ -10496,7 +14257,7 @@ def tab_review():
             counts = _batch_llm_validate(ids, s, _upd)
         prog.empty()
         st.success(f"LLM: keep={counts['keep']}, reject={counts['reject']}, "
-                   f"review={counts['needs_review']}, chyby={counts['error']}")
+                   f"review={counts['needs_review']}, errors={counts['error']}")
         st.rerun()
 
     # ── Data editor tabulka ───────────────────────────────────────────────────
@@ -10548,7 +14309,7 @@ def tab_review():
         key="review_table",
     )
 
-    # Přidat _id zpět pro saveení
+    # Pridat _id zpet for saveeni
     edited_with_id = edited.copy()
     edited_with_id["_id"] = df_orig["_id"].values
 
@@ -10562,7 +14323,7 @@ def tab_review():
         else:
             st.info(t("no_changes_to_save"))
 
-    # Akce na zaškrtnutých
+    # Akce on zaskrtnutych
     selected_ids = [
         int(df_orig.iloc[i]["_id"])
         for i, row in edited.iterrows()
@@ -10602,14 +14363,21 @@ def tab_review():
                        f"review={counts['needs_review']}, err={counts['error']}")
             st.rerun()
 
-    # ── Detail kandidáta — navigace Prev/Noxt + klávesy ← → ────────────────
-    # review_detail_idx: index do filteredanního seznamu (přežívá rerun)
-    # Pokud je zaškrtnut přesně jeden checkbox → přejít na něj.
+    # ── Detail candidate — show only for exactly one checked record ─────────
+    # Selection is authoritative:
+    #   0 checked  -> show no record detail
+    #   1 checked  -> show that record's detail
+    #   2+ checked -> keep only the bulk actions rendered above
+    if n_sel != 1:
+        return
+
+    # review_detail_idx: index of the filtered list (persists across reruns).
+    # Exactly one checked checkbox synchronizes the detail to that record.
     if "review_detail_idx" not in st.session_state:
         st.session_state["review_detail_idx"] = 0
 
     if len(selected_ids) == 1:
-        # Zaškrtnutý jeden checkbox → synchronizovat detail na ten záznam
+        # Zaskrtnuty jeden checkbox → synchronizovat detail on ten zaznam
         _sel_pos = next((i for i, r in enumerate(filtered) if r["id"] == selected_ids[0]), 0)
         if st.session_state["review_detail_idx"] != _sel_pos:
             st.session_state["review_detail_idx"] = _sel_pos
@@ -10620,24 +14388,26 @@ def tab_review():
         st.session_state["review_detail_idx"] = _det_idx
 
     detail_id = filtered[_det_idx]["id"] if filtered else None
+    if detail_id:
+        _ux_set_current_candidate(detail_id)
 
-    # ── Navigační lišta Prev/Noxt ────────────────────────────────────────────
+    # ── Navigacni lista Prev/Noxt ────────────────────────────────────────────
     _nav_c1, _nav_c2, _nav_c3, _nav_c4 = st.columns([1, 1, 4, 1])
     if _nav_c1.button(tt("◀ Previous", "◀ Previous"), key="rev_det_prev",
                       disabled=(_det_idx == 0),
                       help=tt("Previous candidate (key ←)", "Previous candidate (key ←)")):
         st.session_state["review_detail_idx"] = max(0, _det_idx - 1)
         st.rerun()
-    if _nav_c2.button(tt("Noxt ▶", "Noxt ▶"), key="rev_det_next",
+    if _nav_c2.button(tt("Next ▶", "Next ▶"), key="rev_det_next",
                       disabled=(_det_idx >= len(filtered) - 1),
-                      help=tt("Noxt candidate (key →)", "Noxt candidate (key →)")):
+                      help=tt("Next candidate (key →)", "Next candidate (key →)")):
         st.session_state["review_detail_idx"] = min(len(filtered) - 1, _det_idx + 1)
         st.rerun()
     _nav_c3.markdown(
         f"<div style='padding-top:6px;font-size:0.82rem;opacity:0.85'>"
         f"{tt(f'Candidate <b>{_det_idx + 1}</b> / {len(filtered)}', f'Candidate <b>{_det_idx + 1}</b> / {len(filtered)}')}"
         f"</div>", unsafe_allow_html=True)
-    # Skokový výběr — číslo záznamu v sérii
+    # Skokovy vyber — cislo zaznamu in serii
     _jump = _nav_c4.number_input(
         "→#", min_value=1, max_value=max(len(filtered), 1),
         value=_det_idx + 1, step=1,
@@ -10648,12 +14418,12 @@ def tab_review():
         st.rerun()
 
     # ── Keyboard navigace ← → v detail panelu ────────────────────────────────
-    st.markdown("""<script> (function() { const _navKey = '_rev_nav_injected'; if (window[_navKey]) return; window[_navKey] = true; document.addEventListener('keydown', function(e) { if (['INPUT','TEXTAREA','SELECT'].includes(document.activeElement.tagName)) return; if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') { const btns = document.querySelectorAll('button'); const label = e.key === 'ArrowLeft' ? '◀ Previous': 'Noxt ▶'; for (const b of btns) { if (b.innerText.trim().startsWith(e.key === 'ArrowLeft' ? '◀': 'Noxt') || b.innerText.trim() === label) { b.click(); break; } } } }); })(); </script>""", unsafe_allow_html=True)
+    st.markdown("""<script> (function() { const _navKey = '_rev_nav_injected'; if (window[_navKey]) return; window[_navKey] = true; document.addEventListener('keydown', function(e) { if (['INPUT','TEXTAREA','SELECT'].includes(document.activeElement.tagName)) return; if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') { const btns = document.querySelectorAll('button'); const label = e.key === 'ArrowLeft' ? '◀ Previous': 'Next ▶'; for (const b of btns) { if (b.innerText.trim().startsWith(e.key === 'ArrowLeft' ? '◀': 'Next') || b.innerText.trim() === label) { b.click(); break; } } } }); })(); </script>""", unsafe_allow_html=True)
 
     with st.expander(t("candidate_detail_expander"), expanded=True):
         cand_detail = get_candidate(int(detail_id)) if detail_id else None
         if cand_detail:
-            # Hlavička — rank badge s barvou podle species/genus/family
+            # Hlavicka — rank badge s barvou podle species/genus/family
             _conf_d = cand_detail["confidence"] or 0
             _stat_d = cand_detail["status"] or ""
             _stat_icon = {"approved":"✅","rejected":"❌","pending":"⏳",
@@ -10670,7 +14440,7 @@ def tab_review():
                 f"border-radius:3px;padding:1px 6px;font-size:0.78rem'>"
                 f"{cand_detail['rank_guess'] or '?'}</span>"
             )
-            # Rank-aware TYPE pole varování v detailu
+            # Rank-aware TYPE field varovani in detailu
             _det_fields_pre = get_candidate_fields(int(detail_id))
             _rk_d_norm = _RANK_ALIASES.get(_rank_d, _rank_d if _rank_d in _REQUIRED_FIELDS_BY_RANK else "")
             _is_sp_grade = _rk_d_norm in ("species", "subspecies")
@@ -10704,13 +14474,13 @@ def tab_review():
                 st.text(cand_detail["context_after"][:400] if cand_detail["context_after"] else "–")
 
             with dd2:
-                # Vyplněná pole — zvýrazni TYPE TAXON/SPECIMENS podle ranku
+                # Vyplnena field — zvyrazni TYPE TAXON/SPECIMENS podle ranku
                 _det_fields = _det_fields_pre
                 if _det_fields:
                     st.caption(t("extracted_fields_caption"))
                     for _fn, _fv in sorted(_det_fields.items()):
                         if _fv and _fv != NOT_PROVIDED:
-                            # Barevné označení problematických fields
+                            # Barevne oznaceni problematickych fields
                             _fld_warn = (
                                 (_is_sp_grade and _fn == "TYPE TAXON") or
                                 (_is_hi_grade and _fn == "TYPE SPECIMENS" and
@@ -10743,11 +14513,11 @@ def tab_review():
                         f"LLM: **{action}** [{llm_j.get('confidence','?')}] "
                         f"_{llm_j.get('reason','')}_")
 
-            # Rychlé akce + navigace v jedné řadě
+            # Rychle akce + navigace in jedne rade
             _qa1, _qa2, _qa3, _qa4, _qa5 = st.columns([1, 1, 1, 1, 1])
             if _qa1.button("✅ Approve", key=f"det_appr_{detail_id}", type="primary"):
                 _batch_update_status([detail_id], "approved")
-                # Automatický posun na další po schválení
+                # Automaticky posun nand others after schvaleni
                 if _det_idx < len(filtered) - 1:
                     st.session_state["review_detail_idx"] = _det_idx + 1
                 st.rerun()
@@ -10762,7 +14532,7 @@ def tab_review():
                            disabled=(_det_idx == 0), help="Previous"):
                 st.session_state["review_detail_idx"] = max(0, _det_idx - 1); st.rerun()
             if _qa5.button("▶", key=f"det_next_{detail_id}",
-                           disabled=(_det_idx >= len(filtered) - 1), help="Noxt"):
+                           disabled=(_det_idx >= len(filtered) - 1), help="Next"):
                 st.session_state["review_detail_idx"] = min(len(filtered)-1, _det_idx+1); st.rerun()
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -10770,20 +14540,17 @@ def tab_review():
 # ══════════════════════════════════════════════════════════════════════════════
 
 FIELD_GROUPS: Dict[str, List[str]] = {
-    # TYPE TAXON (rod/Ďledě → typový druh/rod) patří do Identita
-    "🏷️ Identita":          ["TAXONOMIC PLACEMENT","TAXON","NOMENCLATURAL ACTS",
-                              "TYPE TAXON",
-                              "INCLUDED TAXONS"],
-    "📋 Nomenklatura":      ["AUTHOR","SYNONYMY",
-                              "OPEN NOMENCLATURE / IDENTIFICATION QUALIFIERS"],
-    # TYPE SPECIMENS (druh/poddruh → holotyp, paratypus…) patří do Typy & materiál
-    "🔬 Types & material":   ["TYPE SPECIMENS",
-                              "TYPE MATERIAL","MATERIAL EXAMINED"],
-    "📍 Locality & strat.": ["LOCALITY","STRATIGRAPHY","OCCURRENCE","YEAR_OF_PUBLICATION"],
-    "📝 Popis":              ["DIAGNOSIS","DESCRIPTION","SIZE","ETYMOLOGY"],
-    "💬 Misc":               ["REMARKS","FIGURES","REFERENCE"],
+    "📝 Description": ["DIAGNOSIS", "DESCRIPTION", "SIZE", "ETYMOLOGY"],
+    "🏷️ Taxonomy": [
+        "TAXONOMIC PLACEMENT", "TAXON", "AUTHOR", "NOMENCLATURAL ACTS",
+        "TYPE TAXON", "INCLUDED TAXONS", "SYNONYMY",
+        "OPEN NOMENCLATURE / IDENTIFICATION QUALIFIERS",
+    ],
+    "🔬 Types & material": ["TYPE SPECIMENS", "TYPE MATERIAL", "MATERIAL EXAMINED"],
+    "📍 Locality & stratigraphy": ["LOCALITY", "STRATIGRAPHY", "OCCURRENCE", "YEAR_OF_PUBLICATION"],
+    "💬 Misc": ["REMARKS", "FIGURES", "REFERENCE", "RAW_TRANSLATION", "UNMAPPED TEXT", "REST"],
 }
-# Prioritní pořadí fields pro ruzné ranky (používá ordered_field_groups_for_rank)
+# Prioritni poradi fields for ruzne ranky (pouziva ordered_field_groups_for_rank)
 _SPECIES_GRADE_PRIORITY_FIELDS  = ["TYPE SPECIMENS","DIAGNOSIS","LOCALITY",
                                     "STRATIGRAPHY","DESCRIPTION","SYNONYMY","FIGURES"]
 _GENUS_GRADE_PRIORITY_FIELDS    = ["TYPE TAXON","DIAGNOSIS","INCLUDED TAXONS",
@@ -10820,7 +14587,7 @@ def ordered_field_groups() -> Dict[str, List[str]]:
         sorted_fields = sorted(fields, key=lambda f: -prio.get(f, 0))
         result[gname] = sorted_fields
         group_max_prio[gname] = max((prio.get(f, 0) for f in fields), default=0)
-    # Seřadit skupiny podle nejvyšší priority pole uvnitř (sestupně)
+    # Seradit skupiny podle nejvyssi priority field uvnitr (sestupne)
     ordered_names = sorted(result.keys(), key=lambda g: -group_max_prio[g])
     return {g: result[g] for g in ordered_names}
 
@@ -10847,17 +14614,17 @@ def ordered_field_groups_for_rank(rank: str = "") -> Dict[str, List[str]]:
     for gname, fields in base.items():
         ordered = list(fields)
         if _rk in ("species", "subspecies"):
-            # Pro druhy: TYPE SPECIMENS na prvním místě v Typy,
-            # TYPE TAXON přesunout na poslední v Identita (málo relevantní)
+            # For and speciesy: TYPE SPECIMENS on prvnim miste in Typy,
+            # TYPE TAXON presunout on posledni in Identita (malo relevantni)
             if "TYPE SPECIMENS" in ordered:
                 ordered = ["TYPE SPECIMENS"] + [f for f in ordered if f != "TYPE SPECIMENS"]
             if "TYPE TAXON" in ordered:
                 ordered = [f for f in ordered if f != "TYPE TAXON"] + ["TYPE TAXON"]
         elif _rk in ("genus", "family", "order", "class", "phylum"):
-            # Pro rody/čeledi: TYPE TAXON na prvním místě v Identita
+            # For genusy/celedi: TYPE TAXON on prvnim miste in Identita
             if "TYPE TAXON" in ordered:
                 ordered = ["TYPE TAXON"] + [f for f in ordered if f != "TYPE TAXON"]
-            # TYPE SPECIMENS na konec Typy (málo relevantní jako heading)
+            # TYPE SPECIMENS on konec Typy (malo relevantni as heading)
             if "TYPE SPECIMENS" in ordered:
                 ordered = [f for f in ordered if f != "TYPE SPECIMENS"] + ["TYPE SPECIMENS"]
         result[gname] = ordered
@@ -10945,10 +14712,12 @@ Block Editor lets you fix it.
     docs = con.execute("SELECT id, filename FROM documents ORDER BY created_at DESC").fetchall()
     con.close()
     if not docs:
-        st.info("Nojprve nahrajte Document.")
+        st.info("Upload a document first.")
         return
 
     doc_labels = {f"{d['filename']} (ID {d['id']})": d['id'] for d in docs}
+    st.button("Clear all", key="be_clear_all",
+              on_click=_clear_session_keys, args=("be_doc", "be_status", "be_cand"))
     dcol, scol = st.columns([3, 2])
     doc_label = dcol.selectbox("Document", list(doc_labels.keys()), key="be_doc")
     doc_id = doc_labels[doc_label]
@@ -10972,6 +14741,7 @@ Block Editor lets you fix it.
     cand_labels = {f"#{r['id']} · str. {r['page_start']} · {r['taxon_name']} · {r['rank_guess']} · {r['status']}": r['id'] for r in rows}
     cand_label = st.selectbox(t("candidate_block_label"), list(cand_labels.keys()), key="be_cand")
     cid = int(cand_labels[cand_label])
+    _ux_set_current_candidate(cid)
     cand = get_candidate(cid)
     if not cand:
         st.error(t("candidate_not_found"))
@@ -11027,6 +14797,7 @@ Block Editor lets you fix it.
             sug = st.session_state[f"be_boundary_suggestion_{cid}"]
             st.json(sug, expanded=False)
             if st.button(t("apply_boundary_suggestion"), key=f"be_apply_suggest_{cid}"):
+                _ux_snapshot_block(cid)
                 s_id = int(sug.get("suggested_start_unit_id", start_default))
                 e_id = int(sug.get("suggested_end_unit_id", end_default))
                 block = "\n\n".join((units[i].text or "").strip() for i in range(s_id, e_id+1) if (units[i].text or "").strip())
@@ -11048,7 +14819,7 @@ Block Editor lets you fix it.
         start_unit = rng1.number_input(
             "From (first paragraph)", 0, max(0, len(units)-1), start_default,
             key=f"be_start_{cid}",
-            help="Index firs paragraph of this record.")
+            help="Index of the first paragraph of this record.")
         end_unit = rng2.number_input(
             "To (last paragraph)", 0, max(0, len(units)-1), end_default,
             key=f"be_end_{cid}",
@@ -11068,6 +14839,7 @@ Block Editor lets you fix it.
         st.dataframe(pd.DataFrame(preview_rows), use_container_width=True, hide_index=True)
         c1, c2, c3 = st.columns(3)
         if c1.button("💾 Save start/end", key=f"be_save_bounds_{cid}"):
+            _ux_snapshot_block(cid)
             block = "\n\n".join((units[i].text or "").strip()
                                 for i in range(int(start_unit), int(end_unit)+1)
                                 if (units[i].text or "").strip())
@@ -11088,7 +14860,7 @@ Block Editor lets you fix it.
         st.subheader(t("block_text_fields"))
         source = cand.get("active_block_source") or "parser"
         st.caption(
-            "**Block source** determines, which text is used extraction of fields. 🤖 auto = text from the parser (automatic), ✋ manual = text manually insterted below."
+            "**Block source** determines, which text is used extraction of fields. 🤖 auto = text from the parser (automatic), ✋ manual = text manually inserted below."
         )
         st.radio("Block source", ["parser", "manual"],
                  index=1 if source == "manual" else 0,
@@ -11110,7 +14882,7 @@ Block Editor lets you fix it.
             st.success(t("manual_block_saved")); st.rerun()
         if m2.button("↩️ Back to auto block", key=f"be_parser_on_{cid}"):
             set_active_block_source(cid, "parser"); st.rerun()
-        if st.button("🔄 Extract the array from the block again", key=f"be_pipeline_{cid}",
+        if st.button("🔄 Re-extract fields from the block", key=f"be_pipeline_{cid}",
                      help="Run automatic mapping of sections → fields from the current block."):
             run_post_approval_pipeline(cid); st.success(t("field_extraction_done")); st.rerun()
         events = detect_field_events(get_active_block_text(cand) or active_block)
@@ -11127,7 +14899,7 @@ Block Editor lets you fix it.
         st.caption(t("extracted_fields_hint"))
         fields = get_candidate_fields(cid)
         if fields:
-            st.dataframe(pd.DataFrame([{"pole": k, "hodnota": v[:500]}
+            st.dataframe(pd.DataFrame([{"field": k, "value": v[:500]}
                                        for k, v in sorted(fields.items()) if v]),
                          use_container_width=True, hide_index=True)
         else:
@@ -11192,11 +14964,11 @@ def render_manual_taxon_creator(default_doc_id: Optional[int] = None) -> None:
                 st.error(tt(f"❌ Record se nepodarilo vytvorit: {exc}", f"❌ Failed to create record: {exc}"))
 
 def tab_editor():
-    st.header(t("editor_header"))
+    st.markdown(f"### {t('editor_header')}", unsafe_allow_html=False)
     render_manual_taxon_creator()
     s = get_settings()
 
-    # ── Načti schválené záznamy ───────────────────────────────────────────────
+    # ── Nacti schvalene records ───────────────────────────────────────────────
     con = db()
     approved = con.execute("""
         SELECT tc.id, tc.taxon_name, tc.rank_guess, tc.page_start,
@@ -11205,7 +14977,7 @@ def tab_editor():
         FROM taxon_candidates tc
         JOIN documents d ON tc.document_id=d.id
         WHERE tc.status IN ('approved','needs_review')
-        ORDER BY d.filename, tc.page_start
+        ORDER BY tc.taxon_name COLLATE NOCASE, d.filename, tc.page_start
     """).fetchall()
     con.close()
 
@@ -11213,7 +14985,7 @@ def tab_editor():
         st.info(t("no_approved"))
         return
 
-    # ── Živé hledání — VŽDY viditelné nad navigací (ne v expanderu) ──────────
+    # ── Zive hledani — VZDY viditelne nad navigaci (ne in expanderu) ──────────
     fdocs  = sorted(set(r["filename"]  for r in approved))
     franks = sorted(set(r["rank_guess"] for r in approved if r["rank_guess"]))
 
@@ -11228,7 +15000,7 @@ def tab_editor():
     f_rank = sf3.selectbox("Rank", ["— All —"] + franks,
                             key="ed_filter_rank", label_visibility="collapsed")
 
-    # Wildcard podpora: * → .* , ? → . ; bez wildcard = substring hledání
+    # Wildcard podpora: * → .* , ? → . ; without wildcard = substring hledani
     def _match_search(name: str, pattern: str) -> bool:
         if not pattern:
             return True
@@ -11255,7 +15027,7 @@ def tab_editor():
         st.warning(t("no_record_in_filter"))
         return
 
-    # Pokud je aktivní vyhledávání (neprázdný f_search), zobraz tabulku výsledku
+    # If is aktivni vyhledavani (neprazdny f_search), zobraz tabulku vysledku
     if f_search and f_search.strip():
         st.caption(tt(f"🔎 Nalezeno {len(filtered)} results — click a row to edit", f"🔎 Found {len(filtered)} results — click a row to edit"))
         _search_df = pd.DataFrame([{
@@ -11294,15 +15066,15 @@ def tab_editor():
     if idx >= len(filtered):
         idx = 0; st.session_state["editor_idx"] = 0
 
-    # ── Dvoupanelový layout: levý = literatura+taxoni, pravý = editor ────────
+    # ── Dvoupanelovy layout: levy = literatura+taxoni, pravy = editor ────────
 
-    # ── Dvoupanelový layout: levý = taxony, pravý = editor ──────────────────
+    # ── Dvoupanelovy layout: levy = taxony, pravy = editor ──────────────────
     ed_left, ed_right = st.columns([1, 3], gap="medium")
 
     with ed_left:
-        # ── Seznam allch taxa (filtrovaný dle horní lišty) ─────────────────
-        # Literatura se vybírá filtrem "Document" v horní liště (f_doc selectbox).
-        # Když je vybraný konkrétní Document, zobrazí se jen jeho taxony.
+        # ── List allch taxa (filtrovany dle horni listy) ─────────────────
+        # Literatura vybira filtrem "Document" in horni liste (f_doc selectbox).
+        # When is vybrany konkretni Document, zobrazi only jeho taxony.
         _left_label = (
             f"**🔬 Taxony** — {len(filtered)} records"
             + (f" · 📄 {f_doc}" if f_doc != "— All —" else "")
@@ -11351,15 +15123,18 @@ def tab_editor():
                     st.rerun()
         st.caption(tt(f"Record {idx+1}/{len(filtered)}", f"Record {idx+1}/{len(filtered)}"))
 
-    # ── Pravý panel: vlastní editor záznamu ──────────────────────────────
+    # ── Pravy panel: vlastni editor zaznamu ──────────────────────────────
     with ed_right:
 
         cand = get_candidate(id_list[idx])
         if not cand:
             st.error(t("record_not_found")); return
         cand_id = cand["id"]
+        _ux_set_current_candidate(cand_id)
+        _ux_render_save_state(cand_id)
+        _ux_render_quality_panel(cand_id)
 
-        # ── Akce na aktuálním záznamu (klávesy A = schválit, R = odmítnout) ──────
+        # ── Akce on aktualnim zaznamu (klavesy And = schvalit, R = odmitnout) ──────
         act1, act2, act3, act4 = st.columns([1,1,1,3])
         if act1.button(t("approve"), key=f"ed_approve_{cand_id}", type="primary"):
             _batch_update_status([cand_id], "approved"); st.rerun()
@@ -11373,7 +15148,7 @@ def tab_editor():
 
         _inject_keyboard_shortcuts("editor", "Approve (A)", "Reject (R)")
 
-        # ── Header záznamu ────────────────────────────────────────────────────────
+        # ── Header zaznamu ────────────────────────────────────────────────────────
         filled, total = _count_filled_fields(cand_id)
         fill_pct = int(filled/total*100) if total else 0
         conf_color = "#047857" if cand["confidence"]>=0.80 else "#b45309" if cand["confidence"]>=0.60 else "#b91c1c"
@@ -11387,13 +15162,13 @@ def tab_editor():
             f'</span></div>',
             unsafe_allow_html=True)
 
-        # ── Editace jména taxonu ──────────────────────────────────────────────
+        # ── Editace jmena taxonu ──────────────────────────────────────────────
         with st.expander(t("edit_name_assign"), expanded=False):
             _en1, _en2 = st.columns([3, 1])
             _new_name = _en1.text_input(
                 "Name taxon", value=cand["taxon_name"] or "",
                 key=f"ed_rename_{cand_id}",
-                help="Opravte preklep or OCR chybu v jmenu taxonu.")
+                help="Correct a typo or OCR error in the taxon name.")
             _new_rank = _en2.selectbox(
                 "Rank", [""] + RANK_OPTIONS,
                 index=(RANK_OPTIONS.index(cand["rank_guess"]) + 1
@@ -11411,7 +15186,7 @@ def tab_editor():
                     _con_rn.commit(); _con_rn.close()
                     st.success(tt(f"Saved: {_saved_name} [{_saved_rank}]", f"Saved: {_saved_name} [{_saved_rank}]")); st.rerun()
 
-            # Přiřazení ke správnému taxonu (synonymum / přesun)
+            # Prirazeni ke spravnemu taxonu (synonymum / presun)
             _con_all = db()
             _all_taxa = [r[0] for r in _con_all.execute(
                 "SELECT DISTINCT taxon_name FROM taxon_candidates "
@@ -11425,7 +15200,7 @@ def tab_editor():
                     "Correct taxon", ["— not selected —"] + _all_taxa,
                     key=f"ed_link_{cand_id}",
                     label_visibility="collapsed",
-                    help="Select cilovy taxon ze seznamu allch records v databazi.")
+                    help="Select the target taxon from all records in the database.")
                 if _link_target != "— not selected —":
                     if st.button(tt(f"🔗 Assign to '{_link_target}'", f"🔗 Assign to '{_link_target}'"),
                                  key=f"ed_do_link_{cand_id}"):
@@ -11433,13 +15208,13 @@ def tab_editor():
                         _con_lnk.execute(
                             "UPDATE taxon_candidates SET taxon_name=? WHERE id=?",
                             (_link_target, cand_id))
-                        # Přidat original jméno jako synonymum
+                        # Pridat original name as synonymum
                         if cand.get("taxon_name") and cand["taxon_name"] != _link_target:
                             _cur_syn = _con_lnk.execute(
                                 "SELECT field_value FROM occurrence_fields "
                                 "WHERE candidate_id=? AND field_name='SYNONYMY'",
                                 (cand_id,)).fetchone()
-                            _syn_val = (_cur_syn[0] + "; " if _cur_syn else "") + \
+                            _syn_val = (_cur_syn[0] + "; " if _cur_syn else "") +\
                                        f"{cand['taxon_name']} [assigned to {_link_target}]"
                             _con_lnk.execute(
                                 "INSERT OR REPLACE INTO occurrence_fields "
@@ -11459,19 +15234,19 @@ def tab_editor():
 
         st.markdown("")  # spacer
 
-        # ── Načti/extrahuj blok ───────────────────────────────────────────────────
+        # ── Nacti/extrahuj blok ───────────────────────────────────────────────────
         block = cand["block_text"] or ""
         if not block:
             with st.spinner("Extrahuji blok textu…"):
                 block = extract_block_for_candidate(cand_id, cand["document_id"], cand["page_start"])
             if block:
                 con = db()
-                # Cap na 200 KB — extrémně dlouhé bloky by zpusobily problémy v DB/UI
+                # Cap on 200 KB — extremne dlouhe bloky by zpusobily problemy in DB/UI
                 con.execute("UPDATE taxon_candidates SET block_text=? WHERE id=?",
                             (block[:200_000], cand_id))
                 con.commit(); con.close()
 
-        # ── Hlavní layout: blok vlevo, pole vpravo ────────────────────────────────
+        # ── Hlavni layout: blok vlevo, field vpravo ────────────────────────────────
         left_col, right_col = st.columns([2, 3])
 
         with left_col:
@@ -11516,8 +15291,8 @@ def tab_editor():
                                     cand["document_id"], _epg,
                                     key=f"ed_pdf_{cand_id}_{_epg}")
 
-            # ── Boundary tlačítka ──────────────────────────────────────────────
-            # Přidej/Odeber jeden odstavec ze začátku or konce bloku.
+            # ── Boundary tlacitka ──────────────────────────────────────────────
+            # Pridej/Odeber jeden odstavec from zacatku or konce bloku.
             bnd1, bnd2, bnd3, bnd4 = st.columns(4)
             if bnd1.button("⬆ Add before", key=f"bnd_add_before_{cand_id}",
                            help="Adds text unit before start block"):
@@ -11609,6 +15384,10 @@ def tab_editor():
                 if mapped:
                     save_fields(cand_id, mapped, method="regex")
                     st.success(tt(f"{len(mapped)} fields: {list(mapped.keys())}", f"{len(mapped)} fields: {list(mapped.keys())}"))
+                    # Clear cached widget values so fields show updated data
+                    for _fk in list(st.session_state.keys()):
+                        if _fk.startswith(f"field_{cand_id}_"):
+                            del st.session_state[_fk]
                     st.rerun()
                 else:
                     st.warning(t("no_labels_found2"))
@@ -11619,24 +15398,42 @@ def tab_editor():
                     with st.spinner(t("llm_assigning_fields")):
                         raw_resp = lm_chat(
                             s, s.get("llm_field_prompt", LLM_FIELD_PROMPT),
-                            f"Taxon: {cand['taxon_name']}\n\nBlok:\n{(edited_block or block)[:4000]}")
+                            f"Taxon: {cand['taxon_name']}\n\nBlok:\n{(edited_block or block)[:4000]}",
+                            json_mode=True)
                     result = lm_parse_json(raw_resp)
                     if result and "fields" in result:
                         llm_fields = {k:v for k,v in result["fields"].items()
                                       if k in SECTION_FIELDS}
                         save_fields(cand_id, llm_fields, method="llm")
                         st.success(tt(f"LLM: {len(llm_fields)} fields", f"LLM: {len(llm_fields)} fields"))
+                        # Clear cached widget values so fields show updated data
+                        for _fk in list(st.session_state.keys()):
+                            if _fk.startswith(f"field_{cand_id}_"):
+                                del st.session_state[_fk]
                         st.rerun()
                     else:
                         st.warning(t("llm_no_valid_json"))
                 except Exception as exc:
-                    st.error(f"LLM chyba: {exc}")
+                    st.error(f"LLM error: {exc}")
 
-            # ── Ruční překlad fields (LM Studio) ────────────────────────────
+            _translation_notice = st.session_state.pop(
+                f"translation_notice_{cand_id}", None)
+            if _translation_notice:
+                st.success(
+                    f"Translation saved automatically: "
+                    f"{_translation_notice['translated']} translated field(s), "
+                    f"{_translation_notice['remapped']} remapped section(s)."
+                )
+
+            # ── Rucni preklad fields (LM Studio) ────────────────────────────
             with st.expander(t("translate_fields_expander"), expanded=False):
-                _doc_lang_tr_r = db().execute(
-                    "SELECT lang FROM documents WHERE id=?",
-                    (cand["document_id"],)).fetchone()
+                _doc_lang_con = db()
+                try:
+                    _doc_lang_tr_r = _doc_lang_con.execute(
+                        "SELECT lang FROM documents WHERE id=?",
+                        (cand["document_id"],)).fetchone()
+                finally:
+                    _doc_lang_con.close()
                 _doc_lang_tr = (_doc_lang_tr_r["lang"] if _doc_lang_tr_r else "") or ""
                 _llm_ok = s.get("llm_enabled", False)
 
@@ -11645,7 +15442,7 @@ def tab_editor():
                         "⚠ LM Studio neni zapnute. Aktivujte ho v Settings → ⚙ LM Studio → Enable LLM.",
                         icon="⚠️")
                 else:
-                    # Zobrazit detekovaný jazyk; nechat uživatele přepsat
+                    # Zobrazit detekovany language; nechat user prepsat
                     _lang_detect_display = _doc_lang_tr.upper() if _doc_lang_tr else "?"
                     _tr_c1, _tr_c2 = st.columns([2, 3])
                     _tr_c1.caption(f"Detected document language: **{_lang_detect_display}**")
@@ -11653,40 +15450,83 @@ def tab_editor():
                         "Language (overwrite)", value=_doc_lang_tr,
                         placeholder="cs / ru / de / fr / zh …",
                         key=f"tr_lang_{cand_id}",
-                        help="Zadejte kód jazyka pokud auto-detekce selhala (cs, ru, de, fr, zh…)",
+                        help="Enter a language code if automatic detection failed (cs, ru, de, fr, zh…).",
                         label_visibility="collapsed")
                     _eff_lang = _force_lang_override.strip() or _doc_lang_tr
                     _is_expl_en = _eff_lang.lower() in {"en","eng","english","en-gb","en-us"}
                     if _is_expl_en:
-                        st.info(t("doc_is_english") + " " + tt(
-                                "For translation remove 'en' from field language above.",
-                                " To force translation, remove 'en' from the language field above."))
+                        st.info("The record is labelled English. Manual translation will auto-detect the actual source language.")
                     _tr_btn = st.button(
-                        f"🌐 Translate → EN{f' (z {_eff_lang.upper()})' if _eff_lang else ''}",
+                        f"🌐 Translate → EN{f' (from {_eff_lang.upper()})' if _eff_lang else ''}",
                         key=f"translate_now_{cand_id}",
                         disabled=not _llm_ok,
                         help="Translates all fields to English (format: translation (original))")
                     if _tr_btn:
+                        _tr_status = st.status(
+                            f"Translating fields for {cand.get('taxon_name','the selected taxon')}…",
+                            expanded=True)
+                        _tr_progress = st.progress(0, text="Preparing source fields and checking the model…")
                         try:
-                            with st.spinner(t("lmstudio_translating")):
-                                _n_tr = auto_translate_candidate_fields(
-                                    cand_id, _eff_lang, s,
-                                    force=True,
-                                    force_lang=_eff_lang)
+                            _tr_progress.progress(10, text="Checking source-language support…")
+                            _require_llm_language_support(s, _eff_lang or "mixed")
+                            _tr_progress.progress(25, text="Sending the record fields to LM Studio…")
+                            _current_block_for_translation = edited_block or block or cand.get("block_text", "") or ""
+                            _fields_before_translation = get_candidate_fields(cand_id)
+                            _n_tr = auto_translate_candidate_fields(
+                                cand_id, _eff_lang, s, force=True,
+                                force_lang=_eff_lang, block=_current_block_for_translation)
+                            _fields_after_translation = get_candidate_fields(cand_id)
+                            _changes = _translation_changes(
+                                _fields_before_translation, _fields_after_translation)
+                            st.session_state[f"translation_workspace_{cand_id}"] = {
+                                "changes": _changes,
+                                "model": s.get("lmstudio_model", ""),
+                                "language": _eff_lang or "auto",
+                                "created_at": datetime.now().isoformat(timespec="seconds"),
+                            }
+                            _tr_progress.progress(85, text="Saving translations and refreshing mapped fields…")
+                            _n_remap = remap_fields_post_translation(cand_id)
+                            _tr_progress.progress(100, text="Translation task finished.")
                             if _n_tr:
-                                st.success(tt(f"✅ Translated {_n_tr} fields to English.", f"✅ Translated {_n_tr} fields to English."))
-                                st.rerun()
+                                _tr_status.update(
+                                    label=f"Translation completed: {_n_tr} field(s) translated.",
+                                    state="complete", expanded=True)
+                                st.success(
+                                    f"Translated {_n_tr} field(s) to English for {cand.get('taxon_name','the selected record')}." +
+                                    (f" Remapped {_n_remap} section(s)." if _n_remap else ""))
+                            elif _n_remap:
+                                _tr_status.update(label="No new translation was needed; field mapping was refreshed.",state="complete",expanded=True)
+                                st.info(f"No new translations were needed. Remapped {_n_remap} section(s).")
                             else:
-                                st.info(
-                                    "No fields to translate — are fields filled in and is the language set correctly?")
+                                _tr_status.update(label="Translation finished with no field changes.",state="complete",expanded=True)
+                                st.info("Translation finished, but no field values changed. The fields may already be in English or empty.")
+                            # Force an immediate editor refresh. The selected candidate and
+                            # translation comparison remain in session state, so the user no
+                            # longer has to switch to another taxon and back.
+                            st.session_state[f"translation_notice_{cand_id}"] = {
+                                "translated": int(_n_tr),
+                                "remapped": int(_n_remap),
+                            }
+                            # Clear cached widget values for all field text_areas so they
+                            # pick up the new translated values from the database instead
+                            # of showing stale session_state entries.
+                            for _fk in list(st.session_state.keys()):
+                                if _fk.startswith(f"field_{cand_id}_"):
+                                    del st.session_state[_fk]
+                            st.rerun()
                         except RuntimeError as _tr_err:
-                            st.error(tt(f"❌ Translation error: {_tr_err}", f"❌ Translation error: {_tr_err}"))
+                            _tr_status.update(label="Translation failed.",state="error",expanded=True)
+                            st.error(f"Translation error: {_tr_err}")
                         except Exception as _tr_exc:
-                            st.error(tt(f"❌ Unexpected error: {_tr_exc}", f"❌ Unexpected error: {_tr_exc}"))
+                            _tr_status.update(label="Translation failed unexpectedly.",state="error",expanded=True)
+                            st.error(f"Unexpected translation error: {_tr_exc}")
+
+            _render_translation_workspace(cand_id)
+            render_field_move_tool(cand_id, "editor_field_move")
 
             # ── Field Mapper Panel ─────────────────────────────────────────────
-            # Rozbalitelný panel: seznam allch labels detekovaných v bloku →
-            # cílové pole + možnost přemapovat na jiné pole kliknutím.
+            # Rozbalitelny panel: list allch labels detekovanych in bloku →
+            # target field + moznost premapovat on jine field kliknutim.
             with st.expander(t("field_mapper_expander"), expanded=False):
                 current_block = edited_block or block
                 if current_block:
@@ -11712,7 +15552,12 @@ def tab_editor():
                         if st.button(t("save_remap_btn"), key=f"remap_save_{cand_id}"):
                             if remap_changes:
                                 save_fields(cand_id, remap_changes, method="manual")
-                                st.success(tt(f"Saved {len(remap_changes)} fields.", f"Saved {len(remap_changes)} fields.")); st.rerun()
+                                st.success(tt(f"Saved {len(remap_changes)} fields.", f"Saved {len(remap_changes)} fields."))
+                                # Clear cached widget values so fields show updated data
+                                for _fk in list(st.session_state.keys()):
+                                    if _fk.startswith(f"field_{cand_id}_"):
+                                        del st.session_state[_fk]
+                                st.rerun()
                             else:
                                 st.warning(t("no_changes_remap"))
                     else:
@@ -11740,6 +15585,7 @@ def tab_editor():
             except Exception:
                 pass
             llm_j = json.loads(cand["llm_json"] or "{}") if cand["llm_json"] else {}
+            render_llm_audit_panel(cand_id)
             if llm_j:
                 action = llm_j.get("action","?")
                 color  = {"keep":"success","reject":"error","needs_review":"warning"}.get(action,"info")
@@ -11752,13 +15598,13 @@ def tab_editor():
             fields = get_candidate_fields(cand_id)
             schema = load_schema()
 
-            # BOD 9: Auto-save indikátor
+            # BOD 9: Auto-save indikator
             st.markdown(
-                "<div style='font-size:0.72rem;color:#10b981;margin-bottom:4px'>💾 Auto-save aktivni — fields se savei pri odchodu z bunky</div>", unsafe_allow_html=True)
-            # ── Rank-aware pole varování ────────────────────────────────────────
-            # Upozornit pokud jsou vyplněna pole neodpovídající ranku:
-            #   • species/subspecies: TYPE TAXON by neměl být vyplněn
-            #   • genus/family/…: TYPE SPECIMENS by neměl být vyplněn (jako heading)
+                "<div style='font-size:0.72rem;color:#10b981;margin-bottom:4px'>💾 Auto-save is active — fields are saved when you leave the input box</div>", unsafe_allow_html=True)
+            # ── Rank-aware field varovani ────────────────────────────────────────
+            # Upozornit if are vyplnena field neodpovidajici ranku:
+            #   • species/subspecies: TYPE TAXON by nemel byt vyplnen
+            #   • genus/family/…: TYPE SPECIMENS by nemel byt vyplnen (as heading)
             _cand_rank_l = (cand.get("rank_guess","") or "").lower().split()
             _cand_rank_l = _cand_rank_l[0] if _cand_rank_l else ""
             if _cand_rank_l in _REQUIRED_FIELDS_BY_RANK:
@@ -11778,6 +15624,7 @@ def tab_editor():
                             "⚠ **TYPE SPECIMENS** je vyplnen u genus/family/… — pravdepodobne jde o TYPE TAXON (typovy druh/rod). Genus a vyssi maji TYPE TAXON, ne TYPE SPECIMENS.",
                             icon="⚠️")
             _cand_rank_for_groups = cand.get("rank_guess", "") or ""
+            _field_meta = get_candidate_field_metadata(cand_id)
             _fgroups_ranked = ordered_field_groups_for_rank(_cand_rank_for_groups)
             group_names = list(_fgroups_ranked.keys())
             group_tabs  = st.tabs(group_names)
@@ -11787,48 +15634,28 @@ def tab_editor():
                         cur_val = fields.get(fname, "")
                         is_filled = bool(cur_val and cur_val != NOT_PROVIDED)
                         label = f"{'✅' if is_filled else '⬜'} {fname}"
-                        # BOD 9: Auto-save — saveí se při odchodu z pole (on_blur).
-                        # Bez st.rerun() → bez blikání. "✅" v labelu signalizuje saveení.
+                        # BOD 9: Auto-save — savei when odchodu from field (on_blur).
+                        # Without st.rerun() → without blikani. "✅" in labelu signalizuje saveeni.
                         _saved_key = f"saved_{cand_id}_{fname}"
                         _was_saved = st.session_state.get(_saved_key, False)
                         _label_icon = "✅" if is_filled else ("💾" if _was_saved else "⬜")
-                        _label_auto = f"{_label_icon} {fname}"
+                        _prov_badge = _field_provenance_badge(_field_meta.get(fname, {})) if is_filled else "Empty"
+                        _label_auto = f"{_label_icon} {fname}  ·  [{_prov_badge}]"
                         new_val = st.text_area(
                             _label_auto, value=cur_val or "", height=90,
                             key=f"field_{cand_id}_{fname}",
-                            help=f"{fname} — saved automatically when leaving the field",
+                            help=f"{fname} — source: {_prov_badge}; saved automatically when leaving the field",
                             placeholder=f"Zadejte {fname}…")
                         if new_val != cur_val:
                             save_fields(cand_id, {fname: new_val}, method="manual")
                             st.session_state[_saved_key] = True
-                            # Tichý save bez rerun → žádný flash stránky.
-                            # Fill bar se aktualizuje při příští interakci uživatele.
+                            # Tichy save without rerun → zadny flash pages.
+                            # Fill bar aktualizuje when pristi interakci user.
 
             st.divider()
-            # Taxon-name rename
-            with st.expander(tt("✏ Rename taxon", "✏️ Rename taxon"), expanded=False):
-                new_name = st.text_input(
-                    "Now taxon name", value=cand["taxon_name"],
-                    key=f"rename_{cand_id}")
-                new_rank = st.selectbox(
-                    "Rank", ["Genus","Species","Family","Subfamily","Order","Class",
-                              "Phylum","Subspecies","Subgenus","Variety","Other"],
-                    index=["Genus","Species","Family","Subfamily","Order","Class",
-                           "Phylum","Subspecies","Subgenus","Variety","Other"
-                           ].index(cand["rank_guess"])
-                          if cand["rank_guess"] in
-                             ["Genus","Species","Family","Subfamily","Order","Class",
-                              "Phylum","Subspecies","Subgenus","Variety","Other"] else 0,
-                    key=f"rank_{cand_id}")
-                if st.button(t("save_name"), key=f"save_name_{cand_id}"):
-                    con = db()
-                    con.execute(
-                        "UPDATE taxon_candidates SET taxon_name=?, rank_guess=? WHERE id=?",
-                        (new_name.strip(), new_rank, cand_id))
-                    con.commit(); con.close()
-                    st.success(tt("Saved.", "Saved.")); st.rerun()
+            # Taxon identity is edited in the single authoritative panel above.
 
-            # Rychlé výskytové čítadlo
+            # Rychle vyskytove citadlo
             con = db()
             occ_count = con.execute(
                 "SELECT COUNT(*) FROM taxon_candidates WHERE taxon_name=? AND id!=?",
@@ -11842,189 +15669,18 @@ def tab_editor():
 
 
 
-    # ══════════════════════════════════════════════════════════════════════════════
-    # BOD 6: CSV export (UTF-8 BOM pro Excel)
-    # ══════════════════════════════════════════════════════════════════════════════
-
-    def export_to_csv(rows: List[Dict]) -> bytes:
-        """
-        Exportuje záznamy do CSV (UTF-8 BOM).
-        UTF-8 BOM zajišťuje správné zobrazení diakritiky v Excel na Windows.
-        """
-        import csv, io as _io
-        out = _io.StringIO()
-        if not rows:
-            return b"\xef\xbb\xbf"
-        writer = csv.DictWriter(
-            out,
-            fieldnames=list(rows[0].keys()),
-            extrasaction="ignore",
-            lineterminator="\r\n",
-            quoting=csv.QUOTE_MINIMAL,
-        )
-        writer.writeheader()
-        writer.writerows(rows)
-        # Přidat BOM na začátek pro Excel
-        return ("\ufeff" + out.getvalue()).encode("utf-8")
-
-
-    # ══════════════════════════════════════════════════════════════════════════════
-    # BOD 8: Darwin Core Archive (DwC-A) export
-    # Formát GBIF — ZIP s occurrence.csv + meta.xml + eml.xml
-    # ══════════════════════════════════════════════════════════════════════════════
-
-    # Mapování PaleoN fields na Darwin Core termíny (URI)
-    _DWC_FIELD_MAP: Dict[str, str] = {
-        "RECORD_ID":                "occurrenceID",
-        "TAXON_NAME_VERBATIM":      "scientificName",
-        "TAXON_RANK_AS_WRITTEN":    "taxonRank",
-        "AUTHOR":                   "scientificNameAuthorship",
-        "DIAGNOSIS":                "taxonRemarks",
-        "DESCRIPTION":              "occurrenceRemarks",
-        "TYPE SPECIMENS":           "typeStatus",
-        "TYPE_SPECIMEN_KIND":       "typeStatus",
-        "INSTITUTION_CODE":         "institutionCode",
-        "CATALOG_NUMBER":           "catalogNumber",
-        "LOCALITY":                 "verbatimLocality",
-        "STRATIGRAPHY":             "verbatimEventDate",
-        "OCCURRENCE":               "habitat",
-        "SIZE":                     "measurementValue",
-        "ETYMOLOGY":                "taxonRemarks",
-        "REMARKS":                  "occurrenceRemarks",
-        "SYNONYMY":                 "namePublishedIn",
-        "FIGURES":                  "associatedMedia",
-        "REFERENCE":                "namePublishedIn",
-        "SOURCE PAGES":             "verbatimCoordinates",
-        "SOURCE_DOCUMENT":          "datasetName",
-    }
-
-    _DWC_META_XML = """<?xml version="1.0" encoding="UTF-8"?>
-    <archive xmlns="http://rs.tdwg.org/dwc/text/"
-             xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-             xsi:schemaLocation="http://rs.tdwg.org/dwc/text/ http://rs.tdwg.org/dwc/text/tdwg_dwc_text.xsd">
-      <core encoding="UTF-8" fieldsTerminatedBy="," linesTerminatedBy="\r\n"
-            fieldsEnclosedBy="\"" ignoreHeaderLines="1"
-            rowType="http://rs.tdwg.org/dwc/terms/Taxon">
-        <files><location>occurrence.csv</location></files>
-        <id index="0"/>
-        <field index="0" term="http://rs.tdwg.org/dwc/terms/occurrenceID"/>
-        <field index="1" term="http://rs.tdwg.org/dwc/terms/scientificName"/>
-        <field index="2" term="http://rs.tdwg.org/dwc/terms/taxonRank"/>
-        <field index="3" term="http://rs.tdwg.org/dwc/terms/scientificNameAuthorship"/>
-        <field index="4" term="http://rs.tdwg.org/dwc/terms/institutionCode"/>
-        <field index="5" term="http://rs.tdwg.org/dwc/terms/catalogNumber"/>
-        <field index="6" term="http://rs.tdwg.org/dwc/terms/typeStatus"/>
-        <field index="7" term="http://rs.tdwg.org/dwc/terms/verbatimLocality"/>
-        <field index="8" term="http://rs.tdwg.org/dwc/terms/verbatimEventDate"/>
-        <field index="9" term="http://rs.tdwg.org/dwc/terms/occurrenceRemarks"/>
-        <field index="10" term="http://rs.tdwg.org/dwc/terms/taxonRemarks"/>
-        <field index="11" term="http://rs.tdwg.org/dwc/terms/namePublishedIn"/>
-        <field index="12" term="http://rs.tdwg.org/dwc/terms/datasetName"/>
-        <field index="13" term="http://rs.tdwg.org/dwc/terms/basisOfRecord"/>
-        <field index="14" term="http://rs.tdwg.org/dwc/terms/kingdom"/>
-        <field index="15" term="http://rs.tdwg.org/dwc/terms/phylum"/>
-      </core>
-    </archive>
-    """
-
-    def _dwc_eml_xml(n_records: int, dataset_name: str, creator: str) -> str:
-        from xml.sax.saxutils import escape as _esc
-        return (
-            '<?xml version="1.0" encoding="UTF-8"?>\n'
-            '<eml:eml xmlns:eml="eml://ecoinformatics.org/eml-2.1.1"\n'
-            '         xmlns:dc="http://purl.org/dc/terms/"\n'
-            '         packageId="paleon-export" system="paleon">\n'
-            '  <dataset>\n'
-            f'    <title>{_esc(dataset_name)}</title>\n'
-            f'    <creator><individualName><givenName>{_esc(creator)}</givenName>'
-            f'</individualName></creator>\n'
-            '    <abstract><para>Taxonomic data extracted by PaleoN.</para></abstract>\n'
-            f'    <numberOfRecords>{n_records}</numberOfRecords>\n'
-            '  </dataset>\n'
-            '</eml:eml>\n'
-        )
-
-
-    def export_to_dwca(
-        rows: List[Dict],
-        dataset_name: str = "PaleoN Export",
-        creator: str = "PaleoN",
-    ) -> bytes:
-        """
-        Exportuje záznamy do Darwin Core Archive (DwC-A) — standardní formát GBIF.
-        Vrátí ZIP v paměti (bytes).
-
-        Struktura ZIP:
-            occurrence.csv  — hlavní data (Darwin Core termíny)
-            meta.xml        — popis schématu
-            eml.xml         — metadata datasetu
-        """
-        import csv, io as _io
-
-        # Sestavit occurrence.csv
-        occ_cols = [
-            "occurrenceID", "scientificName", "taxonRank",
-            "scientificNameAuthorship", "institutionCode", "catalogNumber",
-            "typeStatus", "verbatimLocality", "verbatimEventDate",
-            "occurrenceRemarks", "taxonRemarks", "namePublishedIn",
-            "datasetName", "basisOfRecord", "kingdom", "phylum",
-        ]
-        occ_buf = _io.StringIO()
-        writer = csv.DictWriter(occ_buf, fieldnames=occ_cols,
-                                extrasaction="ignore",
-                                lineterminator="\r\n",
-                                quoting=csv.QUOTE_ALL)
-        writer.writeheader()
-
-        for row in rows:
-            def _get(*paleon_fields: str) -> str:
-                for pf in paleon_fields:
-                    v = row.get(pf, "") or ""
-                    if v and v != NOT_PROVIDED:
-                        return v.replace("\n", " ").replace("\r", "")[:500]
-                return ""
-
-            dwc_row = {
-                "occurrenceID":               _get("RECORD_ID"),
-                "scientificName":             _get("TAXON_NAME_VERBATIM"),
-                "taxonRank":                  _get("TAXON_RANK_AS_WRITTEN"),
-                "scientificNameAuthorship":   _get("AUTHOR"),
-                "institutionCode":            _get("INSTITUTION_CODE"),
-                "catalogNumber":              _get("CATALOG_NUMBER"),
-                "typeStatus":                 _get("TYPE_SPECIMEN_KIND", "TYPE SPECIMENS"),
-                "verbatimLocality":           _get("LOCALITY"),
-                "verbatimEventDate":          _get("STRATIGRAPHY"),
-                "occurrenceRemarks":          _get("DESCRIPTION", "REMARKS"),
-                "taxonRemarks":               _get("DIAGNOSIS"),
-                "namePublishedIn":            _get("REFERENCE"),
-                "datasetName":                _get("SOURCE_DOCUMENT"),
-                "basisOfRecord":              "FossilSpecimen",
-                "kingdom":                    "Animalia",
-                "phylum":                     "Mollusca",
-            }
-            writer.writerow(dwc_row)
-
-        # Zabalit do ZIP
-        zip_buf = _io.BytesIO()
-        with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            zf.writestr("occurrence.csv",
-                        ("\ufeff" + occ_buf.getvalue()).encode("utf-8"))
-            zf.writestr("meta.xml", _DWC_META_XML.encode("utf-8"))
-            zf.writestr("eml.xml",
-                        _dwc_eml_xml(len(rows), dataset_name, creator).encode("utf-8"))
-        return zip_buf.getvalue()
 
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ROUND-TRIP XLSX EXPORT / IMPORT
-# Export schválených záznamů do editovatelného XLSX + import zpět.
+# Export schvalenych zaznamu to editovatelneho XLSX + import zpet.
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Pole metadat záznamu – editovatelná přímo v taxon_candidates
+# Field metadat zaznamu – editovatelna primo in taxon_candidates
 _RT_META_EDITABLE   = ("taxon_name", "rank_guess", "status")
 _RT_META_LOCKED     = ("id", "document", "page_start")
-# Pole obsahu – editovatelná přes occurrence_fields (vynecháme odvozená)
+# Field obsahu – editovatelna pres occurrence_fields (vynechame odvozena)
 _RT_DERIVED_SKIP    = {"COMPLETENESS_SCORE", "MISSING_REQUIRED_FIELDS"}
 
 def _rt_content_fields() -> List[str]:
@@ -12091,7 +15747,7 @@ def export_records_editable_xlsx(candidate_ids: Tuple[int, ...]) -> bytes:
     ws = wb.active
     ws.title = "Records"
 
-    # Řádek 1: záhlaví
+    # Orderek 1: zahlavi
     ws.append(headers)
     ws.row_dimensions[1].height = 36
     for i, (_, locked) in enumerate(ALL_COLS, 1):
@@ -12100,7 +15756,7 @@ def export_records_editable_xlsx(candidate_ids: Tuple[int, ...]) -> bytes:
         c.font = h_font
         c.alignment = h_aln
 
-    # Datové řádky
+    # Datove lines
     for cid in candidate_ids:
         row_obj = cands.get(cid)
         if not row_obj:
@@ -12123,7 +15779,7 @@ def export_records_editable_xlsx(candidate_ids: Tuple[int, ...]) -> bytes:
             cell.alignment = d_aln
             cell.border = brd
 
-    # Šířky sloupců
+    # Sirky sloupcu
     _wide = {"DESCRIPTION", "DIAGNOSIS", "SYNONYMY", "REMARKS",
              "MATERIAL EXAMINED", "TYPE SPECIMENS", "OCCURRENCE"}
     for i, (col_name, _) in enumerate(ALL_COLS, 1):
@@ -12208,11 +15864,11 @@ def import_records_from_xlsx(file_bytes: bytes) -> Dict[str, Any]:
     con = db()
 
     for row_vals in ws.iter_rows(min_row=2, values_only=True):
-        # Prázdný řádek
+        # Prazdny line
         if all(v is None for v in row_vals):
             continue
 
-        # Získat candidate id
+        # Ziskat candidate id
         raw_id = row_vals[id_col] if id_col < len(row_vals) else None
         if raw_id is None:
             continue
@@ -12222,7 +15878,7 @@ def import_records_from_xlsx(file_bytes: bytes) -> Dict[str, Any]:
             stats["errors"].append(f"Non-integer id {raw_id!r} — row skipped")
             continue
 
-        # Kandidát v DB?
+        # Candidate in DB?
         existing = con.execute(
             "SELECT id, taxon_name, rank_guess, status "
             "FROM taxon_candidates WHERE id=?", (cid,)).fetchone()
@@ -12232,7 +15888,7 @@ def import_records_from_xlsx(file_bytes: bytes) -> Dict[str, Any]:
 
         row_changed = False
 
-        # ── 1) Aktualizace polí v taxon_candidates ────────────────────────
+        # ── 1) Aktualizace poli in taxon_candidates ────────────────────────
         meta_sets: Dict[str, str] = {}
         for col_name in _RT_META_EDITABLE:
             if col_name not in headers:
@@ -12245,7 +15901,7 @@ def import_records_from_xlsx(file_bytes: bytes) -> Dict[str, Any]:
                 continue
             new_s = str(new_v).strip()
             if not new_s:
-                continue  # prázdné = nezměnit
+                continue  # prazdne = nezmenit
             # Validace status
             if col_name == "status" and new_s not in (
                     "approved", "needs_review", "rejected", "pending"):
@@ -12282,14 +15938,14 @@ def import_records_from_xlsx(file_bytes: bytes) -> Dict[str, Any]:
                 continue
             new_s = str(new_v).strip()
             if not new_s or new_s == NOT_PROVIDED:
-                continue  # prázdné = nezměnit
-            # Porovnat se stávající hodnotou
+                continue  # prazdne = nezmenit
+            # Porovnat stavajici hodnotou
             if col_name in existing_fields:
                 old_row = con.execute(
                     "SELECT field_value FROM occurrence_fields WHERE id=?",
                     (existing_fields[col_name],)).fetchone()
                 if old_row and str(old_row["field_value"] or "").strip() == new_s:
-                    continue  # beze změny
+                    continue  # beze zmeny
                 con.execute(
                     "UPDATE occurrence_fields SET field_value=?, method=? WHERE id=?",
                     (new_s, "xlsx_import", existing_fields[col_name]))
@@ -12310,7 +15966,7 @@ def import_records_from_xlsx(file_bytes: bytes) -> Dict[str, Any]:
     con.commit()
     con.close()
 
-    # ── FTS5 + term_matches pro aktualizované záznamy ─────────────────────
+    # ── FTS5 + term_matches for aktualizovane records ─────────────────────
     for cid in updated_cids:
         try:
             _fts_update_candidate(cid)
@@ -12326,8 +15982,181 @@ def import_records_from_xlsx(file_bytes: bytes) -> Dict[str, Any]:
     return stats
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# BOD 6: CSV export (UTF-8 BOM pro Excel)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def export_to_csv(rows: List[Dict]) -> bytes:
+    """
+    Exportuje záznamy do CSV (UTF-8 BOM).
+    UTF-8 BOM zajišťuje správné zobrazení diakritiky v Excel na Windows.
+    """
+    import csv, io as _io
+    out = _io.StringIO()
+    if not rows:
+        return b"\xef\xbb\xbf"
+    writer = csv.DictWriter(
+        out,
+        fieldnames=list(rows[0].keys()),
+        extrasaction="ignore",
+        lineterminator="\r\n",
+        quoting=csv.QUOTE_MINIMAL,
+    )
+    writer.writeheader()
+    writer.writerows(rows)
+    # Pridat BOM on zacatek for Excel
+    return ("\ufeff" + out.getvalue()).encode("utf-8")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BOD 8: Darwin Core Archive (DwC-A) export
+# Format GBIF — ZIP s occurrence.csv + meta.xml + eml.xml
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Mapping PaleoN fields on Darwin Core terms (URI)
+_DWC_FIELD_MAP: Dict[str, str] = {
+    "RECORD_ID":                "occurrenceID",
+    "TAXON_NAME_VERBATIM":      "scientificName",
+    "TAXON_RANK_AS_WRITTEN":    "taxonRank",
+    "AUTHOR":                   "scientificNameAuthorship",
+    "DIAGNOSIS":                "taxonRemarks",
+    "DESCRIPTION":              "occurrenceRemarks",
+    "TYPE SPECIMENS":           "typeStatus",
+    "TYPE_SPECIMEN_KIND":       "typeStatus",
+    "INSTITUTION_CODE":         "institutionCode",
+    "CATALOG_NUMBER":           "catalogNumber",
+    "LOCALITY":                 "verbatimLocality",
+    "STRATIGRAPHY":             "verbatimEventDate",
+    "OCCURRENCE":               "habitat",
+    "SIZE":                     "measurementValue",
+    "ETYMOLOGY":                "taxonRemarks",
+    "REMARKS":                  "occurrenceRemarks",
+    "SYNONYMY":                 "namePublishedIn",
+    "FIGURES":                  "associatedMedia",
+    "REFERENCE":                "namePublishedIn",
+    "SOURCE PAGES":             "verbatimCoordinates",
+    "SOURCE_DOCUMENT":          "datasetName",
+}
+
+_DWC_META_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<archive xmlns="http://rs.tdwg.org/dwc/text/"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://rs.tdwg.org/dwc/text/ http://rs.tdwg.org/dwc/text/tdwg_dwc_text.xsd">
+  <core encoding="UTF-8" fieldsTerminatedBy="," linesTerminatedBy="\r\n"
+        fieldsEnclosedBy="\"" ignoreHeaderLines="1"
+        rowType="http://rs.tdwg.org/dwc/terms/Taxon">
+    <files><location>occurrence.csv</location></files>
+    <id index="0"/>
+    <field index="0" term="http://rs.tdwg.org/dwc/terms/occurrenceID"/>
+    <field index="1" term="http://rs.tdwg.org/dwc/terms/scientificName"/>
+    <field index="2" term="http://rs.tdwg.org/dwc/terms/taxonRank"/>
+    <field index="3" term="http://rs.tdwg.org/dwc/terms/scientificNameAuthorship"/>
+    <field index="4" term="http://rs.tdwg.org/dwc/terms/institutionCode"/>
+    <field index="5" term="http://rs.tdwg.org/dwc/terms/catalogNumber"/>
+    <field index="6" term="http://rs.tdwg.org/dwc/terms/typeStatus"/>
+    <field index="7" term="http://rs.tdwg.org/dwc/terms/verbatimLocality"/>
+    <field index="8" term="http://rs.tdwg.org/dwc/terms/verbatimEventDate"/>
+    <field index="9" term="http://rs.tdwg.org/dwc/terms/occurrenceRemarks"/>
+    <field index="10" term="http://rs.tdwg.org/dwc/terms/taxonRemarks"/>
+    <field index="11" term="http://rs.tdwg.org/dwc/terms/namePublishedIn"/>
+    <field index="12" term="http://rs.tdwg.org/dwc/terms/datasetName"/>
+    <field index="13" term="http://rs.tdwg.org/dwc/terms/basisOfRecord"/>
+    <field index="14" term="http://rs.tdwg.org/dwc/terms/kingdom"/>
+    <field index="15" term="http://rs.tdwg.org/dwc/terms/phylum"/>
+  </core>
+</archive>
+"""
+
+def _dwc_eml_xml(n_records: int, dataset_name: str, creator: str) -> str:
+    from xml.sax.saxutils import escape as _esc
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<eml:eml xmlns:eml="eml://ecoinformatics.org/eml-2.1.1"\n'
+        '         xmlns:dc="http://purl.org/dc/terms/"\n'
+        '         packageId="paleon-export" system="paleon">\n'
+        '  <dataset>\n'
+        f'    <title>{_esc(dataset_name)}</title>\n'
+        f'    <creator><individualName><givenName>{_esc(creator)}</givenName>'
+        f'</individualName></creator>\n'
+        '    <abstract><para>Taxonomic data extracted by PaleoN.</para></abstract>\n'
+        f'    <numberOfRecords>{n_records}</numberOfRecords>\n'
+        '  </dataset>\n'
+        '</eml:eml>\n'
+    )
+
+
+def export_to_dwca(
+    rows: List[Dict],
+    dataset_name: str = "PaleoN Export",
+    creator: str = "PaleoN",
+) -> bytes:
+    """
+    Exportuje záznamy do Darwin Core Archive (DwC-A) — standardní formát GBIF.
+    Vrátí ZIP v paměti (bytes).
+
+    Struktura ZIP:
+        occurrence.csv  — hlavní data (Darwin Core termíny)
+        meta.xml        — popis schématu
+        eml.xml         — metadata datasetu
+    """
+    import csv, io as _io
+
+    # Sestavit occurrence.csv
+    occ_cols = [
+        "occurrenceID", "scientificName", "taxonRank",
+        "scientificNameAuthorship", "institutionCode", "catalogNumber",
+        "typeStatus", "verbatimLocality", "verbatimEventDate",
+        "occurrenceRemarks", "taxonRemarks", "namePublishedIn",
+        "datasetName", "basisOfRecord", "kingdom", "phylum",
+    ]
+    occ_buf = _io.StringIO()
+    writer = csv.DictWriter(occ_buf, fieldnames=occ_cols,
+                            extrasaction="ignore",
+                            lineterminator="\r\n",
+                            quoting=csv.QUOTE_ALL)
+    writer.writeheader()
+
+    for row in rows:
+        def _get(*paleon_fields: str) -> str:
+            for pf in paleon_fields:
+                v = row.get(pf, "") or ""
+                if v and v != NOT_PROVIDED:
+                    return v.replace("\n", " ").replace("\r", "")[:500]
+            return ""
+
+        dwc_row = {
+            "occurrenceID":               _get("RECORD_ID"),
+            "scientificName":             _get("TAXON_NAME_VERBATIM"),
+            "taxonRank":                  _get("TAXON_RANK_AS_WRITTEN"),
+            "scientificNameAuthorship":   _get("AUTHOR"),
+            "institutionCode":            _get("INSTITUTION_CODE"),
+            "catalogNumber":              _get("CATALOG_NUMBER"),
+            "typeStatus":                 _get("TYPE_SPECIMEN_KIND", "TYPE SPECIMENS"),
+            "verbatimLocality":           _get("LOCALITY"),
+            "verbatimEventDate":          _get("STRATIGRAPHY"),
+            "occurrenceRemarks":          _get("DESCRIPTION", "REMARKS"),
+            "taxonRemarks":               _get("DIAGNOSIS"),
+            "namePublishedIn":            _get("REFERENCE"),
+            "datasetName":                _get("SOURCE_DOCUMENT"),
+            "basisOfRecord":              "FossilSpecimen",
+            "kingdom":                    "Animalia",
+            "phylum":                     "Mollusca",
+        }
+        writer.writerow(dwc_row)
+
+    # Zabalit do ZIP
+    zip_buf = _io.BytesIO()
+    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("occurrence.csv",
+                    ("\ufeff" + occ_buf.getvalue()).encode("utf-8"))
+        zf.writestr("meta.xml", _DWC_META_XML.encode("utf-8"))
+        zf.writestr("eml.xml",
+                    _dwc_eml_xml(len(rows), dataset_name, creator).encode("utf-8"))
+    return zip_buf.getvalue()
+
+
 def tab_export():
-    st.header(t("export_header"))
+    st.markdown(f"### {t('export_header')}", unsafe_allow_html=False)
 
     con = db()
     docs = con.execute("SELECT id, filename FROM documents ORDER BY created_at DESC").fetchall()
@@ -12341,7 +16170,7 @@ def tab_export():
         st.info(t("no_docs_dossier"))
         return
 
-    # ── Výběr documents (zaškrtávací seznam s vyhledáváním) ────────────────────
+    # ── Vyber documents (zaskrtavaci list s vyhledavanim) ────────────────────
     st.markdown("**Documents to export**")
     doc_counts: Dict[int, int] = {}
     for r in all_approved:
@@ -12349,7 +16178,7 @@ def tab_export():
 
     sf1, sf2 = st.columns([3,1])
     doc_search = sf1.text_input(
-        "🔍 Hledat Document", key="exp_doc_search",
+        "🔍 Search documents", key="exp_doc_search",
         placeholder="filter by file name…", label_visibility="collapsed")
     select_all_docs = sf2.checkbox("☑️ All", value=True, key="exp_select_all_docs")
     if select_all_docs != st.session_state.get("_exp_select_all_prev", True):
@@ -12408,7 +16237,7 @@ def tab_export():
 
     cand_ids_tuple = tuple(r["id"] for r in candidates)
 
-    # ── Připravit řádky ───────────────────────────────────────────────────────
+    # ── Pripravit lines ───────────────────────────────────────────────────────
     @st.cache_data(ttl=30, show_spinner="Preparing data…")
     def _build_rows(cand_ids: Tuple[int, ...]) -> Tuple[List[Dict], List[Dict]]:
         rows, review_rows = [], []
@@ -12439,7 +16268,7 @@ def tab_export():
         con2.close()
         return rows, review_rows
 
-    # ── Literatura / reference (zaškrtávací výběr) ────────────────────────────
+    # ── Literatura / reference (zaskrtavaci vyber) ────────────────────────────
     rows_preview, _ = _build_rows(cand_ids_tuple)
     unique_refs = sorted(set(
         r.get("REFERENCE", NOT_PROVIDED) for r in rows_preview
@@ -12481,7 +16310,7 @@ def tab_export():
 
     ts = datetime.now().strftime("%Y%m%d_%H%M")
 
-    # ── Tlačítka exportu ──────────────────────────────────────────────────────
+    # ── Tlacitka exportu ──────────────────────────────────────────────────────
     st.markdown(t("formats_label"))
     annotate_opt = st.checkbox(
         "🏷 Category at the start of paragraph in RAW block (TXT export)",
@@ -12519,7 +16348,7 @@ def tab_export():
             mime="text/plain", key="dl_txt")
 
     pdf_lbl  = "⬇️ PDF" if HAS_FPDF else "⬇️ PDF (HTML)"
-    pdf_help = "Export via fpdf2" if HAS_FPDF else \
+    pdf_help = "Export via fpdf2" if HAS_FPDF else\
                "fpdf2 is not installed – will generate HTML for printing"
     if fc5.button(pdf_lbl, help=pdf_help):
         rows, _ = _build_rows(cand_ids_tuple)
@@ -12610,7 +16439,7 @@ def tab_export():
                         st.error(f"Import failed: {exc}")
                         logging.exception("XLSX import error")
 
-        # ── Náhled ───────────────────────────────────────────────────────────────
+        # ── Nahled ───────────────────────────────────────────────────────────────
     if st.checkbox(t("show_table_preview")):
         rows, _ = _build_rows(cand_ids_tuple)
         preview = ["RECORD_ID","TAXON_NAME_VERBATIM","TAXON_RANK_AS_WRITTEN",
@@ -12647,7 +16476,7 @@ def _render_hierarchy_badge(cand_row) -> str:
     return "".join(parts)
 
 
-def tab_taxon_dossier():
+def tab_taxon_dossier_legacy():
     # ── CSS pro dense 4K layout ───────────────────────────────────────────────
     st.markdown("""
     <style>
@@ -12698,7 +16527,7 @@ def tab_taxon_dossier():
         st.info(t("empty_library"))
         return
 
-    # ── Horní lišta: vyhledávání + filtry ────────────────────────────────────
+    # ── Horni lista: vyhledavani + filtry ────────────────────────────────────
     hc1, hc2, hc3, hc4, hc5 = st.columns([5, 1, 1, 1, 1])
     query = hc1.text_input(
         "🔍", key="td_query",
@@ -12712,7 +16541,7 @@ def tab_taxon_dossier():
                                help="[CATEGORY] labels in block")
     show_raw     = hc5.toggle("Raw blok", value=True, key="td_raw")
 
-    # ── Načíst allchny kandidáty (jednou, pak filtrovat v Pythonu) ────────────
+    # ── Load allchny kandidaty (jednou, pak filtrovat in Pythonu) ────────────
     statuses = (["approved","pending","needs_review","low_confidence"]
                 if include_low else ["approved","pending","needs_review"])
     sp = ",".join("?"*len(statuses))
@@ -12726,10 +16555,10 @@ def tab_taxon_dossier():
         statuses).fetchall()
     con.close()
 
-    # ── Build: seznam unikátních jmen + počty (abecedně) ────────────────────
+    # ── Build: list unikatnich jmen + pocty (abecedne) ────────────────────
     needle = _norm_search(query.strip()) if query and len(query.strip()) >= 1 else ""
 
-    # Wildcard podpora v hledání jmen taxa: * → .* , ? → .
+    # Wildcard podpora in hledani jmen taxa: * → .* , ? → .
     def _dos_match_name(taxon_name: str) -> bool:
         if not needle:
             return True
@@ -12748,7 +16577,7 @@ def tab_taxon_dossier():
         # Fulltext: zkusit FTS5, fallback na LIKE
         _fts_ids = set(fts_search(query.strip(), limit=1000))
         if _fts_ids:
-            # FTS5 uspělo — kombinovat s name matchem
+            # FTS5 uspelo — kombinovat s name matchem
             filtered = [
                 c for c in all_cands
                 if c["id"] in _fts_ids
@@ -12756,7 +16585,7 @@ def tab_taxon_dossier():
             ]
             _fts_method = "FTS5"
         else:
-            # Fallback: LIKE scan (pomalejší, ale vždy funkční)
+            # Fallback: LIKE scan (pomalejsi, but vzdy funkcni)
             _ft_con = db()
             _ft_sql = f"%{query.strip()}%"
             _ft_field_ids = set(
@@ -12785,13 +16614,13 @@ def tab_taxon_dossier():
     else:
         filtered = all_cands
 
-    # Seskupit podle normalizovaného jména
+    # Seskupit podle normalizovaneho jmena
     groups: Dict[str, list] = {}
     for c in filtered:
         key = re.sub(r"\s+", " ", (c["taxon_name"] or "").strip())
         groups.setdefault(key, []).append(c)
 
-    # Seřadit abecedně
+    # Seradit abecedne
     sorted_names = sorted(groups.keys())
 
     if not sorted_names:
@@ -12818,7 +16647,7 @@ def tab_taxon_dossier():
     avg_conf = round(sum(c["confidence"] for c in filtered)/max(len(filtered),1), 3)
     m4.metric("Average confidence", f"{avg_conf:.3f}")
 
-    # ── FIELD_ORDER pro zobrazení fields ───────────────────────────────────────
+    # ── FIELD_ORDER for zobrazeni fields ───────────────────────────────────────
     FIELD_ORDER = [
         "TAXONOMIC PLACEMENT","AUTHOR","SYNONYMY",
         "NOMENCLATURAL ACTS","OPEN NOMENCLATURE / IDENTIFICATION QUALIFIERS",
@@ -12830,22 +16659,22 @@ def tab_taxon_dossier():
         "INCLUDED TAXONS","TAXON","PARENT_TAXON_NAME",
     ]
 
-    # ── Výběr aktuálního taxonu (session state) ──────────────────────────────
-    if "td_selected" not in st.session_state or \
+    # ── Vyber aktualniho taxonu (session state) ──────────────────────────────
+    if "td_selected" not in st.session_state or\
        st.session_state["td_selected"] not in sorted_names:
         st.session_state["td_selected"] = sorted_names[0]
 
-    # ── Dvousloupcový layout: seznam vlevo | detail vpravo ───────────────────
+    # ── Dvousloupcovy layout: list vlevo | detail vpravo ───────────────────
     list_col, detail_col = st.columns([1, 3], gap="large")
 
-    # ── Levý sloupec: abecední seznam taxa ─────────────────────────────────
+    # ── Levy sloupec: abecedni list taxa ─────────────────────────────────
     with list_col:
         st.markdown(
             f"<div style='font-size:0.70rem;color:#64748b;margin-bottom:4px'>"
             f"<b>{len(sorted_names)}</b> taxa — click a row for detail</div>",
             unsafe_allow_html=True)
 
-        # Sestavit DataFrame pro přehlednou tabulku s výběrem řádku
+        # Sestavit DataFrame for prehlednou tabulku s vyberem radku
         _td_df = pd.DataFrame([{
             "Taxon": n,
             "n": len(groups[n]),
@@ -12867,7 +16696,7 @@ def tab_taxon_dossier():
             selection_mode="single-row",
             key="td_taxon_table",
         )
-        # Přečíst výběr — pokud uživatel klikl na řádek, přejít na daný taxon
+        # Precist vyber — if user klikl on line, prejit on dany taxon
         _sel_rows = getattr(_td_sel, "selection", {})
         if isinstance(_sel_rows, dict):
             _sel_rows = _sel_rows.get("rows", [])
@@ -12881,14 +16710,14 @@ def tab_taxon_dossier():
         else:
             selected_name = st.session_state["td_selected"]
 
-    # ── Pravý sloupec: detail vybraného taxonu ────────────────────────────────
+    # ── Pravy sloupec: detail vybraneho taxonu ────────────────────────────────
     with detail_col:
         occs = groups.get(selected_name, [])
         if not occs:
             st.info("Select taxon ze seznamu.")
             st.stop()
 
-        # ── Záhlaví ──────────────────────────────────────────────────────────
+        # ── Zahlavi ──────────────────────────────────────────────────────────
         all_fields_across_docs = {}
         for occ in occs:
             f = get_candidate_fields(occ["id"])
@@ -12947,7 +16776,7 @@ def tab_taxon_dossier():
             f"</div>",
             unsafe_allow_html=True)
 
-        # ── PDF odkaz (první výskyt) vedle záložek ─────────────────────────
+        # ── PDF odkaz (prvni vyskyt) vedle zalothatk ─────────────────────────
         _first_occ = sorted(occs, key=lambda x: (x["filename"], x["page_start"]))[0]
         _tdck = f"docpath_{_first_occ['document_id']}"
         if _tdck not in st.session_state:
@@ -12956,9 +16785,9 @@ def tab_taxon_dossier():
                 (_first_occ["document_id"],)).fetchone()
             _ccon.close()
             st.session_state[_tdck] = (_cr["path"] if _cr else None)
-        # (_pdf_link_html odpagesěn — file:// URLs nefungují z Streamlit HTTP Contextu;
-        #  PDF se nyní zobrazuje inline v tab 📜 Raw + PDF)
-        # ── Záložky detail panelu ─────────────────────────────────────────────
+        # (_pdf_link_html odpagesen — file:// URLs nefunguji from Streamlit HTTP Contextu;
+        #  PDF nyni zobrazuje inline in tab 📜 Raw + PDF)
+        # ── Zalozky detail panelu ─────────────────────────────────────────────
         has_multi = len(set(o["filename"] for o in occs)) > 1
         _tab_labels = ["📋 Pole", "🧬 Systematika", "📜 Raw + PDF"]
         if has_multi:
@@ -12970,14 +16799,14 @@ def tab_taxon_dossier():
         tab_compare  = detail_tabs[3] if has_multi else None
 
         with tab_fields:
-            # Banner po úspěšném překladu (zobrazí se jednou po rerunu)
+            # Banner after uspesnem prekladu (zobrazi jednou after rerunu)
             _just_tr = st.session_state.pop(f"dos_just_translated_{selected_name}", None)
             if _just_tr:
                 st.success(
                     f"✅ Translated {_just_tr} fields — zde jsou aktualizovane hodnoty",
                     icon="🌐")
 
-            # Sloučená pole ze allch occurrences, zobrazeno v dense gridu
+            # Sloucena field from allch occurrences, zobrazeno in dense gridu
             all_fv_display = []
             for fname in FIELD_ORDER:
                 if fname in all_fields_across_docs:
@@ -12987,7 +16816,7 @@ def tab_taxon_dossier():
             all_fv_display += extra
 
             if all_fv_display:
-                # ── Tlačítka: Auto-map + Přeložit do AJ ──────────────────────
+                # ── Tlacitka: Auto-map + Prelozit to AJ ──────────────────────
                 _dos_btn_c1, _dos_btn_c2, _dos_btn_c3 = st.columns([2, 2, 3])
                 if _dos_btn_c1.button("🔄 Auto-map all",
                                       key=f"td_am2_{selected_name}",
@@ -13004,8 +16833,8 @@ def tab_taxon_dossier():
                 _dos_s = get_settings()
                 _dos_llm_ok = _dos_s.get("llm_enabled")
 
-                # ── Hromadný překlad: VŠECHNY výskyty taxonu ──────────────
-                # Sbíráme jazyky ze allch zdrojových documents
+                # ── Hromadny preklad: All vyskyty taxonu ──────────────
+                # Sbirame jazyky from allch zdrojovych documents
                 _dos_langs: Dict[int, str] = {}  # document_id → lang
                 for _oc in occs:
                     if _oc["document_id"] not in _dos_langs:
@@ -13021,9 +16850,9 @@ def tab_taxon_dossier():
                     if _dos_unique_langs else "?"
                 )
                 _dos_tr_help = (
-                    f"Translates fields of ALL {len(occs)} výskytu "
-                    f"(jazyky: {_dos_lang_badge}) do angličtiny. "
-                    "Každý výskyt se přeloží zvlášť."
+                    f"Translates fields from all {len(occs)} occurrences "
+                    f"(languages: {_dos_lang_badge}) into English. "
+                    "Each occurrence is translated separately."
                     if _dos_llm_ok else
                     "Requires LM Studio — enable it in Settings → LLM.")
                 if _dos_btn_c2.button(
@@ -13039,7 +16868,8 @@ def tab_taxon_dossier():
                             _oc_lang = _dos_langs.get(_oc["document_id"], "")
                             try:
                                 _n = auto_translate_candidate_fields(
-                                    _oc["id"], _oc_lang, _dos_s, force=True)
+                                    _oc["id"], _oc_lang, _dos_s, force=True,
+                                    block=(_oc["block_text"] or ""))
                                 _tr_total += _n
                                 remap_fields_post_translation(_oc["id"])
                             except RuntimeError as _e:
@@ -13050,15 +16880,19 @@ def tab_taxon_dossier():
                     if _tr_errors:
                         st.error(tt(f"❌ Translation error: {_tr_errors[0]}", f"❌ Translation error: {_tr_errors[0]}"))
                     elif _tr_total:
-                        # Po překladu přepnout na záložku Pole →
-                        # saveíme flag, který po rerunu zobrazí banner + zvýrazní pole
+                        # After prekladu prepnout on zalozku Field →
+                        # saveime flag, which after rerunu zobrazi banner + zvyrazni field
                         st.session_state[f"dos_just_translated_{selected_name}"] = _tr_total
+                        _set_completion_gate(
+                            "Translation completed",
+                            f"Translated {_tr_total} field(s) across the occurrences of {selected_name}.",
+                            details={"taxon":selected_name,"occurrences":len(occs),"fields_translated":_tr_total})
                         st.rerun()
                     else:
                         st.info(
-                            "Zadna fields k prekladu — jsou vyskyty namapovane? Languages spravne nastaveny v documents?")
+                            "No fields are available for translation. Check field mapping and document language settings.")
 
-                # Rozdělit do dvou sloupcu pro 4K využití
+                # Rozdelit to dvou sloupcu for 4K vyuziti
                 mid = (len(all_fv_display)+1)//2
                 col_a, col_b = st.columns(2, gap="large")
                 for ci, (col, chunk) in enumerate([(col_a, all_fv_display[:mid]),
@@ -13067,7 +16901,7 @@ def tab_taxon_dossier():
                         rows_html = ""
                         for fname, fval in chunk:
                             safe_val = str(fval).replace("<","&lt;").replace(">","&gt;")
-                            # Ikony pro vybraná pole
+                            # Ikony for vybrana field
                             _ficons = {
                                 "STRATIGRAPHY": "🪨", "OCCURRENCE": "🌍",
                                 "LOCALITY": "📍", "TYPE SPECIMENS": "🔬",
@@ -13102,16 +16936,16 @@ def tab_taxon_dossier():
 
         if tab_compare:
             with tab_compare:
-                # Tabulka: řádky = pole, sloupce = Documenty
+                # Tabulka: lines = field, sloupce = Documenty
                 doc_names = sorted(set(o["filename"] for o in occs))
-                # Batch načíst allchna pole najednou (1 dotaz místo N)
+                # Batch nacist allchna field najednou (1 dotaz instead of N)
                 _bulk_fields = get_candidates_fields_bulk([o["id"] for o in occs])
                 doc_short = [pathlib.Path(dn).stem[:30] for dn in doc_names]
                 occ_by_doc: Dict[str, list] = {}
                 for o in occs:
                     occ_by_doc.setdefault(o["filename"], []).append(o)
 
-                # Nojduležitější pole pro porovnání
+                # Nojdulezitejsi field for porovnani
                 CMP_FIELDS = ["DIAGNOSIS","DESCRIPTION","TYPE SPECIMENS",
                               "LOCALITY","STRATIGRAPHY","OCCURRENCE",
                               "SIZE","SYNONYMY","AUTHOR","FIGURES"]
@@ -13138,7 +16972,7 @@ def tab_taxon_dossier():
                         doc_occs = occ_by_doc.get(doc_name, [])
                         cell_val = ""
                         for do in doc_occs:
-                            # Použít bulk cache (vypočítán před tabulkou)
+                            # Pouzit bulk cache (vypocitan before tabulkou)
                             flds = _bulk_fields.get(do["id"], {})
                             v = flds.get(fn,"")
                             if v and v != NOT_PROVIDED:
@@ -13160,7 +16994,7 @@ def tab_taxon_dossier():
         # 🧬 SYSTEMATIKA
         # ══════════════════════════════════════════════════════════════════════
         with tab_syst:
-            # ── Systematické zařazení ─────────────────────────────────────────
+            # ── Systematicke zarazeni ─────────────────────────────────────────
             _sys_fields = all_fields_across_docs
             _tax_placement = _sys_fields.get("TAXONOMIC PLACEMENT", "")
             _type_taxon    = _sys_fields.get("TYPE TAXON", "")
@@ -13171,7 +17005,7 @@ def tab_taxon_dossier():
             _status_val    = _sys_fields.get("OPEN NOMENCLATURE / IDENTIFICATION QUALIFIERS", "")
             _occ_rank      = (occs[0]["rank_guess"] or "") if occs else ""
 
-            # ── Systematické zařazení / breadcrumb ───────────────────────────
+            # ── Systematicke zarazeni / breadcrumb ───────────────────────────
             st.markdown(tt("**📍 Systematicke zarazeni**", "**📍 Systematic placement**"))
             if _tax_placement and _tax_placement != NOT_PROVIDED:
                 st.markdown(
@@ -13181,7 +17015,7 @@ def tab_taxon_dossier():
                     f"{_tax_placement}</div>",
                     unsafe_allow_html=True)
             else:
-                # Zkus sestavit z dat DB: najdi záznamy se stejným rankem o řád výše
+                # Zkus sestavit from dat DB: najdi records stejnym rankem o rad vyse
                 _rank_order = ["Species","Genus","Family","Order","Class","Phylum"]
                 _cur_rank_i = _rank_order.index(_occ_rank) if _occ_rank in _rank_order else -1
                 _breadcrumb_parts = []
@@ -13189,7 +17023,7 @@ def tab_taxon_dossier():
                     _parent_ranks = _rank_order[_cur_rank_i:]
                     _con_bc = db()
                     for _pr in _parent_ranks:
-                        # SQLite nepodporuje != ALL(subquery) — použijeme taxon_name != ?
+                        # SQLite nepodporuje != ALL(subquery) — pouzijeme taxon_name != ?
                         _bc_r = _con_bc.execute(
                             "SELECT DISTINCT taxon_name FROM taxon_candidates "
                             "WHERE rank_guess=? AND status IN ('approved','pending') "
@@ -13207,7 +17041,7 @@ def tab_taxon_dossier():
             # ── Autor a rok ───────────────────────────────────────────────────
             _auth_display = " ".join(filter(None, [_author_val, _year_val])).strip()
             if not _auth_display or _auth_display == NOT_PROVIDED:
-                # Zkus extrahovat z jména taxonu (pokud obsahuje autora)
+                # Zkus extrahovat from jmena taxonu (if contains authora)
                 _am = AUTHOR_YEAR_RE.search(selected_name)
                 if _am:
                     _auth_display = _am.group(0)
@@ -13226,7 +17060,7 @@ def tab_taxon_dossier():
 
             st.divider()
 
-            # ── Typové informace ─────────────────────────────────────────────
+            # ── Typove informace ─────────────────────────────────────────────
             _s1, _s2 = st.columns(2)
             with _s1:
                 if _type_taxon and _type_taxon != NOT_PROVIDED:
@@ -13259,12 +17093,12 @@ def tab_taxon_dossier():
                 with st.expander(tt("📜 Synonymika", "📜 Synonymy"), expanded=False):
                     st.text(_synonymy)
 
-            # ── Příbuzné taxony — Context-dependentní dotaz ───────────────────
+            # ── Pribuzne taxony — Context-dependentni dotaz ───────────────────
             st.divider()
             _rb1, _rb2 = st.columns([3, 1])
             _rb1.markdown("**🔗 Relatives taxa in DB**")
             if _rb2.button("🔄 Recalculate relationships", key="dos_rebuild_hier",
-                           help="Prepocita parent-child vztahy allch taxa v DB. Spustte po pridani novych documents."):
+                           help="Recomputes parent-child relationships for all taxa. Run after adding new documents."):
                 with st.spinner(tt("Recalculating hierarchy…", "Recomputing hierarchy…")):
                     _rh = rebuild_taxon_hierarchy()
                 st.success(
@@ -13277,8 +17111,8 @@ def tab_taxon_dossier():
             _taxon_first_word = (selected_name or "").split()[0]
 
             if _kin_rank_l == "species":
-                # Pro druh: sourozenci = ostatní druhy se stejným rodem
-                # (tj. stejné první slovo jména, or stejný parent_taxon_name)
+                # For and species: sourozenci = ostatni druhy stejnym genusem
+                # (tj. stejne prvni slovo jmena, or stejny parent_taxon_name)
                 _kin_genus = (
                     parent_name if parent_name
                     else _taxon_first_word)
@@ -13307,11 +17141,11 @@ def tab_taxon_dossier():
                     st.caption(tt(f"No siblings for genus *{_kin_genus}* v DB.", f"No siblings for genus *{_kin_genus}* in DB."))
 
             elif _kin_rank_l in ("genus", "subgenus"):
-                # Pro rod: sourozenci = ostatní rody stejné čeledi
-                # Čeleď zjistíme z parent_taxon_name or z INCLUDED TAXONS nadřazené čeledi
+                # For genus: sourozenci = ostatni genusy stejne celedi
+                # Celed zjistime from parent_taxon_name or from INCLUDED TAXONS nadrazene celedi
                 _kin_family = parent_name or ""
                 if not _kin_family:
-                    # Zkus najít čeleď, jejíž INCLUDED TAXONS obsahuje tento rod
+                    # Zkus najit family, jejiz INCLUDED TAXONS contains this genus
                     _con_kin2 = db()
                     _fam_r = _con_kin2.execute(
                         "SELECT tc.taxon_name FROM taxon_candidates tc "
@@ -13336,7 +17170,7 @@ def tab_taxon_dossier():
                         (selected_name, _kin_family)).fetchall()
                     _kin_label = tt(f"Rody celedi *{_kin_family}*", f"Genera of family *{_kin_family}*")
                 else:
-                    # Fallback: allchny rody ze stejného Documentu
+                    # Fallback: allchny genusy from stejneho Documentu
                     _doc_ids = [o["document_id"] for o in occs]
                     _ph = ",".join("?"*len(_doc_ids))
                     _kin_rows = _con_kin.execute(
@@ -13363,7 +17197,7 @@ def tab_taxon_dossier():
                     st.caption(tt("No related genera in DB (try Recalculate relationships).", "No related genera in DB (run Recompute relationships)."))
 
             elif _kin_rank_l in ("family", "subfamily", "superfamily"):
-                # Pro čeleď: zobrazit zařazené rody (z INCLUDED TAXONS or z parent)
+                # For family: zobrazit zarazene genusy (from INCLUDED TAXONS or from parent)
                 _incl_source = _incl_taxa or ""
                 _con_kin = db()
                 _child_rows = _con_kin.execute(
@@ -13375,7 +17209,7 @@ def tab_taxon_dossier():
                     (selected_name,)).fetchall()
                 _con_kin.close()
                 _child_display = [r["taxon_name"] for r in _child_rows]
-                # Doplnit z textového pole INCLUDED TAXONS
+                # Doplnit from textoveho field INCLUDED TAXONS
                 if _incl_source and _incl_source != NOT_PROVIDED:
                     for _iw in re.split(r"[;,\n]", _incl_source):
                         _iw = _iw.strip().strip("*_")
@@ -13393,10 +17227,10 @@ def tab_taxon_dossier():
                                 st.rerun()
                 else:
                     st.caption(
-                        "Zadne rody prirazeny k teto celedi. Spustte Prepocitat vztahy or doplnte fields INCLUDED TAXONS.")
+                        "No genera are assigned to this family. Recompute relationships or complete the INCLUDED TAXONS field.")
 
             else:
-                # Vyšší ranky (Order, Class, Phylum): zobrazit podřazené čeledi
+                # Vyssi ranky (Order, Class, Phylum): zobrazit podrazene celedi
                 _con_kin = db()
                 _child_rows = _con_kin.execute(
                     "SELECT DISTINCT taxon_name, rank_guess FROM taxon_candidates "
@@ -13417,20 +17251,20 @@ def tab_taxon_dossier():
                             st.rerun()
                 else:
                     st.caption(
-                        "Zadne podrazene taxony. Spustte Prepocitat vztahy po pridani documents.")
+                        "No subordinate taxa are assigned. Recompute relationships after adding documents.")
 
         # ══════════════════════════════════════════════════════════════════════
         # 📜 RAW + PDF
         # ══════════════════════════════════════════════════════════════════════
         with tab_block:
-            # Allchny výskyty chronologicky s raw blokem + inline PDF
+            # Allchny vyskyty chronologicky s raw blokem + inline PDF
             for occ in sorted(occs, key=lambda x: (x["filename"], x["page_start"])):
                 block = occ["block_text"] or ""
                 if not block:
                     block = extract_block_for_candidate(
                         occ["id"], occ["document_id"], occ["page_start"])
 
-                # Načíst cestu k fileu
+                # Load cestu k fileu
                 _td_doc_key = f"docpath_{occ['document_id']}"
                 if _td_doc_key not in st.session_state:
                     _tdcon = db()
@@ -13449,7 +17283,7 @@ def tab_taxon_dossier():
                     and pathlib.Path(_tddoc_path).exists()
                     and HAS_FITZ)
 
-                # Záhlaví výskytu
+                # Zahlavi vyskytu
                 conf_color = ("22c55e" if occ["confidence"] >= 0.80
                               else "f59e0b" if occ["confidence"] >= 0.60 else "ef4444")
                 _pg_range_lbl = (f"str. {_raw_pg_s}–{_raw_pg_e}"
@@ -13464,7 +17298,7 @@ def tab_taxon_dossier():
                     f"{_badge_html(occ['status'])}</div>",
                     unsafe_allow_html=True)
 
-                # ── PDF toggle: zobrazí stránky inline ────────────────────────
+                # ── PDF toggle: zobrazi pages inline ────────────────────────
                 if _raw_is_pdf:
                     _raw_pdf_tog = st.toggle(
                         f"📄 View PDF ({_pg_range_lbl})",
@@ -13494,10 +17328,10 @@ def tab_taxon_dossier():
                     key=f"td_blk_{occ['id']}",
                     label_visibility="collapsed", disabled=True)
 
-                # ── Akce na výskytu: auto-map / přeložit / editor ────────
+                # ── Akce on vyskytu: auto-map / prelozit / editor ────────
                 _ac_s = get_settings()
                 _ac_llm = _ac_s.get("llm_enabled", False)
-                # Zjistit jazyk Documentu pro tento výskyt
+                # Zjistit language Documentu for this vyskyt
                 _ac_doc_key = f"lang_{occ['document_id']}"
                 if _ac_doc_key not in st.session_state:
                     _ac_lr = db().execute(
@@ -13510,11 +17344,11 @@ def tab_taxon_dossier():
 
                 ac1, ac2, ac3 = st.columns(3)
                 if ac1.button("🔄 Auto-map", key=f"td_am2_{occ['id']}",
-                              help="Extrahovat pole z bloku"):
+                              help="Extract fields from the block"):
                     n = auto_map_candidate_fields(occ["id"], block)
                     st.success(tt(f"Mapped {n} fields.", f"Mapped {n} fields.")); st.rerun()
 
-                # ── Výběr jazyka pokud není znám ────────────────────────────
+                # ── Vyber jazyka if neni znam ────────────────────────────
                 _lang_picker_key = f"td_lang_pick_{occ['id']}"
                 _lang_confirmed_key = f"td_lang_ok_{occ['id']}"
                 if not _ac_lang or _ac_lang.lower() in {"?", ""}:
@@ -13550,7 +17384,7 @@ def tab_taxon_dossier():
                         st.session_state[_ac_doc_key] = _picked
                         _ac_lang = _picked
                         st.rerun()
-                    _tr_do = False   # tlačítko překladu zobrazíme až po potvrzení
+                    _tr_do = False   # tlacitko prekladu zobrazime az after potvrzeni
                 else:
                     _tr_do = True
 
@@ -13609,7 +17443,7 @@ def tab_taxon_dossier():
 
 
 
-def tab_morphostrat_dossier():
+def tab_morphostrat_dossier_legacy():
     # ── CSS ───────────────────────────────────────────────────────────────────
     st.markdown("""
     <style>
@@ -13646,18 +17480,18 @@ def tab_morphostrat_dossier():
     ).fetchone()[0]
     con.close()
 
-    # ── Header lišta ─────────────────────────────────────────────────────────
+    # ── Header lista ─────────────────────────────────────────────────────────
     hh1, hh2, hh3, hh4 = st.columns([2, 2, 2, 1])
     hh1.metric("Approved records", n_approved)
     hh2.metric("With morphological terms",   n_morph)
     hh3.metric("With stratigraphic terms",n_strat)
 
-    # ── Přecount termínu — přímý callback progress ───────────────────────────
+    # ── Precount terminu — primy callback progress ───────────────────────────
     _just_recomputed = False
 
     if hh4.button("🔄 Recompute", key="ms_recompute",
                   help="Recompute morphological and stratigraphic terms"):
-        # Vyčistit starý chunk-state, aby starý globální loop nepřebil UI.
+        # Vycistit old chunk-state, so that old globalni loop neprebil UI.
         st.session_state.pop("terms_recompute_ids", None)
         st.session_state.pop("terms_recompute_done", None)
 
@@ -13665,8 +17499,8 @@ def tab_morphostrat_dossier():
         progress_bar = st.progress(0.0)
 
         def progress_callback(current: int, total: int):
-            # st.progress bere float 0.0–1.0; text držíme odděleně, protože je
-            # spolehlivější napříč verzemi Streamlitu než kombinovaný text parametr.
+            # st.progress bere float 0.0–1.0; text drzime oddelene, because is
+            # spolehlivejsi napric verzemi Streamlitu nez kombinovany text parametr.
             total = max(int(total or 0), 1)
             current = max(0, min(int(current or 0), total))
             fraction = current / total
@@ -13693,16 +17527,16 @@ def tab_morphostrat_dossier():
         st.info(t("no_terms_computed2"))
         return
 
-    # ── Typ + hledání v termínech ─────────────────────────────────────────────
+    # ── Typ + hledani in terminech ─────────────────────────────────────────────
     rc1, rc2, rc3, rc4 = st.columns([2, 4, 2, 1])
     ttype = "stratigraphy" if rc1.radio(
         "##t", [t("stratigraphy"), t("morphology")],
         horizontal=True, key="ms_type",
-        label_visibility="collapsed").startswith(t("stratigraphy")[:2]) \
+        label_visibility="collapsed").startswith(t("stratigraphy")[:2])\
         else "morphology"
 
     term_search = rc2.text_input(
-        "🔍 Hledat pojem", key="ms_term_search",
+        "🔍 Search terms", key="ms_term_search",
         placeholder="filter terms alphabetically…",
         label_visibility="collapsed")
 
@@ -13710,7 +17544,7 @@ def tab_morphostrat_dossier():
                             help="Alphabetically (otherwise by number of matches ↓)")
     show_ctx  = rc4.toggle("Context", value=False, key="ms_ctx")
 
-    # ── Načíst kategorie a termíny ────────────────────────────────────────────
+    # ── Load kategorie and terms ────────────────────────────────────────────
     con = db()
     cat_counts = con.execute(
         "SELECT category, COUNT(DISTINCT candidate_id) n FROM term_matches "
@@ -13722,7 +17556,7 @@ def tab_morphostrat_dossier():
         st.warning(tt(f"Pro '{ttype}' — no matches. First approve records and recalculate.", f"No matches for '{ttype}' — approve records and recompute first."))
         return
 
-    # ── Kategorie jako horizontální filtrovací pill ───────────────────────────
+    # ── Kategorie as horizontalni filtrovaci pill ───────────────────────────
     all_cats = ["— All —"] + [r["category"] for r in cat_counts if r["category"]]
     sel_cat_label = st.radio(
         "Kategorie", all_cats,
@@ -13731,7 +17565,7 @@ def tab_morphostrat_dossier():
     st.session_state["ms_cat_idx"] = all_cats.index(sel_cat_label)
     sel_cat = None if sel_cat_label == "— All —" else sel_cat_label
 
-    # ── Načíst termíny pro tuto kategorii ─────────────────────────────────────
+    # ── Load terms for tuto kategorii ─────────────────────────────────────
     con = db()
     if sel_cat:
         term_rows = con.execute(
@@ -13745,12 +17579,12 @@ def tab_morphostrat_dossier():
             (ttype,)).fetchall()
     con.close()
 
-    # Filtrovat podle hledání
+    # Filtrovat podle hledani
     term_needle = _norm_search(term_search.strip()) if term_search.strip() else ""
     if term_needle:
         term_rows = [r for r in term_rows if term_needle in _norm_search(r["canonical"])]
 
-    # Seřadit
+    # Seradit
     if sort_alpha:
         term_rows = sorted(term_rows, key=lambda r: r["canonical"].lower())
     else:
@@ -13760,7 +17594,7 @@ def tab_morphostrat_dossier():
         st.info(t("no_term_matches"))
         return
 
-    # ── Dvousloupcový layout: seznam termínu | výsledky ───────────────────────
+    # ── Dvousloupcovy layout: list terminu | vysledky ───────────────────────
     left_col, right_col = st.columns([1, 3], gap="small")
 
     with left_col:
@@ -13770,12 +17604,12 @@ def tab_morphostrat_dossier():
             + (" (A–Z)" if sort_alpha else " (↓ frequency)")
             + "</div>", unsafe_allow_html=True)
 
-        # Klikací seznam termínu (st.radio = přímý výběr kliknutím)
+        # Klikaci list terminu (st.radio = primy vyber kliknutim)
         term_options = [r["canonical"] for r in term_rows[:300]]
         if not term_options:
             st.stop()
 
-        if "ms_sel_term" not in st.session_state or \
+        if "ms_sel_term" not in st.session_state or\
            st.session_state["ms_sel_term"] not in term_options:
             st.session_state["ms_sel_term"] = term_options[0]
 
@@ -13820,7 +17654,7 @@ def tab_morphostrat_dossier():
             st.caption(tt(f"… a {len(term_rows)-300} more", f"… and {len(term_rows)-300} more"))
 
     with right_col:
-        # ── Výsledky pro vybraný termín ───────────────────────────────────────
+        # ── Vysledky for vybrany termin ───────────────────────────────────────
         con = db()
         matches = con.execute(
             """SELECT tm.term, tm.category, tm.source_field,
@@ -13836,7 +17670,7 @@ def tab_morphostrat_dossier():
             (ttype, sel_canonical)).fetchall()
         con.close()
 
-        # Live filtr uvnitř výsledku
+        # Live filtr uvnitr vysledku
         res_search = st.text_input(
             "🔍 Filtr v taxonech", key="ms_res_filter",
             placeholder="Search in taxon names…",
@@ -13855,7 +17689,7 @@ def tab_morphostrat_dossier():
         if not matches:
             st.info(t("no_match_for_term"))
         else:
-            # ── Klikací tabulka výsledku (st.dataframe s výběrem řádku) ──────
+            # ── Klikaci tabulka vysledku (st.dataframe s vyberem radku) ──────
             _ms_match_df = pd.DataFrame([{
                 "Taxon":    m["taxon_name"],
                 "Rank":     m["rank_guess"] or "—",
@@ -13874,7 +17708,7 @@ def tab_morphostrat_dossier():
                     "Dok.":  st.column_config.TextColumn("Dok.",  width=150),
                     "Str.":  st.column_config.NumberColumn("Str.", width=55),
                     "Conf.": st.column_config.NumberColumn("Conf.", width=65, format="%.3f"),
-                    "Pole":  st.column_config.TextColumn("Pole",  width=120),
+                    "Field": st.column_config.TextColumn("Field", width=120),
                 },
                 hide_index=True,
                 use_container_width=True,
@@ -13909,7 +17743,7 @@ def tab_morphostrat_dossier():
                     f" · {_ms_dok}</span></div>",
                     unsafe_allow_html=True)
 
-                # Načíst pole a blok pro vybraného kandidáta
+                # Load field and blok for vybraneho candidate
                 _ms_fields = get_candidate_fields(_ms_sel_cid)
                 _ms_cand = get_candidate(_ms_sel_cid)
                 if _ms_fields:
@@ -13944,7 +17778,7 @@ def tab_morphostrat_dossier():
                             f"style='color:#60a5fa;font-size:0.76rem'>"
                             f"📄 Open PDF page&nbsp;{_pg}</a>",
                             unsafe_allow_html=True)
-                    # Toggle PDF náhled
+                    # Toggle PDF nahled
                     if HAS_FITZ and _doc_id and st.toggle(
                             "📄 Preview of pages", value=False, key=f"ms_pdf_{_ms_sel_cid}"):
                         _show_pdf_page_inline(_doc_id, _pg, key=f"ms_pdfv_{_ms_sel_cid}")
@@ -14038,19 +17872,20 @@ def tab_morphostrat_dossier():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 7 – NASTAVENÍ
+# TAB 7 – NASTAVENI
 # ══════════════════════════════════════════════════════════════════════════════
 
 def tab_settings():
-    st.header(t("settings_header"))
+    st.markdown(f"### {t('settings_header')}", unsafe_allow_html=False)
     s = get_settings()
+    user_paths = current_user_paths()
 
     stab1, stab1b, stab1c, stab2, stab3, stab4, stab5, stab_users, stab_dup = st.tabs(
         [t("schema_tab"), t("gazetteer_tab"), t("terms_tab"), t("llm_tab"),
          t("data_tab"), t("quality_tab"), "🏆 Gold Set", "👥 Users",
          "🔀 Duplicates"])
 
-    # ── Schéma ────────────────────────────────────────────────────────────────
+    # ── Schema ────────────────────────────────────────────────────────────────
     with stab1:
         schema = load_schema()
 
@@ -14061,8 +17896,8 @@ def tab_settings():
         sc3.metric("Languages", schema["language"].nunique())
         sc4.metric("Active", (schema["enabled"] == "1").sum())
 
-        schema_src = ("✅ File: `" + str(SCHEMA_FILE) + "`"
-                      if SCHEMA_FILE.exists() else "⚠️ Built-in fallback")
+        schema_src = ("✅ File: `" + str(user_paths.schema) + "`"
+                      if user_paths.schema.exists() else "⚠️ Built-in fallback")
         st.caption(schema_src)
 
         # ── Upload + Download ─────────────────────────────────────────────────
@@ -14075,16 +17910,16 @@ def tab_settings():
                      "type_species_standalone, priority, language")
             if new_schema and st.button(t("schema_tab") + " " + t("save_caption")[3:].strip(),
                                          key="schema_upload_btn", type="primary"):
-                BASE_DIR.mkdir(parents=True, exist_ok=True)
-                SCHEMA_FILE.write_bytes(new_schema.getbuffer())
+                user_paths.root.mkdir(parents=True, exist_ok=True)
+                user_paths.schema.write_bytes(new_schema.getbuffer())
                 reload_schema()
                 st.success(tt(f"✅ Schema saved ({new_schema.size:,} B).", f"✅ Schema saved ({new_schema.size:,} B)."))
                 st.rerun()
         with dl_col:
-            if SCHEMA_FILE.exists():
+            if user_paths.schema.exists():
                 st.download_button(
-                    "📥 Download aktualni schema (TSV)",
-                    data=SCHEMA_FILE.read_bytes(),
+                    "📥 Download current schema (TSV)",
+                    data=user_paths.schema.read_bytes(),
                     file_name="section_schema.tsv",
                     mime="text/tab-separated-values",
                     key="schema_dl",
@@ -14145,27 +17980,27 @@ def tab_settings():
             view = view[view["label"].str.contains(label_srch, case=False, na=False)]
         view = view.reset_index(drop=True)
 
-        # Save original label pro merge při saveení
+        # Save original label for merge when saveeni
         view["_orig_label"] = view["label"]
 
         st.caption(tt(f"Zobrazeno **{len(view)}** z {len(schema)} labels", f"Showing **{len(view)}** of {len(schema)} labels")
-                   + (f" — pole: `{sel_field}`" if sel_field != "— all —" else ""))
+                   + (f" — field: `{sel_field}`" if sel_field != "— all —" else ""))
 
-        # ── Hromadné akce na pole ─────────────────────────────────────────────
+        # ── Hromadne akce on field ─────────────────────────────────────────────
         if sel_field != "— all —":
             ba1, ba2, _ = st.columns([1, 1, 4])
             if ba1.button("✅ Activate all", key="schema_enable_all"):
                 schema.loc[schema["target_field"] == sel_field, "enabled"] = "1"
-                BASE_DIR.mkdir(parents=True, exist_ok=True)
-                schema.to_csv(SCHEMA_FILE, sep="\t", index=False)
+                user_paths.root.mkdir(parents=True, exist_ok=True)
+                schema.to_csv(user_paths.schema, sep="\t", index=False)
                 reload_schema()
-                st.success(tt("Allchny labely tohoto fields aktivovany.", "All labels for this field activated.")); st.rerun()
+                st.success(tt("All labels for this field activated.", "All labels for this field activated.")); st.rerun()
             if ba2.button("⛔ Deactivate all", key="schema_disable_all"):
                 schema.loc[schema["target_field"] == sel_field, "enabled"] = "0"
-                BASE_DIR.mkdir(parents=True, exist_ok=True)
-                schema.to_csv(SCHEMA_FILE, sep="\t", index=False)
+                user_paths.root.mkdir(parents=True, exist_ok=True)
+                schema.to_csv(user_paths.schema, sep="\t", index=False)
                 reload_schema()
-                st.success(tt("Allchny labely tohoto fields deaktivovany.", "All labels for this field deactivated.")); st.rerun()
+                st.success(tt("All labels for this field deactivated.", "All labels for this field deactivated.")); st.rerun()
 
         # ── Tabulka editoru ───────────────────────────────────────────────────
         EDIT_COLS_BASIC = ["enabled", "label", "target_field",
@@ -14225,14 +18060,14 @@ def tab_settings():
             key=editor_key,
         )
 
-        # ── Uložení změn ─────────────────────────────────────────────────────
+        # ── Ulothatni zmen ─────────────────────────────────────────────────────
         sv1, sv2 = st.columns(2)
         if sv1.button("💾 Save displayed changes", type="primary",
                        key="schema_save_view"):
-            BASE_DIR.mkdir(parents=True, exist_ok=True)
+            user_paths.root.mkdir(parents=True, exist_ok=True)
 
-            # Odpagesit zobrazené řádky ze stávajícího schématu podle
-            # jejich originálních labels (před editací)
+            # Odpagesit zobrazene lines from stavajiciho schematu podle
+            # jejich originalnich labels (before editaci)
             displayed_labels = set(view["_orig_label"].tolist())
             displayed_field  = sel_field if sel_field != "— all —" else None
             if displayed_field:
@@ -14242,10 +18077,10 @@ def tab_settings():
                 mask_remove = schema["label"].isin(displayed_labels)
             full = schema[~mask_remove].copy()
 
-            # Zpracovat editované řádky
+            # Zpracovat editovane lines
             new_rows = edited_view.copy()
 
-            # label_regex a canonical_label: prázdné → doplnit z label
+            # label_regex and canonical_label: prazdne → doplnit from label
             for col_auto in ["label_regex", "canonical_label"]:
                 if col_auto not in new_rows.columns:
                     new_rows[col_auto] = new_rows["label"]
@@ -14270,7 +18105,7 @@ def tab_settings():
 
             full = pd.concat([full[TSV_COLS], new_rows[TSV_COLS]],
                              ignore_index=True, sort=False)
-            full.to_csv(SCHEMA_FILE, sep="\t", index=False)
+            full.to_csv(user_paths.schema, sep="\t", index=False)
             reload_schema()
             st.success(tt(f"✅ Saved {len(new_rows)} labels ", f"✅ Saved {len(new_rows)} labels ") +
                        tt(f"(celkem {len(full)} in files).", f"({len(full)} total in file)."))
@@ -14279,11 +18114,11 @@ def tab_settings():
         if sv2.button("↩ Discard changes", key="schema_discard_view"):
             st.rerun()
 
-        # ── Rychlé přidání nového labelu ──────────────────────────────────────
+        # ── Rychle pridani noveho labelu ──────────────────────────────────────
         st.divider()
         with st.expander(t("add_label_expander"), expanded=False):
             st.caption(
-                "Vyplnte below a kliknete Pridat. Label se ihned savei do TSV.")
+                "Complete the fields below and click Add. The label is saved to the TSV immediately.")
             na1, na2, na3 = st.columns([3, 2, 1])
             nb1, nb2, nb3 = st.columns([1, 1, 1])
             nc1, nc2      = st.columns([1, 1])
@@ -14311,7 +18146,7 @@ def tab_settings():
                 if not new_label.strip():
                     st.warning(t("label_text_required"))
                 else:
-                    BASE_DIR.mkdir(parents=True, exist_ok=True)
+                    user_paths.root.mkdir(parents=True, exist_ok=True)
                     regex_val = new_regex.strip() or new_label.strip()
                     new_row = pd.DataFrame([{
                         "enabled":                new_enabled,
@@ -14325,22 +18160,22 @@ def tab_settings():
                         "priority":               str(int(new_priority)),
                         "language":               new_lang.strip(),
                     }])
-                    if SCHEMA_FILE.exists():
+                    if user_paths.schema.exists():
                         cur = pd.read_csv(
-                            SCHEMA_FILE, sep="\t", dtype=str).fillna("")
+                            user_paths.schema, sep="\t", dtype=str).fillna("")
                     else:
                         cur = pd.read_csv(
                             io.StringIO(_MINIMAL_SCHEMA_TSV),
                             sep="\t", dtype=str).fillna("")
                     updated = pd.concat(
                         [cur, new_row], ignore_index=True, sort=False)
-                    updated.to_csv(SCHEMA_FILE, sep="\t", index=False)
+                    updated.to_csv(user_paths.schema, sep="\t", index=False)
                     reload_schema()
                     st.success(
                         f"✅ Label '{new_label.strip()}' -> '{new_tfield}' added.")
                     st.rerun()
 
-    # ── Gazetteer (seznam známých taxa) ──────────────────────────────────────
+    # ── Gazetteer (list znamych taxa) ──────────────────────────────────────
     with stab1b:
         st.caption(
             "List of known taxa (taxons.txt) — used as a SOFT bonus in detection scoring, not as a hard filter. A candidate whose name (or genus) is on the list receives a confidence bonus; a missing match is not penalized in any way (newly described species in the current article are, of course, not included in the list).")
@@ -14350,8 +18185,8 @@ def tab_settings():
         gz1.metric("Genera", len(genera))
         gz2.metric("Binomials", len(binomials))
 
-        gaz_src = ("✅ File: `" + str(GAZETTEER_FILE) + "`"
-                   if GAZETTEER_FILE.exists() else "⚠️ No gazetteer loaded")
+        gaz_src = ("✅ File: `" + str(user_paths.gazetteer) + "`"
+                   if user_paths.gazetteer.exists() else "⚠️ No gazetteer loaded")
         st.caption(gaz_src)
 
         s_gaz = get_settings()
@@ -14364,8 +18199,8 @@ def tab_settings():
             "Upload a new taxon list (TXT, one name per row)",
             type=["txt"], key="gazetteer_up")
         if new_gaz and st.button(t("gaz_save_btn")):
-            BASE_DIR.mkdir(parents=True, exist_ok=True)
-            GAZETTEER_FILE.write_bytes(new_gaz.getbuffer())
+            user_paths.root.mkdir(parents=True, exist_ok=True)
+            user_paths.gazetteer.write_bytes(new_gaz.getbuffer())
             reload_gazetteer()
             st.success(tt(f"Gazetteer saved ({new_gaz.size} B).", f"Gazetteer saved ({new_gaz.size} B)."))
             st.rerun()
@@ -14373,7 +18208,7 @@ def tab_settings():
         with st.expander(t("gaz_preview")):
             st.write(sorted(genera)[:60])
 
-    # ── Morfologické a stratigrafické termíny ──────────────────────────────────
+    # ── Morfologicke and stratigraficke terms ──────────────────────────────────
     with stab1c:
         st.caption(tt(
             'Termíny se používají v záložce „Morpho/Strat.“ pro filtrování taxonů'
@@ -14386,13 +18221,13 @@ def tab_settings():
         # ── Resolve file paths once ────────────────────────────────────────────
         _morph_path = _upath("paleon_morphology_terms.tsv")
         if not _morph_path.exists():
-            _morph_path = MORPHOLOGY_FILE
+            _morph_path = user_paths.morphology
         _strat_path = _upath("stratigraphy_terms.tsv")
         if not _strat_path.exists():
-            _strat_path = STRATIGRAPHY_FILE
+            _strat_path = user_paths.stratigraphy
         _syst_path = _upath("systematic_sections.tsv")
         if not _syst_path.exists():
-            _syst_path = SYSTEMATIC_SECTIONS_FILE
+            _syst_path = user_paths.systematic_sections
 
         # ── Load raw files (all rows, including enabled=0) ─────────────────────
         _morph_raw = _load_raw_tsv(_morph_path, ["term", "canonical", "category", "language", "enabled"])
@@ -14428,7 +18263,7 @@ def tab_settings():
         # ── Recompute hint banner ──────────────────────────────────────────────
         if st.session_state.get("terms_recompute_after_tsv"):
             st.info(tt(
-                "⚠️ Byl nahrán nebo upraven soubor termínů. Pro aktualizaci shod v databázi spusť 🔄 Recompute níže.",
+                "⚠️ A term file was uploaded or edited. Run Recompute to update matches in the database.",
                 "⚠️ Term file was uploaded or edited. Run 🔄 Recompute below to update matches in the database."),
                 icon="⚠️")
 
@@ -14445,24 +18280,22 @@ def tab_settings():
             _mup_col, _mdl_col = st.columns(2)
             with _mup_col:
                 new_morph = st.file_uploader(
-                    tt("📂 Nahrát nový soubor morfologických termínů (TSV)",
-                       "📂 Upload new morphological terms file (TSV)"),
+                    "📂 Upload new morphological terms file (TSV)",
                     type=["tsv"], key="morph_up")
                 if new_morph and st.button(t("save_morpho_btn"), key="morph_up_save", type="primary"):
-                    BASE_DIR.mkdir(parents=True, exist_ok=True)
+                    user_paths.root.mkdir(parents=True, exist_ok=True)
                     _morph_write = _upath("paleon_morphology_terms.tsv")
                     _morph_write.parent.mkdir(parents=True, exist_ok=True)
                     _morph_write.write_bytes(new_morph.getbuffer())
-                    MORPHOLOGY_FILE.write_bytes(new_morph.getbuffer())
+                    user_paths.morphology.write_bytes(new_morph.getbuffer())
                     reload_morphology_terms()
                     st.session_state["terms_recompute_after_tsv"] = True
-                    st.success(tt(f"✅ Uloženo ({new_morph.size:,} B). Spusť Recompute níže.",
-                                  f"✅ Saved ({new_morph.size:,} B). Run Recompute below."))
+                    st.success(f"✅ Saved ({new_morph.size:,} B). Run Recompute below.")
                     st.rerun()
             with _mdl_col:
                 if _morph_path.exists():
                     st.download_button(
-                        tt("📥 Stáhnout aktuální TSV", "📥 Download current TSV"),
+                        "📥 Download current TSV",
                         data=_morph_path.read_bytes(),
                         file_name="paleon_morphology_terms.tsv",
                         mime="text/tab-separated-values",
@@ -14470,7 +18303,7 @@ def tab_settings():
 
             # ── Full-width editor ─────────────────────────────────────────────
             st.caption(tt(
-                f"Edituj přímo v tabulce — **{len(_morph_raw)}** termínů (včetně disabled). "
+                f"Edit directly in the table — **{len(_morph_raw)}** termínů (včetně disabled). "
                 "Sloupcové filtry jsou dostupné přes ikonu 🔍 v záhlaví sloupce. "
                 "Po uložení spusť 🔄 Recompute.",
                 f"Edit directly in the table — **{len(_morph_raw)}** terms (including disabled). "
@@ -14481,7 +18314,7 @@ def tab_settings():
             if "enabled" in _morph_raw.columns:
                 _morph_col_cfg["enabled"] = st.column_config.SelectboxColumn(
                     "Active", options=["1", "0"], width=70,
-                    help="1 = použit při výpočtu shod / used for match computation")
+                    help="1 = used for match computation")
             if "term" in _morph_raw.columns:
                 _morph_col_cfg["term"] = st.column_config.TextColumn("Term", width=240)
             if "canonical" in _morph_raw.columns:
@@ -14501,16 +18334,15 @@ def tab_settings():
             )
             _msave1, _msave2 = st.columns([1, 5])
             if _msave1.button(t("save_morpho_btn"), key="morph_edit_save", type="primary"):
-                BASE_DIR.mkdir(parents=True, exist_ok=True)
+                user_paths.root.mkdir(parents=True, exist_ok=True)
                 _morph_write2 = _upath("paleon_morphology_terms.tsv")
                 _morph_write2.parent.mkdir(parents=True, exist_ok=True)
                 _morph_edited.to_csv(str(_morph_write2), sep="\t", index=False, encoding="utf-8")
-                MORPHOLOGY_FILE.write_text(
+                user_paths.morphology.write_text(
                     _morph_edited.to_csv(sep="\t", index=False), encoding="utf-8")
                 reload_morphology_terms()
                 st.session_state["terms_recompute_after_tsv"] = True
-                st.success(tt(f"✅ Uloženo {len(_morph_edited)} termínů. Spusť Recompute níže.",
-                              f"✅ Saved {len(_morph_edited)} terms. Run Recompute below."))
+                st.success(f"✅ Saved {len(_morph_edited)} terms. Run Recompute below.")
                 st.rerun()
 
         # ════════════════════════════════════════════════════════════════════════
@@ -14521,31 +18353,29 @@ def tab_settings():
             _sup_col, _sdl_col = st.columns(2)
             with _sup_col:
                 new_strat = st.file_uploader(
-                    tt("📂 Nahrát nový soubor stratigrafických termínů (TSV)",
-                       "📂 Upload new stratigraphical terms file (TSV)"),
+                    "📂 Upload new stratigraphic terms file (TSV)",
                     type=["tsv"], key="strat_up")
                 if new_strat and st.button(t("save_strat_btn"), key="strat_up_save", type="primary"):
-                    BASE_DIR.mkdir(parents=True, exist_ok=True)
+                    user_paths.root.mkdir(parents=True, exist_ok=True)
                     _strat_write = _upath("stratigraphy_terms.tsv")
                     _strat_write.parent.mkdir(parents=True, exist_ok=True)
                     _strat_write.write_bytes(new_strat.getbuffer())
-                    STRATIGRAPHY_FILE.write_bytes(new_strat.getbuffer())
+                    user_paths.stratigraphy.write_bytes(new_strat.getbuffer())
                     reload_stratigraphy_terms()
                     st.session_state["terms_recompute_after_tsv"] = True
-                    st.success(tt(f"✅ Uloženo ({new_strat.size:,} B). Spusť Recompute níže.",
-                                  f"✅ Saved ({new_strat.size:,} B). Run Recompute below."))
+                    st.success(f"✅ Saved ({new_strat.size:,} B). Run Recompute below.")
                     st.rerun()
             with _sdl_col:
                 if _strat_path.exists():
                     st.download_button(
-                        tt("📥 Stáhnout aktuální TSV", "📥 Download current TSV"),
+                        "📥 Download current TSV",
                         data=_strat_path.read_bytes(),
                         file_name="stratigraphy_terms.tsv",
                         mime="text/tab-separated-values",
                         key="strat_dl")
 
             st.caption(tt(
-                f"Edituj přímo v tabulce — **{len(_strat_raw)}** termínů (včetně disabled). "
+                f"Edit directly in the table — **{len(_strat_raw)}** termínů (včetně disabled). "
                 "Sloupcové filtry jsou dostupné přes ikonu 🔍 v záhlaví sloupce. "
                 "Po uložení spusť 🔄 Recompute.",
                 f"Edit directly in the table — **{len(_strat_raw)}** terms (including disabled). "
@@ -14580,20 +18410,19 @@ def tab_settings():
             )
             _ssave1, _ssave2 = st.columns([1, 5])
             if _ssave1.button(t("save_strat_btn"), key="strat_edit_save", type="primary"):
-                BASE_DIR.mkdir(parents=True, exist_ok=True)
+                user_paths.root.mkdir(parents=True, exist_ok=True)
                 _strat_write2 = _upath("stratigraphy_terms.tsv")
                 _strat_write2.parent.mkdir(parents=True, exist_ok=True)
                 _strat_edited.to_csv(str(_strat_write2), sep="\t", index=False, encoding="utf-8")
-                STRATIGRAPHY_FILE.write_text(
+                user_paths.stratigraphy.write_text(
                     _strat_edited.to_csv(sep="\t", index=False), encoding="utf-8")
                 reload_stratigraphy_terms()
                 st.session_state["terms_recompute_after_tsv"] = True
-                st.success(tt(f"✅ Uloženo {len(_strat_edited)} termínů. Spusť Recompute níže.",
-                              f"✅ Saved {len(_strat_edited)} terms. Run Recompute below."))
+                st.success(f"✅ Saved {len(_strat_edited)} terms. Run Recompute below.")
                 st.rerun()
 
         # ════════════════════════════════════════════════════════════════════════
-        # TAB: SYSTEMATIC SECTIONS (přesunuto do tabu, raw load → vidíme i disabled)
+        # TAB: SYSTEMATIC SECTIONS (presunuto to tabu, raw load → vidime i disabled)
         # ════════════════════════════════════════════════════════════════════════
         with _term_tabs[2]:
             st.caption(
@@ -14623,14 +18452,14 @@ def tab_settings():
                 )
                 if st.button(t("save_sys_sections_btn"), key="sys_sec_save", type="primary"):
                     _sys_path_w = _upath("systematic_sections.tsv")
-                    BASE_DIR.mkdir(parents=True, exist_ok=True)
+                    user_paths.root.mkdir(parents=True, exist_ok=True)
                     _sys_path_w.parent.mkdir(parents=True, exist_ok=True)
                     _sys_edit.to_csv(str(_sys_path_w), sep="\t", index=False, encoding="utf-8")
-                    SYSTEMATIC_SECTIONS_FILE.write_text(
+                    user_paths.systematic_sections.write_text(
                         _sys_edit.to_csv(sep="\t", index=False, encoding="utf-8"), encoding="utf-8")
                     reload_systematic_sections()
                     st.success(tt(
-                        f"Uloženo {len(_sys_edit)} řádků. Změny se projeví při příštím indexování.",
+                        f"Saved {len(_sys_edit)} rows. Changes take effect at the next indexing.",
                         f"Saved {len(_sys_edit)} rows. Changes take effect at next indexing."))
                     st.rerun()
 
@@ -14642,20 +18471,20 @@ def tab_settings():
                     _sys_path_up = _upath("systematic_sections.tsv")
                     _sys_path_up.parent.mkdir(parents=True, exist_ok=True)
                     _sys_path_up.write_bytes(new_sys.getbuffer())
-                    SYSTEMATIC_SECTIONS_FILE.write_bytes(new_sys.getbuffer())
+                    user_paths.systematic_sections.write_bytes(new_sys.getbuffer())
                     reload_systematic_sections()
-                    st.success(tt(f"Uloženo ({new_sys.size} B).", f"Saved ({new_sys.size} B)."))
+                    st.success(tt(f"Saved ({new_sys.size} B).", f"Saved ({new_sys.size} B)."))
                     st.rerun()
             with _sys_dl_col:
                 if _syst_path.exists():
                     st.download_button(
-                        tt("📥 Stáhnout aktuální TSV", "📥 Download current TSV"),
+                        "📥 Download current TSV",
                         data=_syst_path.read_bytes(),
                         file_name="systematic_sections.tsv",
                         mime="text/tab-separated-values",
                         key="sys_sec_dl")
 
-        # ── Recompute (zvýrazněn po uploadu/editaci) ───────────────────────────
+        # ── Recompute (zvyraznen after uploadu/editaci) ───────────────────────────
         st.divider()
         _recomp_pending = bool(st.session_state.get("terms_recompute_after_tsv"))
         _recomp_type    = "primary" if _recomp_pending else "secondary"
@@ -14663,8 +18492,7 @@ def tab_settings():
             tt("🔄 Přepočítat shody — doporučeno po uploadu / editaci termínů",
                "🔄 Recompute matches — recommended after uploading / editing terms")
             if _recomp_pending else
-            tt("🔄 Přepočítat termíny pro všechny schválené záznamy",
-               "🔄 Recompute terms for all approved records")
+            "🔄 Recompute terms for all approved records"
         )
         if st.button(_recomp_label, key="settings_recompute_terms", type=_recomp_type):
             st.session_state.pop("terms_recompute_after_tsv", None)
@@ -14676,30 +18504,29 @@ def tab_settings():
                 _cur = max(0, min(int(current or 0), _tot))
                 _rc_bar.progress(_cur / _tot)
                 _rc_status.text(tt(
-                    f"Přepočítávám termíny: {_cur} / {_tot} ({int(_cur/_tot*100)} %) …",
+                    f"Recomputing terms: {_cur} / {_tot} ({int(_cur/_tot*100)} %) …",
                     f"Recomputing terms: {_cur} / {_tot} ({int(_cur/_tot*100)} %) …"))
 
             try:
                 _rc_status.text(tt(
-                    "Připravuji přepočet morfologických a stratigrafických termínů…",
+                    "Preparing morphology and stratigraphy term recompute…",
                     "Preparing recompute of morphological and stratigraphic terms…"))
                 _rc_n = recompute_all_term_matches(progress_cb=_rc_cb,
                                                    include_needs_review=True)
                 _rc_bar.empty()
-                _rc_status.success(tt(
-                    f"✅ Hotovo! Přepočítáno {_rc_n} záznamů.",
-                    f"✅ Done! Recomputed {_rc_n} records."))
+                _rc_status.success(f"✅ Done! Recomputed {_rc_n} records.")
+                _set_completion_gate("Term recompute completed",f"Recomputed morphology and stratigraphy matches for {_rc_n} records.")
             except Exception as _rc_exc:
                 _rc_bar.empty()
                 _rc_status.error(tt(
-                    f"❌ Přepočet selhal: {_rc_exc}",
+                    f"❌ Recompute failed: {_rc_exc}",
                     f"❌ Recompute failed: {_rc_exc}"))
                 raise
 
     # ── LLM prompty ───────────────────────────────────────────────────────────
     with stab2:
-        st.caption(f"File: `{PROMPTS_FILE}`  "
-                   + ("✅ saved" if PROMPTS_FILE.exists() else "⚠️ nonexist"))
+        st.caption(f"File: `{user_paths.prompts}`  "
+                   + ("✅ saved" if user_paths.prompts.exists() else "⚠️ missing"))
 
         PRESETS = {
             "Default (Czech)": (LLM_VALIDATION_PROMPT, LLM_BOUNDARY_PROMPT, LLM_FIELD_PROMPT),
@@ -14712,7 +18539,7 @@ def tab_settings():
                 "NEVER invent missing text.",
                 "You are PaleoN field assignment assistant.\n"
                 'Return ONLY valid JSON: {"fields":{"FIELD":"verbatim"},"reasons":{},"confidence":"High|Medium|Low"}\n'
-                "Use ONLY text from the input. Nover summarize.",
+                "Use ONLY text from the input. Never summarize.",
             ),
         }
         preset = st.selectbox(t("preset_load"), list(PRESETS.keys()), key="preset_sel")
@@ -14735,12 +18562,13 @@ def tab_settings():
         s["llm_translation_prompt"] = st.text_area(
             "4️⃣ Translation prompt (translation of non-English fields → English)",
             value=s.get("llm_translation_prompt", LLM_TRANSLATION_PROMPT), height=200,
-            help="Prompt pro automaticky preklad pri indexaci ne-anglickych documents. LLM vrati JSON {\"fields\":{\"FIELD\":\"English translation\"}}. PaleoN pak savei: anglicky text (puvodni text v zavorce).")
+            help="Prompt for automatic translation during indexing of non-English documents. The LLM returns JSON with translated field values.")
+
 
         pb1,pb2,pb3 = st.columns(3)
         if pb1.button("💾 Save prompty", type="primary", key="set_prompts_save"):
             save_prompts(s)
-            st.success(tt(f"Saved → `{PROMPTS_FILE}`", f"Saved → `{PROMPTS_FILE}`"))
+            st.success(tt(f"Saved → `{user_paths.prompts}`", f"Saved → `{user_paths.prompts}`"))
         if pb2.button("📂 Load from disc", key="set_prompts_load"):
             s.update(load_prompts()); st.success(tt("Loaded.", "Loaded.")); st.rerun()
         if pb3.button("⚠ Restore default", key="set_prompts_reset"):
@@ -14752,6 +18580,13 @@ def tab_settings():
 
         st.session_state["paleon_settings"] = s
 
+    # Translation dictionary content is managed centrally in Dictionaries.
+    st.info("Translation dictionaries are managed in Dictionaries → Translation.")
+    if st.button("Open Translation dictionaries", key="settings_open_translation_dictionaries"):
+        st.session_state["pn_requested_view"]="📚 Dictionaries"
+        st.session_state["pn_requested_dictionary_tab"]="Translation"
+        st.rerun()
+
     # ── Data & persistence ────────────────────────────────────────────────────
     with stab3:
         # FTS5 rebuild
@@ -14761,12 +18596,12 @@ def tab_settings():
         if st.button("🔄 Rebuild FTS5 index", key="fts_rebuild"):
             with st.spinner(t("indexing_records")):
                 n_fts = fts_rebuild_all()
-            st.success(tt(f"FTS5: {n_fts} records indexovano.", f"FTS5: {n_fts} records indexed."))
+            st.success(f"FTS5: {n_fts} records indexed.")
         st.divider()
         ds1,ds2,ds3 = st.columns(3)
         if ds1.button("💾 Save all", type="primary", key="set_data_save"):
             save_settings_to_disc(s); save_prompts(s)
-            st.success(tt(f"Saved → `{SETTINGS_FILE}` + `{PROMPTS_FILE}`", f"Saved → `{SETTINGS_FILE}` + `{PROMPTS_FILE}`"))
+            st.success(tt(f"Saved → `{user_paths.settings}` + `{user_paths.prompts}`", f"Saved → `{user_paths.settings}` + `{user_paths.prompts}`"))
         if ds2.button("📂 Load from disc", key="set_data_load"):
             st.session_state["paleon_settings"] = load_settings_from_disc()
             st.success(tt("Loaded.", "Loaded.")); st.rerun()
@@ -14776,9 +18611,9 @@ def tab_settings():
 
         st.divider()
         st.subheader(t("db_sub"))
-        if DB_FILE.exists():
-            size_mb = DB_FILE.stat().st_size / 1024 / 1024
-            st.caption(f"`{DB_FILE}`  —  {size_mb:.2f} MB")
+        if user_paths.db.exists():
+            size_mb = user_paths.db.stat().st_size / 1024 / 1024
+            st.caption(f"`{user_paths.db}`  —  {size_mb:.2f} MB")
         con = db()
         nd = con.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
         nc = con.execute("SELECT COUNT(*) FROM taxon_candidates").fetchone()[0]
@@ -14788,32 +18623,37 @@ def tab_settings():
         dc1.metric("Documents", nd)
         dc2.metric("Candidates", nc)
         dc3.metric("Saved fields", nf)
+        integrity = database_integrity_report()
+        if integrity["ok"]:
+            st.caption(f"✅ Database integrity OK · schema v{integrity['schema_version']}")
+        else:
+            st.error(f"Database integrity problem: {integrity}")
 
         st.divider()
         st.subheader(t("backup_sub"))
         st.caption(
-            "Export/import the ENTIRE file `paleon.db` (Documents, candidates, fields) by one click. Settings (settings.json) and schema is backed up separately above.")
+            "Export/import the active user's complete SQLite database. "
+            "A restore is validated and the current database is backed up automatically.")
+        active_paths = current_user_paths()
+        active_db_file = active_paths.db
 
         bk1, bk2 = st.columns(2)
         with bk1:
             st.markdown("**Export**")
-            if DB_FILE.exists():
+            if active_db_file.exists():
                 try:
-                    # WAL checkpoint zajistí, že jsou v hlavním fileu
-                    # propsané i nejnovější zápisy, které by jinak mohly
-                    # zustat jen v -wal fileu.
                     con = db()
                     con.execute("PRAGMA wal_checkpoint(FULL)")
                     con.close()
-                    db_bytes = DB_FILE.read_bytes()
+                    db_bytes = active_db_file.read_bytes()
                     st.download_button(
                         "📥 Download backup (.db)",
                         data=db_bytes,
-                        file_name=f"paleon_backup_{datetime.now().strftime('%Y%m%d_%H%M')}.db",
+                        file_name=f"paleon_{_current_username()}_{datetime.now().strftime('%Y%m%d_%H%M')}.db",
                         mime="application/octet-stream",
                         key="db_backup_download")
                 except Exception as exc:
-                    st.error(tt(f"Failed to prepare backup: {exc}", f"Failed to prepare backup: {exc}"))
+                    st.error(f"Failed to prepare backup: {exc}")
             else:
                 st.caption(t("db_not_exist"))
 
@@ -14822,8 +18662,7 @@ def tab_settings():
             restore_file = st.file_uploader(
                 "Upload backup (.db)", type=["db"], key="db_restore_upload")
             if restore_file is not None:
-                st.warning(
-                    "⚠ Restore PREPISE celou aktualni databazi. Doporuceno nejprve stahnout zalohu aktualniho stavu (vlevo).")
+                st.warning("⚠ Restore overwrites the active user's database after validation.")
                 if st.button(t("restore_db_btn"), key="db_restore_confirm_btn"):
                     st.session_state["db_confirm_restore"] = True
 
@@ -14831,20 +18670,34 @@ def tab_settings():
                 st.error(t("restore_confirm_warn"))
                 ry, rn = st.columns(2)
                 if ry.button("✅ Yes, overwrite", key="db_restore_yes", type="primary"):
+                    temp_restore = active_db_file.with_suffix(".restore.tmp")
+                    auto_backup = active_db_file.with_name(
+                        f"paleon_pre_restore_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db")
                     try:
-                        BASE_DIR.mkdir(parents=True, exist_ok=True)
-                        DB_FILE.write_bytes(restore_file.getbuffer())
-                        # Zahodit stopy WAL ze staré databáze, ať SQLite
-                        # nezkouší replayovat žurnál patřící jinému fileu.
+                        temp_restore.write_bytes(restore_file.getbuffer())
+                        test_con = sqlite3.connect(str(temp_restore), timeout=10.0)
+                        quick = test_con.execute("PRAGMA quick_check").fetchone()[0]
+                        tables = {r[0] for r in test_con.execute(
+                            "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+                        test_con.close()
+                        required = {"documents", "pages", "taxon_candidates", "occurrence_fields"}
+                        if quick != "ok" or not required.issubset(tables):
+                            missing = sorted(required - tables)
+                            raise ValueError(f"Invalid PaleoN database; quick_check={quick}, missing={missing}")
+                        if active_db_file.exists():
+                            shutil.copy2(active_db_file, auto_backup)
                         for suffix in ("-wal", "-shm"):
-                            side = pathlib.Path(str(DB_FILE) + suffix)
+                            side = pathlib.Path(str(active_db_file) + suffix)
                             if side.exists():
                                 side.unlink()
+                        os.replace(temp_restore, active_db_file)
                         st.session_state.pop("db_confirm_restore", None)
-                        st.success(t("db_restored"))
+                        st.success(f"{t('db_restored')} Safety copy: {auto_backup.name}")
                         st.rerun()
                     except Exception as exc:
-                        st.error(f"Restore selhala: {exc}")
+                        if temp_restore.exists():
+                            temp_restore.unlink()
+                        st.error(f"Restore failed: {exc}")
                 if rn.button("❌ Cancel", key="db_restore_no"):
                     st.session_state.pop("db_confirm_restore", None)
                     st.rerun()
@@ -14853,13 +18706,14 @@ def tab_settings():
         files_info = [
             {"File": str(f), "Exists": "✅" if f.exists() else "❌",
              "Size": f"{f.stat().st_size/1024:.1f} KB" if f.exists() else "–"}
-            for f in [SETTINGS_FILE, PROMPTS_FILE, SCHEMA_FILE, DB_FILE]
+            for f in [active_paths.settings, active_paths.prompts, active_paths.schema, active_paths.db]
         ]
         st.dataframe(pd.DataFrame(files_info), use_container_width=True,
                      hide_index=True)
 
     # ── Kvalita dat ──────────────────────────────────────────────────────────
     with stab4:
+        render_internal_health_panel()
         st.subheader(t("fuzzy_dup_sub"))
         st.caption(
             "It finds pairs of candidates with similar but not identical taxon names (typically a minor typo or OCR error in the taxon name in another paper). Exact matches are not displayed—these are expected repeated occurrences of the same taxon and do not constitute a problem.")
@@ -14926,13 +18780,13 @@ def tab_settings():
                 st.caption(
                     "💡 Make the correction manually in the Editor for the specific record (AUTHOR field)—automatic correction could corrupt correctly spelled names.")
 
-    # ── Gold Set Evaluátor ───────────────────────────────────────────────────
+    # ── Gold Set Evaluator ───────────────────────────────────────────────────
     with stab5:
         st.subheader(t("gold_set_sub"))
         st.caption(
             "Upload gold set DOCX (format: `Record N -- genus/species TaxonName` or `Record N TaxonName`), pair it with the Documentem in the library a run the benchmark. The evaluator compares PaleoN detection with the gold standard.")
 
-        # ── Nahrání gold set DOCX ───────────────────────────────────────────
+        # ── Nahrani gold set DOCX ───────────────────────────────────────────
         gs_col1, gs_col2 = st.columns([3, 2])
         with gs_col1:
             st.markdown(t("upload_gold_docx"))
@@ -14946,7 +18800,7 @@ def tab_settings():
                 tmp_path.write_bytes(gs_upload.read())
                 try:
                     preview_recs = parse_goldset_docx(str(tmp_path))
-                    st.success(tt(f"Parsed {len(preview_recs)} records z DOCX.", f"Parsed {len(preview_recs)} records from DOCX."))
+                    st.success(f"Parsed {len(preview_recs)} records from DOCX.")
                     prev_df = pd.DataFrame([{
                         "#": r["n"], "Taxon": r["taxon_name"],
                         "Rank": r.get("rank",""),
@@ -14993,7 +18847,7 @@ def tab_settings():
 
         st.divider()
 
-        # ── Výběr saveeného gold setu a spuštění benchmarku ─────────────────
+        # ── Vyber saveeneho gold setu and spusteni benchmarku ─────────────────
         if existing_gs:
             st.markdown(t("gold_sets_saved_hdr"))
             gs_options = {
@@ -15007,7 +18861,7 @@ def tab_settings():
 
             run_col, del_col = st.columns([3, 1])
             run_btn = run_col.button(
-                "▶️ Spustit benchmark", key="gs_run_btn", type="primary",
+                "▶️ Run benchmark", key="gs_run_btn", type="primary",
                 disabled=not (sel_gs and sel_gs["linked_document_id"]))
             if del_col.button("🗑️ Delete gold set", key="gs_del_btn"):
                 if sel_gs:
@@ -15023,24 +18877,48 @@ def tab_settings():
                 with st.spinner(t("run_benchmark")):
                     results = evaluate_goldset(
                         sel_gs["id"], sel_gs["linked_document_id"])
+                metrics = calculate_benchmark_metrics(results, sel_gs["linked_document_id"])
+                run_id = save_benchmark_run(sel_gs["id"], sel_gs["linked_document_id"], metrics)
                 st.session_state["gs_results"] = results
+                st.session_state["gs_metrics"] = metrics
                 st.session_state["gs_results_meta"] = {
                     "gs_name": sel_gs["filename"],
+                    "gs_id": sel_gs["id"],
                     "doc_id": sel_gs["linked_document_id"],
+                    "run_id": run_id,
                 }
 
-        # ── Zobrazení výsledku ───────────────────────────────────────────────
+        # ── Zobrazeni vysledku ───────────────────────────────────────────────
         results = st.session_state.get("gs_results", [])
         if results:
             meta = st.session_state.get("gs_results_meta", {})
-            n_total = len(results)
-            n_det   = sum(1 for r in results if r.detected)
-            n_cont  = sum(1 for r in results if r.block_contains_gold)
+            metrics = st.session_state.get("gs_metrics")
+            if metrics is None:
+                metrics = calculate_benchmark_metrics(results, meta.get("doc_id"))
+            n_total = metrics.gold_records
+            n_det = metrics.true_positives
             n_short = sum(1 for r in results if r.block_too_short)
-            n_long  = sum(1 for r in results if r.block_too_long)
-            recall  = n_det / n_total if n_total else 0
+            n_long = sum(1 for r in results if r.block_too_long)
+            field_acc = metrics.per_field_accuracy
 
-            # Přesnost fields
+            # Detection metrics
+            mc1, mc2, mc3, mc4 = st.columns(4)
+            mc1.metric("Precision", f"{metrics.precision:.1%}",
+                       delta=f"TP {metrics.true_positives} / FP {metrics.false_positives}")
+            mc2.metric("Recall", f"{metrics.recall:.1%}",
+                       delta=f"TP {metrics.true_positives} / FN {metrics.false_negatives}")
+            mc3.metric("F1", f"{metrics.f1:.1%}")
+            mc4.metric("Candidates / gold", f"{metrics.detected_candidates} / {metrics.gold_records}")
+
+            # Boundary and field metrics
+            mb1, mb2, mb3, mb4 = st.columns(4)
+            mb1.metric("Boundary accuracy", f"{metrics.boundary_accuracy:.1%}")
+            mb2.metric("Mean block similarity", f"{metrics.mean_block_similarity:.1%}")
+            mb3.metric("Field micro accuracy", f"{metrics.field_micro_accuracy:.1%}")
+            mb4.metric("Field macro accuracy", f"{metrics.field_macro_accuracy:.1%}")
+            st.caption(f"Benchmark run ID: {meta.get('run_id', 'unsaved')} · Too short: {n_short} · Too long: {n_long}")
+
+            # Presnost fields
             all_fields_gs: List[str] = []
             for r in results:
                 for k in r.field_results:
@@ -15051,16 +18929,7 @@ def tab_settings():
                 vals = [r.field_results[f] for r in results if f in r.field_results]
                 field_acc[f] = sum(vals)/len(vals) if vals else 0.0
 
-            # Metriky
-            mc1, mc2, mc3, mc4, mc5 = st.columns(5)
-            mc1.metric("Records gold setu", n_total)
-            mc2.metric("Recall detekce", f"{recall:.0%}",
-                       delta=f"{n_det}/{n_total}")
-            mc3.metric("Blok OK (obsahuje text)", n_cont)
-            mc4.metric("⚠ Block is too short", n_short)
-            mc5.metric("⚠ Block is too long", n_long)
-
-            # Přesnost fields
+            # Presnost fields
             with st.expander(t("mapping_accuracy"), expanded=True):
                 field_df = pd.DataFrame([
                     {"Pole": f,
@@ -15081,7 +18950,7 @@ def tab_settings():
                         f"**{icon} #{r.gold_n} {r.gold_name}** "
                         f"[{r.gold_rank or '?'}]  →  "
                         f"{'`' + (r.matched_name or '') + '`' if r.detected else '*nenalezeno*'}  "
-                        f"shoda: {r.name_score:.2f}")
+                        f"name: {r.name_score:.2f} · block: {r.block_similarity:.2f}")
                     if r.detected:
                         flags = []
                         if r.block_too_short: flags.append("⚠️ block too short")
@@ -15093,8 +18962,25 @@ def tab_settings():
                             field_summary = "  ".join(
                                 f"{'✅' if ok else '❌'} {lbl}"
                                 for lbl, ok in r.field_results.items())
-                            st.caption(f"Pole: {field_summary}")
+                            st.caption(f"Fields: {field_summary}")
                     st.markdown("---")
+
+            # Benchmark history
+            gs_id = meta.get("gs_id")
+            if gs_id:
+                history = get_benchmark_history(gs_id)
+                if history:
+                    with st.expander("📈 Benchmark history", expanded=False):
+                        hist_df = pd.DataFrame([{
+                            "Run": h["id"], "Date": h["created_at"],
+                            "Parser": h["parser_version"],
+                            "Precision": h["metrics"].get("precision", 0),
+                            "Recall": h["metrics"].get("recall", 0),
+                            "F1": h["metrics"].get("f1", 0),
+                            "Boundary": h["metrics"].get("boundary_accuracy", 0),
+                            "Field micro": h["metrics"].get("field_micro_accuracy", 0),
+                        } for h in history])
+                        st.dataframe(hist_df, use_container_width=True, hide_index=True)
 
             # Export
             con = db()
@@ -15105,7 +18991,7 @@ def tab_settings():
             doc_name = doc_name_r["filename"] if doc_name_r else "unknown"
 
             xlsx_bytes = export_goldset_report_xlsx(
-                results, meta.get("gs_name", ""), doc_name)
+                results, meta.get("gs_name", ""), doc_name, metrics)
             st.download_button(
                 "📥 Download benchmark report (XLSX)",
                 data=xlsx_bytes,
@@ -15121,12 +19007,12 @@ def tab_settings():
 # ══════════════════════════════════════════════════════════════════════════════
 
 
-    # ── Uživatelé ─────────────────────────────────────────────────────────────
+    # ── Uzivatele ─────────────────────────────────────────────────────────────
     with stab_users:
         st.subheader(t("user_mgmt_sub"))
         _cur = st.session_state.get("pn_user", "")
 
-        # ── Admin přihlášení ──────────────────────────────────────────────────
+        # ── Admin prihlaseni ──────────────────────────────────────────────────
         if not st.session_state.get("admin_auth"):
             st.info(t("admin_required"))
             ap1, ap2 = st.columns([3, 1])
@@ -15147,7 +19033,7 @@ def tab_settings():
 
         st.divider()
 
-        # ── Seznam uživatelu ──────────────────────────────────────────────────
+        # ── List uzivatelu ──────────────────────────────────────────────────
         all_users = _get_all_users()
         st.markdown(tt(f"**Total users: {len(all_users)}**", f"**Total users: {len(all_users)}**"))
 
@@ -15158,7 +19044,7 @@ def tab_settings():
             has_pw = bool(usr["password_hash"])
             udir   = USERS_DIR / _sanitize_username(uname)
 
-            # Počet documents v DB
+            # Pocet documents in DB
             n_docs = 0
             udb = udir / "paleon.db"
             if udb.exists():
@@ -15179,7 +19065,7 @@ def tab_settings():
                 uc2.markdown(f"**Naposledy:** {(usr['last_seen'] or '')[:10]}")
                 uc3.markdown(f"**Admin:** {'Yes' if is_adm else 'No'}")
 
-                # Nastavit / změnit heslo
+                # Nastavit / zmenit heslo
                 with st.expander("🔑 Heslo", expanded=False):
                     new_pw = st.text_input(
                         "Now password (empty = without hesla)",
@@ -15206,7 +19092,7 @@ def tab_settings():
                         _uc3.commit(); _uc3.close()
                         st.rerun()
 
-                # Slovníky pro tohoto uživatele
+                # Slovniky for tohoto user
                 with st.expander(t("dicts_expander"), expanded=False):
                     for dict_file, dict_label in [
                         ("section_schema.tsv", "Schema"),
@@ -15222,7 +19108,7 @@ def tab_settings():
                             f"{'✅' if exists else '❌'} {dict_label} "
                             f"({'exists' if exists else 'missing'})")
                         if dc2.button("↺ From system", key=f"sys_{uname}_{dict_file}",
-                                      help="Prepise slovnik verze ze system/"):
+                                      help="Overwrites the user dictionary with the version from system/."):
                             ok = _copy_system_dict_to_user(uname, dict_file)
                             st.success(tt(f"{dict_label} copied.", f"{dict_label} copied.") if ok else tt("System dictionary not found.", "System dictionary not found."))
                             st.rerun()
@@ -15233,7 +19119,7 @@ def tab_settings():
                                 data=df_path.read_bytes(),
                                 file_name=dict_file, key=f"dlb_{uname}_{dict_file}")
 
-                # Delete uživatele
+                # Delete user
                 if uname != _cur:
                     st.divider()
                     del_key = f"confirm_del_{uname}"
@@ -15243,9 +19129,9 @@ def tab_settings():
                             st.session_state[del_key] = True
                             st.rerun()
                     else:
-                        st.warning(tt(f"⚠️ Opravdu smazat **{uname}** and all their data?", f"⚠️ Really delete **{uname}** and all their data?"))
+                        st.warning(f"⚠️ Really delete **{uname}** and all their data?")
                         c1, c2 = st.columns(2)
-                        if c1.button("Yes, smazat", type="primary", key=f"del_yes_{uname}"):
+                        if c1.button("Yes, delete", type="primary", key=f"del_yes_{uname}"):
                             _delete_user(uname)
                             st.session_state.pop(del_key, None)
                             st.success(tt(f"User {uname} deleted.", f"User {uname} deleted."))
@@ -15256,7 +19142,7 @@ def tab_settings():
 
         st.divider()
 
-        # ── Vytvořit nového uživatele (admin panel) ───────────────────────────
+        # ── Vytvorit noveho user (admin panel) ───────────────────────────
         st.subheader(t("add_user_sub"))
         na1, na2, na3 = st.columns([2, 2, 2])
         adm_new_name = na1.text_input("Username", key="adm_new_name")
@@ -15305,7 +19191,7 @@ def tab_settings():
 
 
 
-    # ── Duplikáty napříč Documenty ────────────────────────────────────────────
+    # ── Duplikaty napric Documenty ────────────────────────────────────────────
     with stab_dup:
         st.subheader(t("similar_taxa_sub"))
         st.caption(
@@ -15347,7 +19233,7 @@ def tab_settings():
                             f"📄 {pair['doc_a']}, str.{pair['page_a']}\n"
                             f"Status: {pair['status_a']}")
                     st.markdown(_mda)
-                    # Ukázka fields A
+                    # Ukazka fields And
                     _fa = get_candidate_fields(pair["id_a"])
                     for fn in ["DIAGNOSIS","LOCALITY","STRATIGRAPHY","TYPE SPECIMENS"]:
                         if _fa.get(fn):
@@ -15374,20 +19260,20 @@ def tab_settings():
                                help="Copies missing field from B to A"):
                     n = merge_candidate_fields(pair["id_a"], pair["id_b"],
                                               overwrite=False)
-                    st.success(tt(f"Copied {n} fields do A.", f"Copied {n} fields to A."))
+                    st.success(f"Copied {n} fields to A.")
                     st.rerun()
 
                 if act2.button("B ← A (doplnit)", key=f"merge_ba_{idx_p}",
                                help="Copies missing field from A to B"):
                     n = merge_candidate_fields(pair["id_b"], pair["id_a"],
                                               overwrite=False)
-                    st.success(tt(f"Copied {n} fields do B.", f"Copied {n} fields to B."))
+                    st.success(f"Copied {n} fields to B.")
                     st.rerun()
 
                 if act3.button("🔗 Synonyma", key=f"link_syn_{idx_p}",
                                help="Connects records as synonyms (RELATED_RECORD_ID)"):
                     link_as_synonym(pair["id_a"], pair["id_b"])
-                    st.success(tt("Records propojeny jako synonyma.", "Records linked as synonyms."))
+                    st.success("Records linked as synonyms.")
                     st.rerun()
 
                 if act4.button("✏️ Editor →", key=f"dup_edit_{idx_p}",
@@ -15422,7 +19308,7 @@ def _show_user_selection() -> None:
 
     if users:
         st.markdown(t("select_user_md"))
-        # Grid tlačítek — max 4 per row
+        # Grid tlacitek — max 4 per row
         cols_per_row = 4
         for row_start in range(0, len(users), cols_per_row):
             row_users = users[row_start:row_start+cols_per_row]
@@ -15434,14 +19320,14 @@ def _show_user_selection() -> None:
                         f"{user['display_name'] or user['username']}")
                     if col.button(label, key=f"sel_{user['username']}",
                                   use_container_width=True):
-                        # Zkontrolovat heslo (pokud uživatel má)
+                        # Zkontrolovat heslo (if user ma)
                         if user["password_hash"]:
                             st.session_state["pn_pending_user"] = user["username"]
                         else:
                             _switch_user(user["username"])
                             st.rerun()
 
-    # Zadání hesla pro uživatele s heslem
+    # Zadani hesla for user s heslem
     pending = st.session_state.get("pn_pending_user", "")
     if pending:
         st.divider()
@@ -15470,7 +19356,7 @@ def _show_user_selection() -> None:
 
     st.divider()
 
-    # Vytvoření nového účtu
+    # Vytvoreni noveho uctu
     with st.expander(t("new_user_expander"), expanded=not users):
         st.caption(t("unique_username"))
         nc1, nc2 = st.columns(2)
@@ -15502,6 +19388,73 @@ def _show_user_selection() -> None:
                     st.error(tt("User s timto jmenem jiz exists.", "A user with this name already exists."))
 
 
+def tab_taxon_workspace() -> None:
+    """Single-taxon working surface; batch-oriented screens remain available separately."""
+    st.markdown("### 🧭 Taxon Workspace")
+    st.caption("One working screen for record status, quality, block, fields, morphology, stratigraphy and source context.")
+    con=db()
+    rows=con.execute("""
+      SELECT c.id,c.taxon_name,c.rank_guess,c.status,c.page_start,c.document_id,d.filename
+      FROM taxon_candidates c JOIN documents d ON d.id=c.document_id
+      WHERE c.status IN ('approved','needs_review','pending','low_confidence')
+      ORDER BY c.taxon_name COLLATE NOCASE,d.filename,c.page_start
+    """).fetchall(); con.close()
+    if not rows:
+        st.info("No taxon records are available for the workspace."); return
+    search=st.text_input("Find taxon",key="workspace_search",placeholder="Type part of a taxon name…")
+    visible=[r for r in rows if not search or _norm_search(search) in _norm_search(r["taxon_name"])]
+    if not visible:
+        st.info("No taxon record matches the current search."); return
+    ids=[r["id"] for r in visible]
+    selected=st.selectbox("Taxon record",ids,key="workspace_candidate",format_func=lambda cid: next(f"{r['taxon_name']} · {r['rank_guess'] or '?'} · {r['filename']} p. {r['page_start']}" for r in visible if r['id']==cid))
+    cand=get_candidate(int(selected)); fields=get_candidate_fields(int(selected)); _ux_set_current_candidate(int(selected))
+    h1,h2,h3,h4=st.columns([3,1,1,1])
+    h1.markdown(f"#### *{cand.get('taxon_name','?')}*  \n{cand.get('rank_guess','?')} · {next(r['filename'] for r in visible if r['id']==selected)} · p. {cand.get('page_start','?')}")
+    status_options=['pending','needs_review','approved','rejected']
+    current=cand.get('status') if cand.get('status') in status_options else 'pending'
+    new_status=h2.selectbox("Status",status_options,index=status_options.index(current),key=f"workspace_status_{selected}")
+    if h3.button("Save status",key=f"workspace_status_save_{selected}"):
+        _ux_snapshot_statuses([int(selected)]); _batch_update_status([int(selected)],new_status); st.success("Status saved."); st.rerun()
+    _ux_render_save_state(int(selected))
+    with h4: _ux_render_quality_panel(int(selected))
+    tabs=st.tabs(["Overview","Block","Fields","Morphology","Stratigraphy","Source"])
+    with tabs[0]:
+        score,items=_ux_quality_items(int(selected)); st.metric("Record quality",f"{score}%")
+        c1,c2,c3=st.columns(3); c1.metric("Filled fields",sum(1 for v in fields.values() if v and v!=NOT_PROVIDED)); c2.metric("Status",cand.get('status','?')); c3.metric("Confidence",f"{float(cand.get('confidence') or 0):.2f}")
+        for state,text in items: st.write({"ok":"✅","warn":"⚠️","bad":"❌"}[state],text)
+    with tabs[1]:
+        block_value=cand.get('manual_block_text') or cand.get('block_text') or ''
+        edited_block=st.text_area("Taxonomic block",value=block_value,height=430,key=f"workspace_block_{selected}")
+        if st.button("💾 Save block",type="primary",key=f"workspace_block_save_{selected}"):
+            _ux_snapshot_block(int(selected)); save_manual_block(int(selected),edited_block); st.success("Block saved."); st.rerun()
+    with tabs[2]:
+        fdf=pd.DataFrame([{"Field":name,"Value":fields.get(name,"")} for name in SECTION_FIELDS])
+        fed=st.data_editor(fdf,use_container_width=True,hide_index=True,disabled=["Field"],height=520,key=f"workspace_fields_{selected}")
+        if st.button("💾 Save fields",type="primary",key=f"workspace_fields_save_{selected}"):
+            st.session_state["ux_save_state"]="saving"
+            save_fields(int(selected),{str(r['Field']):str(r['Value'] or '') for _,r in fed.iterrows()},method="workspace_manual")
+            st.session_state["ux_save_state"]="saved"; st.session_state["ux_saved_at"]=datetime.now().isoformat(timespec='seconds'); st.success("Fields saved."); st.rerun()
+        render_field_move_tool(int(selected), "workspace_field_move")
+    con=db(); terms=con.execute("SELECT term_type,canonical,category,source_field FROM term_matches WHERE candidate_id=? ORDER BY term_type,category,canonical",(int(selected),)).fetchall(); con.close()
+    with tabs[3]:
+        morph = [dict(r) for r in terms if r["term_type"] == "morphology"]
+        if morph:
+            st.dataframe(pd.DataFrame(morph), use_container_width=True, hide_index=True)
+        else:
+            st.info("No indexed morphology terms for this record.")
+    with tabs[4]:
+        strat = [dict(r) for r in terms if r["term_type"] == "stratigraphy"]
+        if strat:
+            st.dataframe(pd.DataFrame(strat), use_container_width=True, hide_index=True)
+        else:
+            st.info("No indexed stratigraphy terms for this record.")
+    with tabs[5]:
+        st.caption(f"Source record · page {cand.get('page_start','?')}")
+        _show_pdf_page_inline(int(cand.get('document_id')),int(cand.get('page_start') or 1),key=f"workspace_pdf_{selected}")
+        st.text_area("Context before",value=cand.get('context_before') or '',height=120,disabled=True,key=f"workspace_before_{selected}")
+        st.text_area("Context after",value=cand.get('context_after') or '',height=120,disabled=True,key=f"workspace_after_{selected}")
+
+
 def main():
     if st is None:
         print("Streamlit is not installed. Run: pip install streamlit")
@@ -15521,7 +19474,7 @@ def main():
         return
 
     s = get_settings()
-    # ── Auto-detekce LM Studio (jednou za sezení) ────────────────────────────
+    # ── Auto-detection LM Studio (jednou za sezeni) ────────────────────────────
     if "lm_studio_detected" not in st.session_state:
         try:
             _detected_models = lm_models(s)
@@ -15542,8 +19495,9 @@ def main():
     st.session_state["app_lang"] = "en"
     inject_css(s.get("theme", "dark"))
     init_db()
+    _pc_init_schema()
 
-    # Auto-kopírovat schema TSV z aktuálního adresáře při prvním spuštění
+    # Auto-kopirovat schema TSV from aktualniho adresare when prvnim spusteni
     if not SCHEMA_FILE.exists():
         import shutil
         for candidate in [
@@ -15555,7 +19509,7 @@ def main():
                 shutil.copy(str(candidate), str(SCHEMA_FILE))
                 break
 
-    # Auto-kopírovat gazetteer (seznam známých taxa) z aktuálního adresáře
+    # Auto-kopirovat gazetteer (list znamych taxa) from aktualniho adresare
     if not GAZETTEER_FILE.exists():
         import shutil
         for candidate in [
@@ -15567,7 +19521,7 @@ def main():
                 shutil.copy(str(candidate), str(GAZETTEER_FILE))
                 break
 
-    # Auto-kopírovat morfologické a stratigrafické termíny
+    # Auto-kopirovat morfologicke and stratigraficke terms
     if not MORPHOLOGY_FILE.exists():
         import shutil
         candidate = pathlib.Path("paleon_morphology_terms.tsv")
@@ -15582,32 +19536,1495 @@ def main():
             shutil.copy(str(candidate), str(STRATIGRAPHY_FILE))
 
     sidebar_ui()
+    _pc_render_task_centre(compact=True)
+    if _render_completion_gate():
+        return
+    _pc_render_onboarding()
 
-    # ── Starý globální session-state chunk recompute deaktivován ───────────────
-    # Přecount termínu nyní běží přímo v Morpho/Strat přes progress_callback.
+    # ── Old globalni session-state chunk recompute deaktivovan ───────────────
+    # Precount terminu nyni bezi primo in Morpho/Strat pres progress_callback.
     st.session_state.pop("terms_recompute_ids", None)
     st.session_state.pop("terms_recompute_done", None)
 
-    tabs = st.tabs([
-        t("tab_library"),
-        t("tab_review"),
-        "🧩 Block Editor",
-        t("tab_editor"),
-        t("tab_dossier"),
-        t("tab_morpho"),
-        t("tab_export"),
-        t("tab_settings"),
-    ])
-    with tabs[0]: tab_library()
-    with tabs[1]: tab_review()
-    with tabs[2]: tab_block_editor()
-    with tabs[3]: tab_editor()
-    with tabs[4]: tab_taxon_dossier()
-    with tabs[5]: tab_morphostrat_dossier()
-    with tabs[6]: tab_export()
-    with tabs[7]: tab_settings()
+    # Mode-aware navigation: daily workflow stays small; curator/expert tools appear on demand.
+    _mode = get_settings().get("ui_mode", "Basic")
+    _all_views = {
+        t("tab_library"): tab_library,
+        t("tab_review"): tab_review,
+        "🧩 Block Editor": tab_block_editor,
+        t("tab_editor"): tab_editor,
+        "🧭 Taxon Workspace": tab_taxon_workspace,
+        t("tab_dossier"): tab_taxon_dossier,
+        t("tab_morphology"): tab_morphology_dossier,
+        t("tab_stratigraphy"): tab_stratigraphy_dossier,
+        "📚 Dictionaries": tab_dictionaries,
+        "🛠️ Tools": tab_tools,
+        t("tab_export"): tab_export,
+        t("tab_settings"): tab_settings,
+    }
+    _mode_names = {
+        "Basic": [t("tab_library"),t("tab_review"),"🧭 Taxon Workspace",t("tab_editor"),t("tab_dossier"),t("tab_morphology"),t("tab_stratigraphy"),t("tab_export")],
+        "Curator": [t("tab_library"),t("tab_review"),"🧩 Block Editor","🧭 Taxon Workspace",t("tab_editor"),t("tab_dossier"),t("tab_morphology"),t("tab_stratigraphy"),"📚 Dictionaries","🛠️ Tools",t("tab_export")],
+        "Expert": list(_all_views.keys()),
+    }
+    nav_items = _mode_names.get(_mode, _mode_names["Basic"])
+    requested = st.session_state.pop("pn_requested_view", None)
+    if requested in _all_views and requested not in nav_items:
+        st.warning(f"{requested} is hidden in {_mode} mode. Switch to Curator or Expert mode in the sidebar.")
+    elif requested in nav_items:
+        st.session_state["pn_main_view"] = requested
+    if st.session_state.get("pn_main_view") not in nav_items:
+        st.session_state["pn_main_view"] = nav_items[0]
+    active_view = st.radio("Main section",nav_items,key="pn_main_view",horizontal=True,label_visibility="collapsed")
+    _all_views[active_view]()
 
 
+
+
+
+
+
+
+# =============================================================================
+# TASK COMPLETION GATE + LLM LANGUAGE CAPABILITY CHECK
+# =============================================================================
+
+_LANGUAGE_NAMES = {
+    "zh":"Chinese", "chi_sim":"Chinese", "chi_tra":"Chinese",
+    "ru":"Russian", "rus":"Russian", "cs":"Czech", "ces":"Czech",
+    "de":"German", "deu":"German", "fr":"French", "fra":"French",
+    "sv":"Swedish", "swe":"Swedish", "es":"Spanish", "spa":"Spanish",
+    "pl":"Polish", "pol":"Polish", "it":"Italian", "ita":"Italian",
+    "mixed":"mixed or automatically detected language",
+}
+_LANGUAGE_PROBE_SAMPLES = {
+    "Chinese":"这是一段古生物学描述。请仅回答标记。",
+    "Russian":"Это краткое палеонтологическое описание. Ответьте только меткой.",
+    "Czech":"Toto je krátký paleontologický popis. Odpovězte pouze značkou.",
+    "German":"Dies ist eine kurze paläontologische Beschreibung. Antworten Sie nur mit der Markierung.",
+    "French":"Ceci est une brève description paléontologique. Répondez uniquement avec le marqueur.",
+    "Swedish":"Detta är en kort paleontologisk beskrivning. Svara endast med markören.",
+    "Spanish":"Esta es una breve descripción paleontológica. Responda solo con la marca.",
+    "Polish":"To jest krótki opis paleontologiczny. Odpowiedz tylko znacznikiem.",
+    "Italian":"Questa è una breve descrizione paleontologica. Rispondi solo con il marcatore.",
+}
+
+def _normalize_language_code(value: str) -> str:
+    value=(value or "").strip().lower().replace("_","-")
+    return {"english":"en","eng":"en","chinese":"zh","zh-cn":"zh","zh-hans":"zh",
+            "zh-tw":"zh","zh-hant":"zh","russian":"ru","rus":"ru","czech":"cs","ces":"cs",
+            "german":"de","deu":"de","french":"fr","fra":"fr","swedish":"sv","swe":"sv",
+            "spanish":"es","spa":"es","polish":"pl","pol":"pl","italian":"it","ita":"it"}.get(value,value)
+
+
+def verify_llm_language_support(settings: Dict[str,Any], language: str, force: bool=False) -> Dict[str,Any]:
+    """Run a small comprehension probe once per model/language/session."""
+    code=_normalize_language_code(language)
+    if code in {"", "en", "en-gb", "en-us"}:
+        return {"supported":True,"language":"English","reason":"No translation probe is required."}
+    name=_LANGUAGE_NAMES.get(code, code.upper())
+    model=(settings.get("lmstudio_model") or "").strip()
+    cache_key=f"llm_language_probe::{model}::{code}"
+    if st is not None and not force and cache_key in st.session_state:
+        return st.session_state[cache_key]
+    sample=_LANGUAGE_PROBE_SAMPLES.get(name)
+    if not sample:
+        result={"supported":False,"language":name,
+                "reason":"No reliable automatic probe is available for this language. Use Expert mode or disable the language check explicitly."}
+    else:
+        system=("You are a strict language capability tester. Read the user text. "
+                "If you understand it well enough for faithful scientific translation, reply with exactly PALEON_OK. "
+                "Otherwise reply with exactly PALEON_UNSUPPORTED. Do not add other text.")
+        try:
+            raw=lm_chat(settings,system,sample,json_mode=False,task_type="language_probe")
+            token=re.sub(r"[^A-Z_]","",str(raw).upper())
+            supported="PALEON_OK" in token and "UNSUPPORTED" not in token
+            result={"supported":supported,"language":name,
+                    "reason":"Model passed the comprehension probe." if supported else "Model did not pass the comprehension probe."}
+        except Exception as exc:
+            result={"supported":False,"language":name,"reason":f"Capability probe failed: {exc}"}
+    if st is not None: st.session_state[cache_key]=result
+    return result
+
+
+def _require_llm_language_support(settings: Dict[str,Any], language: str) -> None:
+    if not settings.get("llm_verify_language_support",True): return
+    result=verify_llm_language_support(settings,language)
+    if not result.get("supported"):
+        raise RuntimeError(
+            f"The selected model has not demonstrated reliable {result.get('language','source-language')} support. "
+            f"{result.get('reason','')} Select another model, run the probe again, or disable the check in Expert settings.")
+
+
+def _set_completion_gate(title: str, message: str, details: Any=None, level: str="success") -> None:
+    if st is None:return
+    st.session_state["pn_completion_gate"]={"title":title,"message":message,"details":details,"level":level,
+        "created_at":datetime.now().isoformat(timespec="seconds")}
+
+
+def _render_completion_gate() -> bool:
+    """Return True while a completion/error acknowledgement blocks new work."""
+    gate=st.session_state.get("pn_completion_gate") if st is not None else None
+    if not gate:return False
+    with st.container(border=True):
+        icon="✅" if gate.get("level")=="success" else "⚠️"
+        st.markdown(f"## {icon} {gate.get('title','Task completed')}")
+        getattr(st,"success" if gate.get("level")=="success" else "warning")(gate.get("message",""))
+        if gate.get("details"):
+            with st.expander("Task details",expanded=False):
+                if isinstance(gate["details"],(dict,list)): st.json(gate["details"])
+                else: st.write(gate["details"])
+        st.caption("Acknowledge this result before starting another task.")
+        if st.button("Acknowledge and continue",type="primary",key="pn_completion_ack"):
+            st.session_state.pop("pn_completion_gate",None); st.rerun()
+    return True
+
+
+# =============================================================================
+# PRIORITY C UX: role modes, task centre, onboarding and extended audit
+# =============================================================================
+
+def _pc_init_schema() -> None:
+    con=db()
+    con.executescript("""
+    CREATE TABLE IF NOT EXISTS ux_audit_events (
+        id INTEGER PRIMARY KEY, created_at TEXT NOT NULL, username TEXT DEFAULT '',
+        action TEXT NOT NULL, candidate_id INTEGER DEFAULT NULL,
+        entity_type TEXT DEFAULT '', entity_id TEXT DEFAULT '',
+        before_json TEXT DEFAULT '{}', after_json TEXT DEFAULT '{}', note TEXT DEFAULT ''
+    );
+    CREATE INDEX IF NOT EXISTS idx_ux_audit_candidate ON ux_audit_events(candidate_id,created_at);
+    CREATE TABLE IF NOT EXISTS background_tasks (
+        id INTEGER PRIMARY KEY, task_type TEXT NOT NULL, label TEXT NOT NULL,
+        status TEXT DEFAULT 'queued', current_value INTEGER DEFAULT 0,
+        total_value INTEGER DEFAULT 0, error_count INTEGER DEFAULT 0,
+        detail TEXT DEFAULT '', cancel_requested INTEGER DEFAULT 0,
+        created_at TEXT NOT NULL, started_at TEXT DEFAULT NULL,
+        finished_at TEXT DEFAULT NULL, username TEXT DEFAULT ''
+    );
+    CREATE INDEX IF NOT EXISTS idx_background_tasks_status ON background_tasks(status,created_at);
+    """)
+    con.commit(); con.close()
+
+
+def _pc_audit(action: str, candidate_id: Optional[int] = None, before: Any = None,
+              after: Any = None, entity_type: str = "candidate", entity_id: Any = "", note: str = "") -> None:
+    try:
+        con=db(); con.execute("""INSERT INTO ux_audit_events
+          (created_at,username,action,candidate_id,entity_type,entity_id,before_json,after_json,note)
+          VALUES (?,?,?,?,?,?,?,?,?)""",
+          (datetime.now().isoformat(timespec="seconds"),_current_username(),action,candidate_id,
+           entity_type,str(entity_id or candidate_id or ""),json.dumps(before or {},ensure_ascii=False,default=str),
+           json.dumps(after or {},ensure_ascii=False,default=str),note[:1000]))
+        con.commit(); con.close()
+    except Exception as exc:
+        logging.debug("Audit event failed: %s",exc)
+
+
+def _pc_create_task(task_type: str, label: str, total: int = 0, detail: str = "") -> int:
+    con=db(); cur=con.execute("""INSERT INTO background_tasks
+      (task_type,label,status,total_value,detail,created_at,username) VALUES (?,?,?,?,?,?,?)""",
+      (task_type,label,"queued",int(total),detail,datetime.now().isoformat(timespec="seconds"),_current_username()))
+    con.commit(); task_id=int(cur.lastrowid); con.close(); return task_id
+
+
+def _pc_update_task(task_id: int, *, status: Optional[str] = None, current: Optional[int] = None,
+                    total: Optional[int] = None, errors: Optional[int] = None, detail: Optional[str] = None) -> None:
+    sets=[]; values=[]
+    for col,val in (("status",status),("current_value",current),("total_value",total),("error_count",errors),("detail",detail)):
+        if val is not None: sets.append(f"{col}=?"); values.append(val)
+    if status=="running": sets.append("started_at=COALESCE(started_at,?)"); values.append(datetime.now().isoformat(timespec="seconds"))
+    if status in {"completed","failed","cancelled"}: sets.append("finished_at=?"); values.append(datetime.now().isoformat(timespec="seconds"))
+    if not sets:return
+    con=db(); con.execute("UPDATE background_tasks SET "+",".join(sets)+" WHERE id=?",values+[task_id]); con.commit(); con.close()
+
+
+def _pc_task_rows(limit: int = 100) -> List[Dict[str,Any]]:
+    con=db(); rows=con.execute("SELECT * FROM background_tasks ORDER BY id DESC LIMIT ?",(limit,)).fetchall(); con.close()
+    return [dict(r) for r in rows]
+
+
+def _pc_render_task_centre(compact: bool = False) -> None:
+    rows=_pc_task_rows(30 if compact else 200)
+    active=[r for r in rows if r["status"] in {"queued","running"}]
+    if compact:
+        st.sidebar.caption(f"Tasks: {len(active)} active · {len(rows)} recent")
+        for r in active[:3]:
+            total=max(1,int(r["total_value"] or 0)); current=int(r["current_value"] or 0)
+            st.sidebar.progress(min(current/total,1.0),text=f"{r['label']} · {current}/{r['total_value'] or '?'}")
+        return
+    st.markdown("### 🧰 Task centre")
+    if not rows:
+        st.info("No recorded tasks yet. Long-running recompute, translation and maintenance operations will appear here.")
+        return
+    for r in rows:
+        with st.container(border=True):
+            c1,c2,c3=st.columns([4,1,1])
+            c1.markdown(f"**{r['label']}**  \n`{r['task_type']}` · {r['created_at']} · {r['username']}")
+            c2.markdown(f"**{r['status']}**")
+            total=int(r["total_value"] or 0); current=int(r["current_value"] or 0)
+            c3.metric("Errors",int(r["error_count"] or 0))
+            if total: st.progress(min(current/max(total,1),1.0),text=f"{current} / {total}")
+            if r["detail"]: st.caption(r["detail"])
+            if r["status"] in {"queued","running"} and st.button("Request cancel",key=f"pc_cancel_{r['id']}"):
+                con=db(); con.execute("UPDATE background_tasks SET cancel_requested=1 WHERE id=?",(r["id"],)); con.commit(); con.close(); st.rerun()
+
+
+def _pc_render_audit() -> None:
+    st.markdown("### 🧾 Change audit")
+    c1,c2,c3=st.columns([2,2,1])
+    action=c1.text_input("Filter action",key="pc_audit_action")
+    candidate=c2.number_input("Candidate ID",min_value=0,value=0,step=1,key="pc_audit_candidate")
+    limit=c3.selectbox("Rows",[50,100,250,500],index=1,key="pc_audit_limit")
+    con=db(); sql="SELECT * FROM ux_audit_events WHERE 1=1"; args=[]
+    if action: sql+=" AND action LIKE ?"; args.append(f"%{action}%")
+    if candidate: sql+=" AND candidate_id=?"; args.append(int(candidate))
+    sql+=" ORDER BY id DESC LIMIT ?"; args.append(int(limit)); rows=con.execute(sql,args).fetchall(); con.close()
+    if not rows: st.info("No matching audit events."); return
+    df=pd.DataFrame([dict(r) for r in rows])
+    st.dataframe(df[["created_at","username","action","candidate_id","entity_type","entity_id","note"]],use_container_width=True,hide_index=True)
+    selected=st.selectbox("Inspect event",[r["id"] for r in rows],key="pc_audit_event")
+    row=next(dict(r) for r in rows if r["id"]==selected)
+    d1,d2=st.columns(2)
+    with d1: st.caption("Before"); st.json(json.loads(row["before_json"] or "{}"),expanded=True)
+    with d2: st.caption("After"); st.json(json.loads(row["after_json"] or "{}"),expanded=True)
+
+
+def tab_tools() -> None:
+    st.markdown("### 🛠️ Tools")
+    mode=get_settings().get("ui_mode","Basic")
+    tabs=st.tabs(["Tasks","Audit"] + (["Health"] if mode=="Expert" else []))
+    with tabs[0]: _pc_render_task_centre(False)
+    with tabs[1]: _pc_render_audit()
+    if mode=="Expert":
+        with tabs[2]: render_internal_health_panel(); render_last_index_results()
+
+
+def _pc_render_onboarding() -> None:
+    s=get_settings()
+    show=bool(st.session_state.get("pc_show_onboarding")) or not bool(s.get("onboarding_completed",False))
+    if not show:return
+    with st.container(border=True):
+        st.markdown("## 👋 Welcome to PaleoN")
+        st.caption("A short workflow guide. You can reopen it anytime from the sidebar.")
+        step=st.radio("Workflow",["1 · Upload","2 · Review","3 · Check block","4 · Edit fields","5 · Dossiers","6 · Export"],horizontal=True,key="pc_onboarding_step")
+        guidance={
+          "1 · Upload":"Open Library, upload PDF/DOCX/TXT and choose the source language.",
+          "2 · Review":"Approve real taxon headings; reject false positives; mark uncertain records for review.",
+          "3 · Check block":"In Curator mode, use Block Editor when a record begins or ends in the wrong paragraph.",
+          "4 · Edit fields":"Record Editor auto-saves scientific fields and shows their provenance and quality.",
+          "5 · Dossiers":"Search taxa, morphology and stratigraphy across the complete user library.",
+          "6 · Export":"Export reviewed records to DOCX/XLSX or use the round-trip XLSX editor."}
+        st.info(guidance[step])
+        g1,g2,g3=st.columns([1,1,4])
+        if g1.button("Open section",type="primary",key="pc_guide_open"):
+            target={"1 · Upload":t("tab_library"),"2 · Review":t("tab_review"),"3 · Check block":"🧩 Block Editor",
+                    "4 · Edit fields":t("tab_editor"),"5 · Dossiers":t("tab_dossier"),"6 · Export":t("tab_export")}[step]
+            if target=="🧩 Block Editor" and s.get("ui_mode")=="Basic":
+                s["ui_mode"]="Curator"; save_settings_to_disc(s)
+            st.session_state["pn_requested_view"]=target; st.session_state["pc_show_onboarding"]=False; st.rerun()
+        if g2.button("Finish guide",key="pc_guide_finish"):
+            s["onboarding_completed"]=True; save_settings_to_disc(s); st.session_state["pc_show_onboarding"]=False; st.rerun()
+
+
+# =============================================================================
+# PRIORITY B UX: dictionaries, impact preview, live search and saved queries
+# =============================================================================
+
+def _pb_dictionary_path(term_type: str) -> pathlib.Path:
+    paths = current_user_paths()
+    return paths.stratigraphy if term_type == "stratigraphy" else paths.morphology
+
+
+def _pb_term_columns(term_type: str) -> List[str]:
+    return (["enabled", "term", "canonical", "category", "language", "match_mode", "source_term_en"]
+            if term_type == "stratigraphy" else
+            ["term", "canonical", "category", "language", "enabled"])
+
+
+def _pb_load_raw_terms(term_type: str) -> pd.DataFrame:
+    return _load_raw_tsv(_pb_dictionary_path(term_type), _pb_term_columns(term_type))
+
+
+def _pb_term_impact(term_type: str, term: str) -> Dict[str, Any]:
+    """Preview library impact without changing dictionaries or stored matches."""
+    term = re.sub(r"\s+", " ", str(term or "")).strip()
+    if len(term) < 2:
+        return {"occurrences": 0, "records": 0, "documents": 0, "overlaps": []}
+    fields = ["STRATIGRAPHY", "OCCURRENCE", "LOCALITY"] if term_type == "stratigraphy" else ["DESCRIPTION", "DIAGNOSIS", "REMARKS"]
+    con = db(); ph = ",".join("?" * len(fields)); pattern = f"%{term}%"
+    rows = con.execute(
+        f"""SELECT f.candidate_id,c.document_id,f.field_value
+            FROM occurrence_fields f JOIN taxon_candidates c ON c.id=f.candidate_id
+            WHERE f.field_name IN ({ph}) AND LOWER(f.field_value) LIKE LOWER(?)""",
+        fields + [pattern]).fetchall()
+    con.close()
+    occurrences = sum(str(r["field_value"] or "").casefold().count(term.casefold()) for r in rows)
+    raw = _pb_load_raw_terms(term_type)
+    overlaps = []
+    if not raw.empty and "term" in raw.columns:
+        for existing in raw["term"].astype(str):
+            if existing and existing.casefold() != term.casefold() and (
+                term.casefold() in existing.casefold() or existing.casefold() in term.casefold() or
+                difflib.SequenceMatcher(None, term.casefold(), existing.casefold()).ratio() >= .82):
+                overlaps.append(existing)
+    return {"occurrences": occurrences, "records": len({r["candidate_id"] for r in rows}),
+            "documents": len({r["document_id"] for r in rows}), "overlaps": overlaps[:8]}
+
+
+def _pb_add_term(term_type: str, term: str, canonical: str, category: str,
+                 language: str, match_mode: str = "exact") -> Dict[str, Any]:
+    term = re.sub(r"\s+", " ", str(term or "")).strip()
+    canonical = re.sub(r"\s+", " ", str(canonical or "")).strip() or term
+    if len(term) < 2:
+        return {"ok": False, "message": "Enter at least two characters."}
+    path = _pb_dictionary_path(term_type); path.parent.mkdir(parents=True, exist_ok=True)
+    cols = _pb_term_columns(term_type); df = _pb_load_raw_terms(term_type)
+    for col in cols:
+        if col not in df.columns: df[col] = ""
+    mask = df["term"].astype(str).str.strip().str.casefold() == term.casefold() if not df.empty else pd.Series([], dtype=bool)
+    if mask.any():
+        row = mask[mask].index[0]; was_disabled = str(df.at[row, "enabled"]).strip() != "1"
+        df.at[row, "enabled"] = "1"
+        df.to_csv(path, sep="\t", index=False, encoding="utf-8")
+        reload_stratigraphy_terms() if term_type == "stratigraphy" else reload_morphology_terms()
+        return {"ok": True, "created": False, "message": "Existing term enabled." if was_disabled else "Term already exists."}
+    new = {c: "" for c in cols}; new.update({"enabled":"1", "term":term, "canonical":canonical,
+                                              "category":category or "unresolved", "language":language or "mixed"})
+    if term_type == "stratigraphy":
+        new["match_mode"] = match_mode; new["source_term_en"] = canonical if language != "en" else term
+    pd.concat([df, pd.DataFrame([new])], ignore_index=True).to_csv(path, sep="\t", index=False, encoding="utf-8")
+    reload_stratigraphy_terms() if term_type == "stratigraphy" else reload_morphology_terms()
+    return {"ok": True, "created": True, "message": f"Added {term} → {canonical}."}
+
+
+def _pb_recompute_scope(scope: str, candidate_id: Optional[int] = None, document_id: Optional[int] = None) -> int:
+    if scope == "Current record" and candidate_id:
+        compute_and_save_term_matches_for_candidate(candidate_id); return 1
+    if scope == "Current document" and document_id:
+        con=db(); ids=[r["id"] for r in con.execute("SELECT id FROM taxon_candidates WHERE document_id=? AND status IN ('approved','needs_review')",(document_id,)).fetchall()]; con.close()
+        for cid in ids: compute_and_save_term_matches_for_candidate(cid)
+        return len(ids)
+    return recompute_all_term_matches(include_needs_review=True)
+
+
+def _pb_render_add_term(term_type: str, key: str, default_term: str = "",
+                        candidate_id: Optional[int] = None, document_id: Optional[int] = None) -> None:
+    with st.expander("➕ Add term with impact preview", expanded=bool(default_term)):
+        c1,c2=st.columns(2)
+        term=c1.text_input("Term as written", value=default_term, key=f"pb_term_{key}")
+        canonical=c2.text_input("Canonical term", key=f"pb_canon_{key}", placeholder="Empty = same as term")
+        c3,c4,c5=st.columns([2,1,1])
+        category=c3.text_input("Category", key=f"pb_cat_{key}", placeholder="formation, zone, muscle scar…")
+        language=c4.text_input("Language", value="en", key=f"pb_lang_{key}")
+        match=c5.selectbox("Match", ["exact","prefix","fuzzy"], key=f"pb_match_{key}", disabled=term_type!="stratigraphy")
+        impact=_pb_term_impact(term_type,term)
+        i1,i2,i3=st.columns(3); i1.metric("Occurrences",impact["occurrences"]); i2.metric("Records",impact["records"]); i3.metric("Documents",impact["documents"])
+        if impact["overlaps"]: st.warning("Possible overlaps: " + ", ".join(impact["overlaps"]))
+        scopes=[]
+        if candidate_id: scopes.append("Current record")
+        if document_id: scopes.append("Current document")
+        scopes += ["Entire library", "Save only"]
+        scope=st.selectbox("After saving", scopes, key=f"pb_scope_{key}")
+        if st.button("💾 Save term", type="primary", key=f"pb_save_{key}"):
+            result=_pb_add_term(term_type,term,canonical,category,language,match)
+            if not result["ok"]: st.error(result["message"])
+            else:
+                count=0 if scope=="Save only" else _pb_recompute_scope(scope,candidate_id,document_id)
+                st.success(result["message"] + (f" Recomputed {count} records." if scope!="Save only" else ""))
+                st.rerun()
+
+
+def _pb_live_search(term_type: str, query: str) -> pd.DataFrame:
+    query=str(query or "").strip()
+    if len(query)<2: return pd.DataFrame()
+    fields=["STRATIGRAPHY","OCCURRENCE","LOCALITY"] if term_type=="stratigraphy" else ["DESCRIPTION","DIAGNOSIS","REMARKS"]
+    con=db(); ph=",".join("?"*len(fields))
+    rows=con.execute(f"""SELECT c.id candidate_id,c.taxon_name,c.rank_guess,c.status,d.filename,c.page_start,
+        f.field_name,f.field_value FROM occurrence_fields f JOIN taxon_candidates c ON c.id=f.candidate_id
+        JOIN documents d ON d.id=c.document_id WHERE f.field_name IN ({ph}) AND LOWER(f.field_value) LIKE LOWER(?)
+        ORDER BY d.filename,c.page_start LIMIT 500""", fields+[f"%{query}%"]).fetchall(); con.close()
+    out=[]
+    for r in rows:
+        value=str(r["field_value"] or ""); pos=value.casefold().find(query.casefold()); start=max(0,pos-90); end=min(len(value),pos+len(query)+140)
+        item=dict(r); item["context"]=("…" if start else "")+value[start:end]+("…" if end<len(value) else ""); item.pop("field_value",None); out.append(item)
+    return pd.DataFrame(out)
+
+
+def _pb_saved_queries_path() -> pathlib.Path:
+    return current_user_paths().root / "saved_term_queries.json"
+
+
+def _pb_load_saved_queries() -> List[Dict[str,str]]:
+    path=_pb_saved_queries_path()
+    try: return json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
+    except Exception: return []
+
+
+def _pb_save_query(name: str, term_type: str, tokens: List[str]) -> None:
+    name=str(name or "").strip()
+    if not name: raise ValueError("Enter a query name.")
+    rows=[r for r in _pb_load_saved_queries() if not (r.get("name","").casefold()==name.casefold() and r.get("term_type")==term_type)]
+    rows.append({"name":name,"term_type":term_type,"tokens":tokens,"updated_at":datetime.now().isoformat(timespec="seconds")})
+    _pb_saved_queries_path().write_text(json.dumps(rows,ensure_ascii=False,indent=2),encoding="utf-8")
+
+
+def _translation_dictionary_validate(text: str) -> Tuple[List[Tuple[str,str]], List[str], List[str]]:
+    """Parse and validate source-term<TAB/=/>translation rows."""
+    rows: List[Tuple[str,str]]=[]; errors=[]; warnings=[]; seen: Dict[str,Tuple[str,int]]={}
+    for no,raw in enumerate((text or "").splitlines(),1):
+        line=raw.strip()
+        if not line or line.startswith("#"): continue
+        parts=re.split(r"\s*(?:\t|=|->|→)\s*",line,maxsplit=1)
+        if len(parts)!=2 or not parts[0].strip() or not parts[1].strip():
+            errors.append(f"Line {no}: expected source term + TAB/= /->/→ + English translation."); continue
+        source,target=parts[0].strip(),parts[1].strip().rstrip(" ,;")
+        if "," in source or "，" in source:
+            warnings.append(f"Line {no}: combined source key '{source}' should usually be split into separate rows.")
+        key=source.casefold()
+        if key in seen:
+            prev,prev_no=seen[key]
+            if prev==target: warnings.append(f"Line {no}: duplicate of line {prev_no}: {source}.")
+            else: errors.append(f"Line {no}: conflicting duplicate '{source}' ({prev!r} vs {target!r}).")
+            continue
+        seen[key]=(target,no); rows.append((source,target))
+    return rows,errors,warnings
+
+
+def _render_translation_dictionary_manager() -> None:
+    st.markdown("#### 🌐 Translation dictionaries")
+    st.caption("Per-user terminology dictionaries tied to a source language. UTF-8 TXT; one source term and preferred English equivalent per line.")
+    st.info("Dictionary changes affect subsequent LM Studio translations. Existing record fields remain editable and are not overwritten automatically; translate them again only when you want to apply the updated terminology.")
+    languages={"zh":"Chinese (ZH)","ru":"Russian (RU)","cs":"Czech (CS)","de":"German (DE)","fr":"French (FR)","sv":"Swedish (SV)","es":"Spanish (ES)","pl":"Polish (PL)","it":"Italian (IT)","mixed":"Mixed / shared fallback"}
+    requested=st.session_state.pop("pn_requested_dictionary_language",None)
+    default=list(languages).index(requested) if requested in languages else 0
+    lang=st.selectbox("Source language",list(languages),index=default,format_func=lambda x:languages[x],key="dict_translation_language")
+    path=_translation_glossary_path(lang)
+    current=path.read_text(encoding="utf-8",errors="replace") if path.exists() else ""
+    editor_key=f"dict_translation_text_{lang}"
+    upload_key=f"dict_translation_upload_{lang}"
+    import_key=f"dict_translation_import_signature_{lang}"
+    pending_key=f"dict_translation_pending_text_{lang}"
+    # A Streamlit widget key may only be changed before that widget is
+    # instantiated in the current run. Apply post-save normalization here,
+    # at the beginning of the next rerun, rather than inside the Save button.
+    if pending_key in st.session_state:
+        st.session_state[editor_key]=st.session_state.pop(pending_key)
+    elif editor_key not in st.session_state:
+        st.session_state[editor_key]=current
+    upload=st.file_uploader(
+        f"Upload {languages[lang]} dictionary",type=["txt"],key=upload_key,
+        help="Select a UTF-8 TXT file. Its content is loaded into the editor immediately; save it with Validate and save.")
+    if upload is not None:
+        uploaded_bytes=upload.getvalue()
+        uploaded_text=uploaded_bytes.decode("utf-8-sig",errors="replace")
+        signature=hashlib.sha256(uploaded_bytes).hexdigest()
+        if st.session_state.get(import_key)!=signature:
+            st.session_state[editor_key]=uploaded_text
+            st.session_state[import_key]=signature
+            st.success(f"Loaded `{upload.name}` into the editor. Review validation below, then click Validate and save.")
+    value=st.text_area(
+        "Dictionary entries",height=390,key=editor_key,
+        placeholder="模式种\ttype species\n壳体\tconch",
+        help="You can edit entries before saving. Supported separators: TAB, =, ->, →.")
+    rows,errors,warnings=_translation_dictionary_validate(value)
+    saved_notice_key=f"dict_translation_saved_notice_{lang}"
+    if saved_notice_key in st.session_state:
+        st.success(f"Saved {st.session_state.pop(saved_notice_key)} unique entries for {languages[lang]}.")
+    m1,m2,m3=st.columns(3);m1.metric("Valid unique entries",len(rows));m2.metric("Errors",len(errors));m3.metric("Warnings",len(warnings))
+    for msg in errors: st.error(msg)
+    for msg in warnings: st.warning(msg)
+    if rows:
+        st.dataframe(pd.DataFrame(rows,columns=["Source term","Preferred English"]),use_container_width=True,hide_index=True,height=min(36*len(rows)+38,320))
+    c1,c2,c3=st.columns([1,1,2])
+    if c1.button("💾 Validate and save",type="primary",key=f"dict_translation_save_{lang}",disabled=bool(errors)):
+        normalized="\n".join(f"{a}\t{b}" for a,b in rows)+("\n" if rows else "")
+        path.parent.mkdir(parents=True,exist_ok=True);path.write_text(normalized,encoding="utf-8")
+        # Do not mutate editor_key here: its text_area already exists in this
+        # Streamlit run. Store the normalized text under a non-widget key and
+        # apply it before text_area creation on the following rerun.
+        st.session_state[pending_key]=normalized
+        st.session_state[f"dict_translation_saved_notice_{lang}"]=len(rows)
+        st.rerun()
+    if c2.button("Remove dictionary",key=f"dict_translation_remove_{lang}",disabled=not path.exists()):
+        path.unlink(missing_ok=True);st.success("Dictionary removed.");st.rerun()
+    if path.exists():
+        c3.download_button("Download current dictionary",path.read_bytes(),file_name=f"translation_glossary_{lang}.txt",mime="text/plain",key=f"dict_translation_download_{lang}")
+    existing=sorted(x.stem.upper() for x in _translation_glossary_dir().glob("*.txt")) if _translation_glossary_dir().exists() else []
+    st.caption("Configured languages: "+(", ".join(existing) if existing else "none"))
+
+
+def tab_dictionaries() -> None:
+    st.markdown("### 📚 Dictionaries")
+    st.caption("One place for scientific and translation dictionaries. Quick-add forms in dossiers write to these same per-user files.")
+    names=["Morphology","Stratigraphy","Translation","Taxon gazetteer","Section labels","Systematic headings"]
+    requested=st.session_state.pop("pn_requested_dictionary_tab",None)
+    if requested in names:
+        st.session_state["pn_dictionary_active_tab"]=requested
+    # Streamlit tabs cannot be selected programmatically; show requested destination first when opened from Settings.
+    if requested=="Translation": names=["Translation","Morphology","Stratigraphy","Taxon gazetteer","Section labels","Systematic headings"]
+    tabs=st.tabs(names)
+    by_name=dict(zip(names,tabs))
+    for term_type,label in [("morphology","Morphology"),("stratigraphy","Stratigraphy")]:
+        with by_name[label]:
+            path=current_user_paths().morphology if term_type=="morphology" else current_user_paths().stratigraphy
+            _pb_render_add_term(term_type,f"dict_{term_type}")
+            df=_pb_load_raw_terms(term_type);cols=_pb_term_columns(term_type)
+            for col in cols:
+                if col not in df.columns:df[col]=""
+            edited=st.data_editor(df[cols],num_rows="dynamic",use_container_width=True,hide_index=True,key=f"pb_dict_{term_type}")
+            if st.button("💾 Save dictionary",type="primary",key=f"pb_dict_save_{term_type}"):
+                edited.to_csv(path,sep="	",index=False,encoding="utf-8")
+                reload_stratigraphy_terms() if term_type=="stratigraphy" else reload_morphology_terms()
+                st.success(f"Saved {len(edited)} rows.");st.rerun()
+    with by_name["Translation"]:_render_translation_dictionary_manager()
+    with by_name["Taxon gazetteer"]:
+        path=current_user_paths().gazetteer;text=path.read_text(encoding="utf-8",errors="replace") if path.exists() else ""
+        value=st.text_area("One taxon per line",value=text,height=420,key="pb_gazetteer")
+        if st.button("💾 Save gazetteer",key="pb_gaz_save"):
+            path.write_text(value,encoding="utf-8");reload_gazetteer();st.success("Gazetteer saved.")
+    with by_name["Section labels"]:
+        st.info("Section labels remain editable in Settings → Schema.")
+        if st.button("Open Settings",key="pb_open_schema"):
+            st.session_state["pn_requested_view"]=t("tab_settings");st.rerun()
+    with by_name["Systematic headings"]:
+        path=current_user_paths().systematic_sections;df=_load_raw_tsv(path,["enabled","language","heading","priority","weight","pattern","note"])
+        edited=st.data_editor(df,num_rows="dynamic",use_container_width=True,hide_index=True,key="pb_systematic")
+        if st.button("💾 Save systematic headings",key="pb_systematic_save"):
+            edited.to_csv(path,sep="	",index=False,encoding="utf-8");reload_systematic_sections();st.success("Saved.");st.rerun()
+
+
+# =============================================================================
+# PRIORITY A UX: shared taxon context, save state, undo and quality summary
+# =============================================================================
+
+def _ux_set_current_candidate(candidate_id: Optional[int]) -> None:
+    if st is None or not candidate_id:
+        return
+    cand = get_candidate(int(candidate_id))
+    if not cand:
+        return
+    st.session_state["ux_current_candidate_id"] = int(candidate_id)
+    st.session_state["ux_current_taxon_name"] = cand.get("taxon_name", "")
+    st.session_state["ux_current_document_id"] = cand.get("document_id")
+
+
+def _ux_push_undo(action: str, candidate_ids: List[int], payload: Dict[str, Any]) -> None:
+    if st is None:
+        return
+    stack = list(st.session_state.get("ux_undo_stack", []))
+    stack.append({"action": action, "candidate_ids": [int(x) for x in candidate_ids],
+                  "payload": payload, "created_at": datetime.now().isoformat(timespec="seconds")})
+    st.session_state["ux_undo_stack"] = stack[-20:]
+
+
+def _ux_snapshot_statuses(candidate_ids: List[int]) -> None:
+    if st is None or not candidate_ids:
+        return
+    con = db(); ph = ",".join("?" * len(candidate_ids))
+    rows = con.execute(f"SELECT id,status FROM taxon_candidates WHERE id IN ({ph})", candidate_ids).fetchall()
+    con.close()
+    _ux_push_undo("status", candidate_ids, {"statuses": {str(r["id"]): r["status"] for r in rows}})
+
+
+def _ux_snapshot_block(candidate_id: int) -> None:
+    if st is None:
+        return
+    cand = get_candidate(candidate_id)
+    if not cand:
+        return
+    keys = ("block_text", "manual_block_text", "active_block_source", "start_unit_id", "end_unit_id",
+            "boundary_method", "boundary_reason", "boundary_confidence", "block_version")
+    _ux_push_undo("block", [candidate_id], {"candidate": {k: cand.get(k) for k in keys}})
+
+
+def _ux_apply_last_undo() -> str:
+    if st is None:
+        return "Undo is unavailable."
+    stack = list(st.session_state.get("ux_undo_stack", []))
+    if not stack:
+        return "Nothing to undo."
+    item = stack.pop(); st.session_state["ux_undo_stack"] = stack
+    con = db()
+    try:
+        if item["action"] == "status":
+            for cid, old_status in item["payload"]["statuses"].items():
+                con.execute("UPDATE taxon_candidates SET status=? WHERE id=?", (old_status, int(cid)))
+        elif item["action"] == "block":
+            cid = int(item["candidate_ids"][0]); old = item["payload"]["candidate"]
+            cols = list(old.keys())
+            con.execute("UPDATE taxon_candidates SET " + ",".join(f"{c}=?" for c in cols) + " WHERE id=?",
+                        [old[c] for c in cols] + [cid])
+        con.commit()
+    finally:
+        con.close()
+    for cid in item["candidate_ids"]:
+        try: _fts_update_candidate(int(cid))
+        except Exception: pass
+    return f"Undid {item['action']} change."
+
+
+def _ux_render_save_state(candidate_id: Optional[int] = None) -> None:
+    if st is None:
+        return
+    state = st.session_state.get("ux_save_state", "saved")
+    saved_at = st.session_state.get("ux_saved_at", "")
+    labels = {"saved": "● Saved", "saving": "● Saving…", "unsaved": "● Unsaved changes", "error": "● Save failed"}
+    colors = {"saved": "#059669", "saving": "#2563eb", "unsaved": "#d97706", "error": "#dc2626"}
+    suffix = f" · {saved_at[-8:]}" if saved_at and state == "saved" else ""
+    st.markdown(f"<div style='text-align:right;color:{colors.get(state, '#64748b')};font-size:.82rem;font-weight:700'>"
+                f"{labels.get(state, state)}{suffix}</div>", unsafe_allow_html=True)
+
+
+def _ux_quality_items(candidate_id: int) -> Tuple[int, List[Tuple[str, str]]]:
+    cand = get_candidate(candidate_id) or {}; fields = get_candidate_fields(candidate_id)
+    comp, missing = _completeness_check(cand.get("rank_guess", ""), fields)
+    items: List[Tuple[str, str]] = []
+    items.append(("ok" if cand.get("status") == "approved" else "warn", f"Record status: {cand.get('status') or '?'}"))
+    items.append(("ok" if cand.get("boundary_method") in {"manual", "manual_units"} else "warn",
+                  f"Block boundary: {cand.get('boundary_method') or 'parser'}"))
+    items.append(("ok" if fields.get("DIAGNOSIS") or fields.get("DESCRIPTION") else "bad", "Diagnosis or description present"))
+    items.append(("ok" if fields.get("STRATIGRAPHY") else "warn", "Stratigraphy present"))
+    items.append(("ok" if not missing else "warn", "Required fields complete" if not missing else "Missing: " + ", ".join(missing[:5])))
+    score = int(round(float(comp) * 70)) + (10 if cand.get("status") == "approved" else 0) + \
+            (10 if cand.get("boundary_method") in {"manual", "manual_units"} else 0) + \
+            (10 if fields.get("STRATIGRAPHY") else 0)
+    return min(score, 100), items
+
+
+def _ux_render_quality_panel(candidate_id: int) -> None:
+    score, items = _ux_quality_items(candidate_id)
+    with st.expander(f"Record quality · {score}%", expanded=False):
+        st.progress(score / 100.0)
+        icons = {"ok": "✅", "warn": "⚠️", "bad": "❌"}
+        for state, text in items:
+            st.markdown(f"{icons[state]} {text}")
+
+
+def _ux_render_current_context(active_view: str = "") -> None:
+    """Deprecated no-op: the global Current taxon strip was intentionally removed."""
+    return
+
+
+def _clear_session_keys(*keys: str) -> None:
+    """Clear a group of search/filter widgets safely before Streamlit renders them."""
+    for key in keys:
+        st.session_state.pop(key, None)
+
+
+# =============================================================================
+# OPTIMIZED TAXON DOSSIER + MORPHOLOGY/STRATIGRAPHY GUI (2026-07)
+# =============================================================================
+
+STRATIGRAPHY_HIERARCHY_FILENAME = "stratigraphy_hierarchy.tsv"
+_DOSSIER_GROUPS = {
+    "Description": ["DIAGNOSIS", "DESCRIPTION", "SIZE", "ETYMOLOGY"],
+    "Taxonomy": ["TAXONOMIC PLACEMENT", "TAXON", "AUTHOR", "NOMENCLATURAL ACTS", "TYPE TAXON", "INCLUDED TAXONS", "SYNONYMY", "OPEN NOMENCLATURE / IDENTIFICATION QUALIFIERS"],
+    "Types & material": ["TYPE SPECIMENS", "TYPE MATERIAL", "MATERIAL EXAMINED"],
+    "Locality & stratigraphy": ["LOCALITY", "STRATIGRAPHY", "OCCURRENCE"],
+    "Misc": ["REMARKS", "FIGURES", "REFERENCE", "RAW_TRANSLATION", "UNMAPPED TEXT", "REST"],
+}
+
+
+def _gui_now() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def _norm_entity_name(value: str) -> str:
+    value = unicodedata.normalize("NFKC", value or "").strip()
+    value = re.sub(r"\s+", " ", value)
+    return value.casefold()
+
+
+def _ensure_optimized_gui_schema() -> None:
+    """Idempotent GUI schema extension; preserves all existing candidate IDs."""
+    con = db()
+    try:
+        con.executescript("""
+        CREATE TABLE IF NOT EXISTS taxon_entities (
+            id INTEGER PRIMARY KEY,
+            canonical_name TEXT NOT NULL,
+            normalized_name TEXT NOT NULL,
+            rank TEXT DEFAULT '', author TEXT DEFAULT '', year TEXT DEFAULT '',
+            parent_taxon_id INTEGER DEFAULT NULL,
+            taxon_status TEXT DEFAULT 'not_reviewed', curator_note TEXT DEFAULT '',
+            created_at TEXT, updated_at TEXT, created_by TEXT DEFAULT '', updated_by TEXT DEFAULT '',
+            UNIQUE(normalized_name, rank)
+        );
+        CREATE TABLE IF NOT EXISTS conflict_overrides (
+            id INTEGER PRIMARY KEY, taxon_entity_id INTEGER NOT NULL,
+            field_name TEXT NOT NULL, record_ids TEXT DEFAULT '',
+            decision TEXT NOT NULL, preferred_value TEXT DEFAULT '', note TEXT DEFAULT '',
+            created_by TEXT DEFAULT '', created_at TEXT, updated_at TEXT,
+            UNIQUE(taxon_entity_id, field_name)
+        );
+        CREATE TABLE IF NOT EXISTS matrix_projects (
+            id INTEGER PRIMARY KEY, name TEXT NOT NULL, description TEXT DEFAULT '',
+            query_json TEXT DEFAULT '{}', settings_json TEXT DEFAULT '{}',
+            created_by TEXT DEFAULT '', created_at TEXT, updated_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS matrix_project_taxa (
+            project_id INTEGER NOT NULL, taxon_entity_id INTEGER NOT NULL,
+            display_order INTEGER DEFAULT 0, enabled INTEGER DEFAULT 1,
+            PRIMARY KEY(project_id, taxon_entity_id)
+        );
+        CREATE TABLE IF NOT EXISTS matrix_characters (
+            id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL,
+            canonical_name TEXT NOT NULL, category TEXT DEFAULT '', description TEXT DEFAULT '',
+            allowed_states_json TEXT DEFAULT '[]', source_term_ids_json TEXT DEFAULT '[]',
+            display_order INTEGER DEFAULT 0, enabled INTEGER DEFAULT 1
+        );
+        CREATE TABLE IF NOT EXISTS matrix_cells (
+            project_id INTEGER NOT NULL, character_id INTEGER NOT NULL, taxon_entity_id INTEGER NOT NULL,
+            curated_value TEXT DEFAULT '', state TEXT DEFAULT 'Unknown', confidence TEXT DEFAULT '',
+            note TEXT DEFAULT '', manual_override INTEGER DEFAULT 1,
+            updated_by TEXT DEFAULT '', updated_at TEXT,
+            PRIMARY KEY(project_id, character_id, taxon_entity_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_entity_name ON taxon_entities(normalized_name, rank);
+        CREATE INDEX IF NOT EXISTS idx_conflict_entity ON conflict_overrides(taxon_entity_id, field_name);
+        """)
+        if "taxon_entity_id" not in _table_columns(con, "taxon_candidates"):
+            con.execute("ALTER TABLE taxon_candidates ADD COLUMN taxon_entity_id INTEGER DEFAULT NULL")
+        rows=con.execute("SELECT id,taxon_name,rank_guess FROM taxon_candidates WHERE taxon_entity_id IS NULL").fetchall()
+        for row in rows:
+            name=(row["taxon_name"] or "").strip()
+            rank=(row["rank_guess"] or "").strip()
+            if not name:
+                continue
+            norm=_norm_entity_name(name)
+            ent=con.execute("SELECT id FROM taxon_entities WHERE normalized_name=? AND rank=?",(norm,rank)).fetchone()
+            if ent:
+                eid=ent["id"]
+            else:
+                cur=con.execute("INSERT INTO taxon_entities(canonical_name,normalized_name,rank,created_at,updated_at,created_by) VALUES(?,?,?,?,?,?)",
+                                (name,norm,rank,_gui_now(),_gui_now(),_current_username()))
+                eid=cur.lastrowid
+            con.execute("UPDATE taxon_candidates SET taxon_entity_id=? WHERE id=?",(eid,row["id"]))
+        con.commit()
+    finally:
+        con.close()
+    _ensure_stratigraphy_hierarchy_file()
+
+
+def _ensure_stratigraphy_hierarchy_file() -> pathlib.Path:
+    path=current_user_paths().root / STRATIGRAPHY_HIERARCHY_FILENAME
+    if path.exists():
+        return path
+    cols=["unit_id","canonical_name","unit_type","parent_id","rank_order","language","synonyms","age_start_ma","age_end_ma","scope","enabled","note"]
+    src=load_stratigraphy_terms()
+    rows=[]; seen=set()
+    for _,r in src.iterrows():
+        name=str(r.get("canonical","") or r.get("term","")).strip()
+        if not name or name.casefold() in seen: continue
+        seen.add(name.casefold())
+        cat=str(r.get("category","")).strip()
+        uid="unit_"+hashlib.sha1(name.casefold().encode("utf-8")).hexdigest()[:12]
+        rows.append({"unit_id":uid,"canonical_name":name,"unit_type":cat or "unresolved","parent_id":"","rank_order":"","language":str(r.get("language","")),"synonyms":str(r.get("term","")) if str(r.get("term",""))!=name else "","age_start_ma":"","age_end_ma":"","scope":"local" if cat.lower() in {"formation","member","beds"} else "unresolved","enabled":"1","note":"Imported from stratigraphy_terms.tsv"})
+    pd.DataFrame(rows,columns=cols).to_csv(path,sep="\t",index=False,encoding="utf-8")
+    return path
+
+
+def _entity_options(include_without_records: bool = False) -> List[sqlite3.Row]:
+    con = db()
+    having = "" if include_without_records else " HAVING COUNT(c.id) > 0"
+    rows = con.execute("""
+      SELECT e.*, COUNT(c.id) record_count,
+             COUNT(DISTINCT c.document_id) document_count
+      FROM taxon_entities e LEFT JOIN taxon_candidates c ON c.taxon_entity_id=e.id
+      GROUP BY e.id
+    """ + having + " ORDER BY e.canonical_name COLLATE NOCASE").fetchall()
+    con.close()
+    return rows
+
+
+def _entity_bundle(entity_id:int, statuses:List[str], ranks:List[str], doc_ids:List[int]) -> Dict[str,Any]:
+    con=db(); entity=con.execute("SELECT * FROM taxon_entities WHERE id=?",(entity_id,)).fetchone()
+    where=["c.taxon_entity_id=?"]; args=[entity_id]
+    if statuses: where.append("c.status IN (%s)" % ",".join("?"*len(statuses))); args.extend(statuses)
+    if ranks: where.append("c.rank_guess IN (%s)" % ",".join("?"*len(ranks))); args.extend(ranks)
+    if doc_ids: where.append("c.document_id IN (%s)" % ",".join("?"*len(doc_ids))); args.extend(doc_ids)
+    records=con.execute("SELECT c.*,d.filename FROM taxon_candidates c JOIN documents d ON d.id=c.document_id WHERE "+" AND ".join(where)+" ORDER BY d.filename,c.page_start",args).fetchall()
+    ids=[r["id"] for r in records]; fields={i:{} for i in ids}; terms={i:[] for i in ids}
+    if ids:
+        ph=",".join("?"*len(ids))
+        for f in con.execute(f"SELECT * FROM occurrence_fields WHERE candidate_id IN ({ph}) ORDER BY candidate_id,field_name",ids): fields[f["candidate_id"]][f["field_name"]]=f
+        for trow in con.execute(f"SELECT * FROM term_matches WHERE candidate_id IN ({ph}) ORDER BY term_type,category,canonical",ids): terms[trow["candidate_id"]].append(trow)
+    overrides={r["field_name"]:r for r in con.execute("SELECT * FROM conflict_overrides WHERE taxon_entity_id=?",(entity_id,)).fetchall()}
+    con.close(); return {"entity":entity,"records":records,"fields":fields,"terms":terms,"overrides":overrides}
+
+
+def _field_conflict(values:List[str], field_name:str) -> str:
+    vals=[re.sub(r"\s+"," ",v.strip()) for v in values if v and v!=NOT_PROVIDED]
+    uniq={unicodedata.normalize("NFKC",v).casefold().strip(" .;,") for v in vals}
+    if len(uniq)<=1: return "confirmed"
+    if field_name=="STRATIGRAPHY":
+        # General and descendant expressions are compatible if one normalized value contains another.
+        if any(a in b or b in a for a in uniq for b in uniq if a!=b): return "compatible"
+    return "conflict"
+
+
+def _save_occurrence_field(candidate_id:int,field_name:str,value:str,source_pages:str="") -> None:
+    con=db(); row=con.execute("SELECT id FROM occurrence_fields WHERE candidate_id=? AND field_name=?",(candidate_id,field_name)).fetchone()
+    if row: con.execute("UPDATE occurrence_fields SET field_value=?,source_pages=?,method='manual',accepted_at=?,accepted_by=? WHERE id=?",(value,source_pages,_gui_now(),_current_username(),row["id"]))
+    else: con.execute("INSERT INTO occurrence_fields(candidate_id,field_name,field_value,source_pages,method,accepted_at,accepted_by) VALUES(?,?,?,?,?,?,?)",(candidate_id,field_name,value,source_pages,"manual",_gui_now(),_current_username()))
+    con.commit(); con.close();
+    try: _fts_update_candidate(candidate_id)
+    except Exception: pass
+
+
+def _render_status_badge(status:str) -> str:
+    colors={"approved":"#16a34a","pending":"#64748b","needs_review":"#d97706","rejected":"#dc2626","low_confidence":"#7c3aed","not_reviewed":"#64748b"}
+    c=colors.get((status or "").lower(),"#64748b")
+    return f"<span style='background:{c};color:white;padding:2px 8px;border-radius:10px;font-size:.75rem'>{html.escape(status or 'not reviewed')}</span>"
+
+
+def _short_source_label(filename: str, max_len: int = 42) -> str:
+    """Compact source label: filename stem, shortened in the middle."""
+    name = pathlib.Path(str(filename or "")).stem.strip() or str(filename or "Source")
+    if len(name) <= max_len:
+        return name
+    left = max(12, (max_len - 1) // 2)
+    right = max(10, max_len - left - 1)
+    return name[:left].rstrip() + "…" + name[-right:].lstrip()
+
+
+def _render_dossier_field(
+    bundle: Dict[str, Any], field_name: str, edit_mode: bool,
+    show_empty: bool = False,
+) -> None:
+    """Render a dossier field card; fields without mapped values stay hidden."""
+    values = []
+    for rec in bundle["records"]:
+        f = bundle["fields"].get(rec["id"], {}).get(field_name)
+        value = str(f["field_value"] or "").strip() if f else ""
+        if value and value != NOT_PROVIDED:
+            values.append((rec, f))
+
+    # Important: do not create the bordered Streamlit container at all. Returning
+    # from inside the container still leaves an empty visual card/row behind.
+    if not values and not show_empty:
+        return
+
+    with st.container(border=True):
+        st.markdown(
+            f"<div class='pn-safe-field-label'>{html.escape(_field_label_for_ui(field_name))}</div>",
+            unsafe_allow_html=True)
+        if not values:
+            st.markdown("<div class='pn-safe-empty'>—</div>", unsafe_allow_html=True)
+            return
+        for value_index, (rec, f) in enumerate(values):
+            if value_index:
+                st.markdown("<div class='pn-safe-divider'></div>", unsafe_allow_html=True)
+            short_source = _short_source_label(rec["filename"])
+            st.markdown(
+                f"<div class='pn-safe-source' title='{html.escape(rec['filename'])}'>"
+                f"{html.escape(short_source)} · #{rec['id']}</div>",
+                unsafe_allow_html=True)
+            key = f"dos_{bundle['entity']['id']}_{rec['id']}_{hashlib.md5(field_name.encode()).hexdigest()[:8]}"
+            if edit_mode:
+                val = st.text_area(
+                    _field_label_for_ui(field_name), f["field_value"], key=key,
+                    height=92, label_visibility="collapsed")
+                if st.button("Save", key=key + "_save"):
+                    _save_occurrence_field(rec["id"], field_name, val, f["source_pages"] or "")
+                    st.rerun()
+            else:
+                st.markdown(
+                    f"<div class='pn-safe-value'>{html.escape(str(f['field_value']))}</div>",
+                    unsafe_allow_html=True)
+        if len(values) > 1:
+            a, b = st.columns(2)
+            safe_field = hashlib.md5(field_name.encode()).hexdigest()[:10]
+            if a.button("Conflict", key=f"conf_{bundle['entity']['id']}_{safe_field}"):
+                _set_conflict_override(bundle["entity"]["id"], field_name, "confirmed_conflict")
+                st.rerun()
+            if b.button("Compatible", key=f"nconf_{bundle['entity']['id']}_{safe_field}"):
+                _set_conflict_override(bundle["entity"]["id"], field_name, "not_a_conflict")
+                st.rerun()
+
+def _set_conflict_override(entity_id:int,field_name:str,decision:str) -> None:
+    con=db(); con.execute("""INSERT INTO conflict_overrides(taxon_entity_id,field_name,decision,created_by,created_at,updated_at)
+      VALUES(?,?,?,?,?,?) ON CONFLICT(taxon_entity_id,field_name) DO UPDATE SET decision=excluded.decision,updated_at=excluded.updated_at,created_by=excluded.created_by""",
+      (entity_id,field_name,decision,_current_username(),_gui_now(),_gui_now())); con.commit(); con.close()
+
+
+def _page_numbers_for_record(rec: sqlite3.Row, fields: Dict[str, sqlite3.Row]) -> List[int]:
+    """Collect every PDF page attributed to a source record."""
+    pages = set()
+    for value in (rec["page_start"], rec["block_end_page"]):
+        try:
+            if int(value or 0) > 0:
+                pages.add(int(value))
+        except (TypeError, ValueError):
+            pass
+    for field_row in fields.values():
+        raw = str(field_row["source_pages"] or "")
+        for a, b in re.findall(r"(\d+)(?:\s*[-–—]\s*(\d+))?", raw):
+            lo, hi = int(a), int(b or a)
+            if 0 < lo <= hi and hi - lo <= 50:
+                pages.update(range(lo, hi + 1))
+    return sorted(pages)
+
+
+def _render_source_record(rec: sqlite3.Row, fields: Dict[str, sqlite3.Row], entity_id: int) -> None:
+    """Render one clearly separated source record and its original PDF pages."""
+    pages = _page_numbers_for_record(rec, fields)
+    page_label = ", ".join(map(str, pages)) if pages else str(rec["page_start"] or "?")
+    short_record_source = _short_source_label(rec["filename"], 72)
+    st.markdown(
+        f"<div class='pn-source-record-title' title='{html.escape(rec['filename'])}'>"
+        f"📚 {html.escape(short_record_source)}</div>", unsafe_allow_html=True)
+    st.markdown(
+        f"**Source record #{rec['id']}** · page(s) **{page_label}** · "
+        f"rank **{html.escape(rec['rank_guess'] or '?')}** · {_render_status_badge(rec['status'])}",
+        unsafe_allow_html=True)
+
+    # A full-PDF download is reliable in browsers where local file:// links are blocked.
+    con = db()
+    doc = con.execute("SELECT path,filename FROM documents WHERE id=?", (rec["document_id"],)).fetchone()
+    con.close()
+    if doc and doc["path"]:
+        pdf_path = pathlib.Path(doc["path"])
+        if not pdf_path.exists():
+            alt = current_user_paths().uploads / pdf_path.name
+            if alt.exists():
+                pdf_path = alt
+        if pdf_path.exists() and pdf_path.suffix.lower() == ".pdf":
+            st.download_button(
+                "Open / download original PDF", pdf_path.read_bytes(),
+                file_name=doc["filename"], mime="application/pdf",
+                key=f"src_pdf_{entity_id}_{rec['id']}")
+
+    if pages:
+        selected_page = st.selectbox(
+            "Original PDF page", pages, key=f"src_page_select_{entity_id}_{rec['id']}")
+        if st.button("Open original page", key=f"src_page_open_{entity_id}_{rec['id']}"):
+            st.session_state[f"src_page_visible_{rec['id']}"] = selected_page
+        visible_key = f"src_page_visible_{rec['id']}"
+        visible = st.session_state.get(visible_key)
+        if visible:
+            _pdf_head, _pdf_close = st.columns([5, 1])
+            _pdf_head.caption(f"Original source: {rec['filename']} · page {visible}")
+            if _pdf_close.button("✕ Close page", key=f"src_page_close_{entity_id}_{rec['id']}", use_container_width=True):
+                st.session_state.pop(visible_key, None)
+                st.rerun()
+            _show_pdf_page_inline(
+                rec["document_id"], int(visible), label="",
+                key=f"src_page_{entity_id}_{rec['id']}_{visible}")
+    else:
+        st.caption("No PDF page number is stored for this source record.")
+
+    if fields:
+        filled_source_fields = [(name, row) for name, row in sorted(fields.items())
+                                if str(row["field_value"] or "").strip()
+                                and str(row["field_value"] or "").strip() != NOT_PROVIDED]
+        source_cols = st.columns(3, gap="small")
+        for idx, (name, field_row) in enumerate(filled_source_fields):
+            with source_cols[idx % 3]:
+                with st.container(border=True):
+                    st.markdown(
+                        f"<div class='pn-safe-field-label'>{html.escape(_field_label_for_ui(name))}</div>",
+                        unsafe_allow_html=True)
+                    st.markdown(
+                        f"<div class='pn-safe-value'>{html.escape(str(field_row['field_value']))}</div>",
+                        unsafe_allow_html=True)
+    st.markdown("<div class='pn-safe-field-label'>Original taxonomic block</div>", unsafe_allow_html=True)
+    st.text_area(
+        "Original taxonomic block", rec["block_text"] or "", height=260,
+        disabled=True, label_visibility="collapsed",
+        key=f"src_block_{entity_id}_{rec['id']}")
+
+
+def tab_taxon_dossier():
+    _ensure_optimized_gui_schema()
+    st.markdown("""<style>
+    .pn-safe-field-label {
+        font-size: .82rem; font-weight: 800; letter-spacing: .025em;
+        text-transform: uppercase; color: #5f7898; line-height: 1.08;
+        margin: 0 0 .08rem 0; padding: 0; overflow-wrap: anywhere;
+    }
+    .pn-safe-source {
+        font-size: calc(.64rem + 2px); color: #687a90; line-height: 1.05;
+        margin: 0 0 .05rem 0; white-space: nowrap; overflow: hidden;
+        text-overflow: ellipsis;
+    }
+    .pn-safe-value {
+        font-size: calc(.88rem + 2px); line-height: 1.22; margin: 0;
+        white-space: pre-wrap; overflow-wrap: anywhere;
+    }
+    .pn-safe-empty {
+        font-size: .78rem; color: #8a94a3; line-height: 1;
+        margin: 0; padding: 0;
+    }
+    .pn-safe-divider {
+        border-top: 1px solid rgba(148,163,184,.24); margin: .28rem 0;
+    }
+    .pn-taxon-title {
+        font-size: 23px; font-weight: 700; font-style: italic;
+        line-height: 1.18; margin: .42rem 0 .28rem 0;
+        overflow-wrap: anywhere;
+    }
+    .pn-source-records-heading {
+        font-size: 1.22rem; font-weight: 700; line-height: 1.2;
+        border-top: 2px solid rgba(100,116,139,.75);
+        padding-top: .48rem; margin: .70rem 0 .28rem 0;
+    }
+    .pn-source-record-title {
+        font-size: 1rem; font-weight: 700; line-height: 1.2;
+        margin: .48rem 0 .18rem 0; overflow-wrap: anywhere;
+    }
+    /* Compact only bordered Taxon Dossier cards. Streamlit applies padding on
+       an inner vertical block, so reducing only the outer wrapper is not enough. */
+    div[data-testid="stVerticalBlockBorderWrapper"] {
+        margin-bottom: .12rem;
+    }
+    div[data-testid="stVerticalBlockBorderWrapper"] > div,
+    div[data-testid="stVerticalBlockBorderWrapper"] > div > div[data-testid="stVerticalBlock"] {
+        padding-top: 0 !important;
+        padding-bottom: .24rem !important;
+    }
+    div[data-testid="stVerticalBlockBorderWrapper"] div[data-testid="stMarkdownContainer"] {
+        margin-top: 0 !important;
+        padding-top: 0 !important;
+    }
+    div[data-testid="stVerticalBlockBorderWrapper"] div[data-testid="stMarkdownContainer"] > p {
+        margin-top: 0 !important;
+    }
+    div[data-testid="stVerticalBlockBorderWrapper"] div[data-testid="stMarkdownContainer"] > p:empty {
+        display: none;
+        margin: 0;
+        padding: 0;
+    }
+    </style>""", unsafe_allow_html=True)
+    st.markdown("### 🧬 Taxon Dossier", unsafe_allow_html=False)
+    st.caption("Complete summary followed by clearly separated individual source records.")
+    show_empty_entities = st.checkbox(
+        "Show taxa without source records", value=False, key="dossier_show_empty_entities",
+        help="By default, the taxon list contains only taxa linked to at least one source record.")
+    entities = _entity_options(include_without_records=show_empty_entities)
+    if not entities:
+        st.info("No taxa with source records are available. Enable ‘Show taxa without source records’ to include empty taxon entities.")
+        return
+    labels = {r["id"]: f"{r['canonical_name']} · {r['rank'] or '?'} · {r['record_count']} records" for r in entities}
+    ids = [r["id"] for r in entities]
+    requested = st.session_state.pop("requested_dossier_entity_id", None)
+    if requested in ids:
+        st.session_state["dossier_entity_select"] = requested
+    default_id = st.session_state.get("dossier_entity_select", st.session_state.get("dossier_entity_id", ids[0]))
+    if default_id not in ids:
+        default_id = ids[0]
+    selected = st.selectbox(
+        "Taxon", ids, index=ids.index(default_id), format_func=lambda x: labels[x],
+        key="dossier_entity_select")
+    st.session_state["dossier_entity_id"] = selected
+
+    con = db()
+    docs = con.execute("SELECT id,filename FROM documents ORDER BY filename").fetchall()
+    all_status = [r[0] for r in con.execute("SELECT DISTINCT status FROM taxon_candidates ORDER BY status").fetchall() if r[0]]
+    all_ranks = [r[0] for r in con.execute("SELECT DISTINCT rank_guess FROM taxon_candidates ORDER BY rank_guess").fetchall() if r[0]]
+    con.close()
+    with st.expander("🔽 Filters", expanded=False):
+        st.button("Clear all", key="dos_clear_all", on_click=_clear_session_keys,
+                  args=("dos_status", "dos_rank", "dos_docs"))
+        c1, c2, c3, c4 = st.columns(4)
+        statuses = c1.multiselect("Record status", all_status, default=all_status, key="dos_status")
+        ranks = c2.multiselect("Rank", all_ranks, default=all_ranks, key="dos_rank")
+        doc_ids = c3.multiselect("Documents", [r["id"] for r in docs], default=[r["id"] for r in docs],
+                                 format_func=lambda x: next(r["filename"] for r in docs if r["id"] == x), key="dos_docs")
+        edit_mode = c4.toggle("Edit mode", value=False, key="dos_edit")
+        show_empty_fields = st.toggle(
+            "Show empty fields", value=False, key="dos_show_empty_fields",
+            help="Empty mapped fields are hidden by default. Enable this only when adding missing values.")
+    bundle = _entity_bundle(selected, statuses, ranks, doc_ids)
+    e, recs = bundle["entity"], bundle["records"]
+    if recs:
+        _ux_set_current_candidate(recs[0]["id"])
+    st.markdown(
+        f"<div class='pn-taxon-title'>{html.escape(e['canonical_name'])} &nbsp; "
+        f"{_render_status_badge(e['taxon_status'])}</div>",
+        unsafe_allow_html=True)
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Source records", len(recs))
+    m2.metric("Documents", len({r["document_id"] for r in recs}))
+    m3.metric("Morphology terms", len({t["canonical"] for ts in bundle["terms"].values() for t in ts if t["term_type"] == "morphology"}))
+
+    # Flat, compact three-column summary: no numbered section headings.
+    compact_field_order = [
+        "TAXON", "AUTHOR", "TAXONOMIC PLACEMENT",
+        "NOMENCLATURAL ACTS", "SYNONYMY", "TYPE TAXON",
+        "INCLUDED TAXONS", "TYPE SPECIMENS", "TYPE MATERIAL",
+        "MATERIAL EXAMINED", "DIAGNOSIS", "DESCRIPTION",
+        "SIZE", "LOCALITY", "STRATIGRAPHY",
+        "OCCURRENCE", "REMARKS", "ETYMOLOGY",
+        "FIGURES", "REFERENCE",
+    ]
+    # Determine visible fields before creating columns. This avoids both empty
+    # cards and blank column slots when a canonical field has no mapped value.
+    visible_summary_fields = []
+    for field_name in compact_field_order:
+        has_value = False
+        for rec in recs:
+            field_row = bundle["fields"].get(rec["id"], {}).get(field_name)
+            value = str(field_row["field_value"] or "").strip() if field_row else ""
+            if value and value != NOT_PROVIDED:
+                has_value = True
+                break
+        if has_value or show_empty_fields:
+            visible_summary_fields.append(field_name)
+
+    if visible_summary_fields:
+        summary_cols = st.columns(3, gap="small")
+        for idx, field_name in enumerate(visible_summary_fields):
+            with summary_cols[idx % 3]:
+                _render_dossier_field(
+                    bundle, field_name, edit_mode,
+                    show_empty=show_empty_fields)
+    else:
+        st.info("No mapped field values are available for the current taxon and filters.")
+
+    st.markdown("<div class='pn-source-records-heading'>Individual source records</div>", unsafe_allow_html=True)
+    if not recs:
+        st.info("No source records match the current filters.")
+    for rec in recs:
+        _render_source_record(rec, bundle["fields"].get(rec["id"], {}), selected)
+
+    with st.expander("Taxon status and approval"):
+        st.button("Clear all", key="dos_status_clear_all",
+                  on_click=_clear_session_keys, args=("dos_status_records",))
+        c1, c2 = st.columns(2)
+        allowed = ["not_reviewed", "pending", "needs_review", "approved", "rejected", "archived"]
+        current = e["taxon_status"] if e["taxon_status"] in allowed else "not_reviewed"
+        new_status = c1.selectbox("Taxon entity status", allowed, index=allowed.index(current))
+        selected_records = c2.multiselect(
+            "Source records to update", [r["id"] for r in recs], key="dos_status_records",
+            format_func=lambda x: next(f"{r['filename']} p. {r['page_start']} [{r['status']}]" for r in recs if r["id"] == x))
+        if st.button("Save taxon status and selected record statuses"):
+            con = db()
+            con.execute("UPDATE taxon_entities SET taxon_status=?,updated_at=?,updated_by=? WHERE id=?",
+                        (new_status, _gui_now(), _current_username(), selected))
+            if selected_records:
+                record_status = new_status if new_status in {"pending", "needs_review", "approved", "rejected"} else "approved"
+                con.executemany("UPDATE taxon_candidates SET status=? WHERE id=?", [(record_status, i) for i in selected_records])
+            con.commit(); con.close(); st.success("Statuses saved."); st.rerun()
+
+def _load_search_evidence(term_type:str,canonicals:List[str]) -> pd.DataFrame:
+    if not canonicals: return pd.DataFrame()
+    con=db(); ph=",".join("?"*len(canonicals))
+    rows=con.execute(f"""SELECT e.id entity_id,e.canonical_name taxon,e.rank,e.taxon_status,
+      c.id candidate_id,c.status record_status,d.filename,c.page_start,t.canonical,t.category,t.source_field
+      FROM term_matches t JOIN taxon_candidates c ON c.id=t.candidate_id
+      JOIN taxon_entities e ON e.id=c.taxon_entity_id JOIN documents d ON d.id=c.document_id
+      WHERE t.term_type=? AND t.canonical IN ({ph})""",[term_type]+canonicals).fetchall(); con.close()
+    return pd.DataFrame([dict(r) for r in rows])
+
+
+def _matrix_from_entities(entity_ids:List[int]) -> pd.DataFrame:
+    if not entity_ids: return pd.DataFrame()
+    con=db(); ph=",".join("?"*len(entity_ids))
+    rows=con.execute(f"""SELECT e.id,e.canonical_name,t.canonical,t.category
+      FROM taxon_entities e JOIN taxon_candidates c ON c.taxon_entity_id=e.id
+      JOIN term_matches t ON t.candidate_id=c.id
+      WHERE e.id IN ({ph}) AND t.term_type='morphology'""",entity_ids).fetchall(); con.close()
+    taxa={r["id"]:r["canonical_name"] for r in rows}; chars=sorted({(r["category"] or "Other",r["canonical"]) for r in rows})
+    data=[]
+    for cat,ch in chars:
+        row={"Category":cat,"Character":ch}
+        present={r["id"] for r in rows if r["canonical"]==ch}
+        for eid,name in taxa.items(): row[name]="Present" if eid in present else "Unknown"
+        data.append(row)
+    return pd.DataFrame(data)
+
+
+def _save_matrix_project(name:str,description:str,entity_ids:List[int],matrix:pd.DataFrame) -> int:
+    con=db(); cur=con.execute("INSERT INTO matrix_projects(name,description,created_by,created_at,updated_at) VALUES(?,?,?,?,?)",(name,description,_current_username(),_gui_now(),_gui_now())); pid=cur.lastrowid
+    for n,eid in enumerate(entity_ids): con.execute("INSERT INTO matrix_project_taxa(project_id,taxon_entity_id,display_order) VALUES(?,?,?)",(pid,eid,n))
+    for n,row in matrix.iterrows():
+        cur=con.execute("INSERT INTO matrix_characters(project_id,canonical_name,category,display_order) VALUES(?,?,?,?)",(pid,str(row.get("Character","")),str(row.get("Category","")),n)); cid=cur.lastrowid
+        for eid in entity_ids:
+            er=con.execute("SELECT canonical_name FROM taxon_entities WHERE id=?",(eid,)).fetchone(); val=str(row.get(er["canonical_name"],"Unknown")) if er else "Unknown"
+            con.execute("INSERT INTO matrix_cells(project_id,character_id,taxon_entity_id,curated_value,state,updated_by,updated_at) VALUES(?,?,?,?,?,?,?)",(pid,cid,eid,val,val,_current_username(),_gui_now()))
+    con.commit(); con.close(); return pid
+
+
+def _render_term_dictionary():
+    subtabs=st.tabs(["Morphology","Stratigraphy","Stratigraphic hierarchy"])
+    specs=[(subtabs[0],current_user_paths().morphology,["enabled","term","canonical","category","language"]),(subtabs[1],current_user_paths().stratigraphy,["enabled","term","canonical","category","language","match_mode"]),(subtabs[2],_ensure_stratigraphy_hierarchy_file(),["unit_id","canonical_name","unit_type","parent_id","rank_order","language","synonyms","age_start_ma","age_end_ma","scope","enabled","note"])]
+    for tab,path,cols in specs:
+        with tab:
+            df=_load_raw_tsv(path,cols)
+            for c in cols:
+                if c not in df.columns: df[c]=""
+            edited=st.data_editor(df[cols],num_rows="dynamic",use_container_width=True,key="dict_"+path.name)
+            if st.button("Save dictionary",key="save_"+path.name):
+                edited.to_csv(path,sep="\t",index=False,encoding="utf-8")
+                if "morphology" in path.name: reload_morphology_terms()
+                elif path.name=="stratigraphy_terms.tsv": reload_stratigraphy_terms()
+                st.success("Dictionary saved.")
+
+
+def _display_term(value: Any) -> str:
+    """Human-readable term label; stored canonical values remain unchanged for matching."""
+    return re.sub(r"\s+", " ", str(value or "").replace("_", " ")).strip()
+
+
+def _available_matched_terms(term_type: str) -> List[str]:
+    """Return only canonical terms already matched in taxon records in this database."""
+    con = db()
+    try:
+        rows = con.execute(
+            """SELECT DISTINCT tm.canonical
+               FROM term_matches tm
+               JOIN taxon_candidates tc ON tc.id = tm.candidate_id
+               WHERE tm.term_type = ?
+                 AND TRIM(COALESCE(tm.canonical, '')) <> ''
+               ORDER BY LOWER(tm.canonical), tm.canonical""",
+            (term_type,),
+        ).fetchall()
+        return [str(row["canonical"]).strip() for row in rows if str(row["canonical"] or "").strip()]
+    finally:
+        con.close()
+
+
+def _term_query_label(tokens: List[str]) -> str:
+    """Render exact terms and wildcard patterns without changing stored values."""
+    if not tokens:
+        return "(empty query)"
+    out = []
+    for token in tokens:
+        if token.startswith("TERM:"):
+            out.append(f'"{_display_term(token[5:])}"')
+        elif token.startswith("WILD:"):
+            out.append(f'WILD("{_display_term(token[5:])}")')
+        else:
+            out.append(token)
+    return " ".join(out)
+
+
+def _term_query_operands(tokens: List[str]) -> List[str]:
+    return list(dict.fromkeys(t for t in tokens if t.startswith(("TERM:", "WILD:")) and t[5:]))
+
+
+def _wildcard_regex(pattern: str) -> re.Pattern:
+    """Compile shell wildcards: * = any characters, ? = exactly one character."""
+    normalized = str(pattern or "").replace("_", " ").strip().casefold()
+    return re.compile(fnmatch.translate(normalized), re.IGNORECASE | re.UNICODE)
+
+
+def _operand_matches_canonical(token: str, canonical: str) -> bool:
+    canonical_norm = _display_term(canonical).casefold()
+    value = token[5:]
+    if token.startswith("TERM:"):
+        return canonical_norm == _display_term(value).casefold()
+    if token.startswith("WILD:"):
+        return bool(_wildcard_regex(value).fullmatch(canonical_norm))
+    return False
+
+
+def _load_query_evidence(term_type: str, tokens: List[str]) -> pd.DataFrame:
+    """Load exact/wildcard evidence and retain rows matched by at least one operand."""
+    operands = _term_query_operands(tokens)
+    if not operands:
+        return pd.DataFrame()
+    con = db()
+    rows = con.execute("""SELECT e.id entity_id,e.canonical_name taxon,e.rank,e.taxon_status,
+      c.id candidate_id,c.status record_status,d.filename,c.page_start,t.canonical,t.category,t.source_field
+      FROM term_matches t JOIN taxon_candidates c ON c.id=t.candidate_id
+      JOIN taxon_entities e ON e.id=c.taxon_entity_id JOIN documents d ON d.id=c.document_id
+      WHERE t.term_type=?""", (term_type,)).fetchall()
+    con.close()
+    df = pd.DataFrame([dict(r) for r in rows])
+    if df.empty:
+        return df
+    mask = df["canonical"].map(lambda c: any(_operand_matches_canonical(op, str(c)) for op in operands))
+    return df[mask].copy()
+
+
+def _evaluate_term_query(tokens: List[str], evidence: pd.DataFrame) -> Tuple[set, str]:
+    """Evaluate exact/wildcard operands with AND precedence over OR."""
+    if not tokens:
+        return set(), "Add at least one term or wildcard pattern to the query."
+    precedence = {"OR": 1, "AND": 2}
+    output, operators = [], []
+    expect_operand, balance = True, 0
+    for token in tokens:
+        if token.startswith(("TERM:", "WILD:")):
+            if not token[5:].strip():
+                return set(), "An empty term or wildcard pattern is not allowed."
+            if not expect_operand:
+                return set(), "An operator is missing between two query operands."
+            output.append(token); expect_operand = False
+        elif token == "(":
+            if not expect_operand:
+                return set(), "An operator is missing before '('."
+            operators.append(token); balance += 1
+        elif token == ")":
+            if expect_operand or balance <= 0:
+                return set(), "Unexpected ')'."
+            while operators and operators[-1] != "(": output.append(operators.pop())
+            if not operators: return set(), "Unbalanced parentheses."
+            operators.pop(); balance -= 1; expect_operand = False
+        elif token in precedence:
+            if expect_operand: return set(), f"Operator {token} has no operand on its left."
+            while operators and operators[-1] in precedence and precedence[operators[-1]] >= precedence[token]:
+                output.append(operators.pop())
+            operators.append(token); expect_operand = True
+        else:
+            return set(), f"Unknown query token: {token}"
+    if expect_operand: return set(), "The query cannot end with an operator or '('."
+    if balance: return set(), "Unbalanced parentheses."
+    while operators:
+        op = operators.pop()
+        if op == "(": return set(), "Unbalanced parentheses."
+        output.append(op)
+
+    canonical_entities = {}
+    if not evidence.empty:
+        for canonical, group in evidence.groupby("canonical"):
+            canonical_entities[str(canonical)] = set(group["entity_id"].astype(int))
+    stack = []
+    for token in output:
+        if token.startswith(("TERM:", "WILD:")):
+            matching = set()
+            for canonical, entity_ids in canonical_entities.items():
+                if _operand_matches_canonical(token, canonical): matching |= entity_ids
+            stack.append(matching)
+        else:
+            if len(stack) < 2: return set(), "Invalid query expression."
+            right, left = stack.pop(), stack.pop()
+            stack.append(left & right if token == "AND" else left | right)
+    return (stack[0], "") if len(stack) == 1 else (set(), "Invalid query expression.")
+
+
+def _term_dossier(term_type: str) -> None:
+    is_morph = term_type == "morphology"
+    title = "🐚 Morphology Dossier" if is_morph else "⏳ Stratigraphy Dossier"
+    st.markdown(f"### {title}")
+    st.caption("Search indexed terms or scan record fields live before adding a new dictionary term.")
+    _pb_render_add_term(term_type, f"dossier_{term_type}")
+    search_mode = st.radio("Search mode", ["Indexed matches", "Live field search"], horizontal=True, key=f"pb_mode_{term_type}")
+    if search_mode == "Live field search":
+        live_query = st.text_input("Text to find", key=f"pb_live_{term_type}", placeholder="Buchava Formation / dorsal muscle scar")
+        live = _pb_live_search(term_type, live_query)
+        if len(live):
+            st.success(f"Found {len(live)} matching field values in {live['candidate_id'].nunique()} records.")
+            st.dataframe(live,use_container_width=True,hide_index=True)
+            _pb_render_add_term(term_type, f"live_{term_type}", default_term=live_query)
+        elif live_query:
+            st.info("No live matches. Try a shorter phrase or add the term without recomputing.")
+        else:
+            st.info("Enter at least two characters to search DESCRIPTION/DIAGNOSIS/REMARKS or STRATIGRAPHY/OCCURRENCE/LOCALITY.")
+        return
+    options = _available_matched_terms(term_type)
+    token_key, run_key, error_key = f"{term_type}_query_tokens", f"{term_type}_dossier_run", f"{term_type}_query_error"
+    st.session_state.setdefault(token_key, [])
+    if st.button("Clear all", key=f"{term_type}_clear_all"):
+        for key in (token_key, run_key, error_key, f"{term_type}_term_to_add", f"{term_type}_wildcard", f"{term_type}_taxon_selection_table"):
+            st.session_state.pop(key, None)
+        st.rerun()
+    if not options:
+        st.info("No indexed terms yet. Add a term above, switch to Live field search, or recompute approved records.")
+        if st.button("🔄 Recompute library", key=f"pb_empty_recompute_{term_type}"):
+            n=recompute_all_term_matches(include_needs_review=True); st.success(f"Recomputed {n} records."); st.rerun()
+        return
+
+    pick_col, add_col = st.columns([5, 1])
+    picked = pick_col.selectbox("Morphology term" if is_morph else "Stratigraphy term", options,
+                                format_func=_display_term, key=f"{term_type}_term_to_add")
+    if add_col.button("＋ Term", key=f"{term_type}_add_term", use_container_width=True):
+        tokens = list(st.session_state.get(token_key, []))
+        if tokens and (tokens[-1].startswith(("TERM:", "WILD:")) or tokens[-1] == ")"): tokens.append("AND")
+        tokens.append("TERM:" + picked); st.session_state[token_key] = tokens
+        st.session_state[run_key] = False; st.session_state.pop(error_key, None); st.rerun()
+
+    wild_col, wild_add = st.columns([5, 1])
+    wildcard = wild_col.text_input("Wildcard pattern", key=f"{term_type}_wildcard",
+        placeholder="Examples: *cambrian, dorsal*, ?arly cambrian",
+        help="* matches zero or more characters; ? matches exactly one character. Matching is case-insensitive and underscores are treated as spaces.")
+    if wild_add.button("＋ Pattern", key=f"{term_type}_add_wildcard", use_container_width=True):
+        pattern = wildcard.strip()
+        if not pattern:
+            st.session_state[error_key] = "Enter a wildcard pattern first."
+        else:
+            tokens = list(st.session_state.get(token_key, []))
+            if tokens and (tokens[-1].startswith(("TERM:", "WILD:")) or tokens[-1] == ")"): tokens.append("AND")
+            tokens.append("WILD:" + pattern); st.session_state[token_key] = tokens
+            st.session_state[run_key] = False; st.session_state.pop(error_key, None)
+        st.rerun()
+
+    c_and, c_or, c_lp, c_rp, c_back = st.columns([1,1,1,1,1.4])
+    for col,label,token,suffix in ((c_and,"AND","AND","and"),(c_or,"OR","OR","or"),(c_lp,"(","(","lp"),(c_rp,")",")","rp")):
+        if col.button(label,key=f"{term_type}_q_{suffix}",use_container_width=True):
+            tokens=list(st.session_state.get(token_key,[])); tokens.append(token); st.session_state[token_key]=tokens
+            st.session_state[run_key]=False; st.session_state.pop(error_key,None); st.rerun()
+    if c_back.button("⌫ Remove",key=f"{term_type}_q_back",use_container_width=True):
+        tokens=list(st.session_state.get(token_key,[]))
+        if tokens: tokens.pop()
+        st.session_state[token_key]=tokens; st.session_state[run_key]=False; st.session_state.pop(error_key,None); st.rerun()
+
+    tokens=list(st.session_state.get(token_key,[]))
+    saved=[r for r in _pb_load_saved_queries() if r.get("term_type")==term_type]
+    q1,q2,q3=st.columns([2,2,1])
+    saved_name=q1.selectbox("Saved queries", [""]+[r["name"] for r in saved], key=f"pb_saved_pick_{term_type}")
+    if q2.button("Load query",key=f"pb_saved_load_{term_type}",disabled=not saved_name):
+        row=next(r for r in saved if r["name"]==saved_name); st.session_state[token_key]=row["tokens"]; st.session_state[run_key]=False; st.rerun()
+    if q3.button("Delete",key=f"pb_saved_delete_{term_type}",disabled=not saved_name):
+        rows=[r for r in _pb_load_saved_queries() if not (r.get("term_type")==term_type and r.get("name")==saved_name)]
+        _pb_saved_queries_path().write_text(json.dumps(rows,ensure_ascii=False,indent=2),encoding="utf-8"); st.rerun()
+    sn1,sn2=st.columns([4,1]); query_name=sn1.text_input("Save current query as",key=f"pb_query_name_{term_type}")
+    if sn2.button("Save",key=f"pb_query_save_{term_type}",disabled=not tokens):
+        try: _pb_save_query(query_name,term_type,tokens); st.success("Query saved."); st.rerun()
+        except ValueError as exc: st.error(str(exc))
+    query_html=html.escape(_term_query_label(tokens))
+    st.markdown(
+        f"<div class='pn-query-preview' style='padding:.62rem .78rem;"
+        f"border:1px solid #64748b;border-radius:6px;background:#202630 !important;"
+        f"color:#f8fafc !important;-webkit-text-fill-color:#f8fafc !important;"
+        f"font-family:monospace;font-size:.95rem;line-height:1.45;"
+        f"font-weight:600;overflow-wrap:anywhere'>"
+        f"<span style='color:#93c5fd !important;-webkit-text-fill-color:#93c5fd !important;"
+        f"font-weight:800'>QUERY:</span> "
+        f"<span style='color:#ffffff !important;-webkit-text-fill-color:#ffffff !important'>"
+        f"{query_html}</span></div><div style='height:.45rem'></div>",
+        unsafe_allow_html=True)
+    if st.button("Search",type="primary",key=f"{term_type}_dossier_search"):
+        preview=_load_query_evidence(term_type,tokens); _,err=_evaluate_term_query(tokens,preview)
+        st.session_state[error_key]=err; st.session_state[run_key]=not bool(err)
+    err=st.session_state.get(error_key,"")
+    if err: st.error(err)
+    if not st.session_state.get(run_key): return
+    evidence=_load_query_evidence(term_type,tokens); keep,err=_evaluate_term_query(tokens,evidence)
+    if err: st.error(err); return
+    evidence=evidence[evidence["entity_id"].isin(keep)] if not evidence.empty else evidence
+    if evidence.empty: st.info("No matching taxa for the current query."); return
+    result=evidence.groupby(["entity_id","taxon","rank","taxon_status"],as_index=False).agg(matches=("canonical","nunique"),documents=("filename","nunique"),records=("candidate_id","nunique"))
+    result.insert(0,"Select",False)
+    edited=st.data_editor(result,hide_index=True,use_container_width=True,key=f"{term_type}_taxon_selection_table",disabled=[c for c in result.columns if c!="Select"],column_config={"Select":st.column_config.CheckboxColumn("Select",help="Select one taxon")})
+    chosen=edited[edited["Select"]==True]
+    if len(chosen)>1: st.warning("Select only one taxon. The first selected row will be opened.")
+    chosen_id=int(chosen.iloc[0]["entity_id"]) if not chosen.empty else None
+    if st.button("Open taxon details",type="primary",disabled=chosen_id is None,key=f"{term_type}_open_taxon_details"):
+        st.session_state["requested_dossier_entity_id"]=chosen_id; st.session_state["pn_requested_view"]=t("tab_dossier"); st.rerun()
+    st.markdown("### Matching evidence")
+    display=evidence.copy()
+    for col in ("canonical","category"):
+        if col in display.columns: display[col]=display[col].map(_display_term)
+    st.dataframe(display,use_container_width=True,hide_index=True)
+
+
+def tab_morphology_dossier():
+    _ensure_optimized_gui_schema()
+    _term_dossier("morphology")
+
+
+def tab_stratigraphy_dossier():
+    _ensure_optimized_gui_schema()
+    _term_dossier("stratigraphy")
+
+
+def tab_morphostrat_dossier():
+    """Backward-compatible entry point; new UI uses separate dossiers."""
+    tab_morphology_dossier()
 
 if __name__ == "__main__":
     main()
